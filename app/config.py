@@ -18,8 +18,10 @@ class Settings(BaseSettings):
     PORT: int = 8000
     API_KEY: str = "dev-insecure-secret-key-change-me"
     CORS_ORIGINS: List[str] = ["*"]
-    MAX_UPLOAD_MB: int = 20
     LOG_LEVEL: str = "INFO"
+
+    # ---------------- Output Encoding ----------------
+    OUTPUT_MAX_BYTES: int = 300 * 1024  # final avatar JPEG must not exceed this
 
     # ---------------- HF & Weights ----------------
     HF_TOKEN: Optional[str] = Field(default=None, validation_alias="HF_TOKEN")

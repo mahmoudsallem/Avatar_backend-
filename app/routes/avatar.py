@@ -1,5 +1,3 @@
-import io
-import time
 import uuid
 import secrets
 import logging
@@ -72,8 +70,8 @@ async def health_check():
     "/v1/avatar",
     responses={
         200: {
-            "content": {"image/png": {}},
-            "description": "Generated avatar image with metadata in response headers.",
+            "content": {"image/jpeg": {}},
+            "description": "Generated avatar JPEG (capped at settings.OUTPUT_MAX_BYTES) with metadata in response headers.",
         },
         400: {"model": ErrorResponse, "description": "Validation rejected."},
         401: {"model": ErrorResponse, "description": "Unauthorized."},
@@ -96,14 +94,8 @@ async def create_avatar(
             content={"error": f"Unsupported file type '{ext}'. Allowed: {', '.join(sorted(step1.IMAGE_EXTENSIONS))}"},
         )
 
-    # Read and enforce max upload size
-    max_bytes = settings.MAX_UPLOAD_MB * 1024 * 1024
+    # No server-side upload size limit - read whatever was sent.
     content = await file.read()
-    if len(content) > max_bytes:
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={"error": f"Uploaded file exceeds maximum limit of {settings.MAX_UPLOAD_MB}MB"},
-        )
 
     # Write temporarily to disk for CV2 / DeepFace processing
     settings.VAL_TMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -125,15 +117,11 @@ async def create_avatar(
                     content={"error": str(r)},
                 )
 
-            # Step 2: Generate avatar (run in thread pool)
-            out_img, metadata = await asyncio.to_thread(
+            # Step 2: Generate avatar - returns JPEG bytes already capped at
+            # settings.OUTPUT_MAX_BYTES (run in thread pool)
+            jpeg_bytes, metadata = await asyncio.to_thread(
                 generate.generate_avatar, temp_path, info
             )
-
-        # Encode image to PNG bytes
-        buffer = io.BytesIO()
-        out_img.save(buffer, format="PNG")
-        png_bytes = buffer.getvalue()
 
         # Build metadata headers
         headers = {
@@ -146,9 +134,10 @@ async def create_avatar(
             "X-Visor-Status": str(metadata.get("visor", "")),
             "X-Tries": str(metadata.get("tries", 1)),
             "X-Seconds-Elapsed": str(metadata.get("seconds", 0.0)),
+            "X-Output-Bytes": str(metadata.get("output_bytes", len(jpeg_bytes))),
         }
 
-        return Response(content=png_bytes, media_type="image/png", headers=headers)
+        return Response(content=jpeg_bytes, media_type="image/jpeg", headers=headers)
 
     except step1.Rejected as r:
         logger.info("Image validation rejected: %s", r)

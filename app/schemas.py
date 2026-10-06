@@ -50,3 +50,4 @@ class GenerationMetadata(BaseModel):
     gen_s: float
     val_s: float
     lora_mult: float
+    output_bytes: Optional[int] = None

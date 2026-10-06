@@ -151,22 +151,26 @@ Generates a sci-fi avatar from a portrait photo.
 - **Headers**:
   - `X-API-Key`: Shared secret configured in `.env`.
 - **Form Data**:
-  - `file`: Image file (`.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`). Max 20MB.
+  - `file`: Image file (`.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`). No server-side size limit is
+    enforced - if you want one, add it at the reverse proxy/ALB layer in front of this service.
 
 **Example Request**:
 ```bash
 curl -X POST http://localhost:8000/v1/avatar \
   -H "X-API-Key: your-secure-production-api-key" \
   -F "file=@photo.jpg" \
-  --output avatar.png \
+  --output avatar.jpg \
   -D headers.txt
 ```
 
 **Success Response (200 OK)**:
-- Returns binary PNG image bytes (`image/png`).
+- Returns binary JPEG image bytes (`image/jpeg`). The output is always re-encoded as JPEG and is
+  guaranteed to be at or under `OUTPUT_MAX_BYTES` (default **300 KB** / `307200` bytes): quality is
+  stepped down from 95 towards 20 first, and if it's still over budget at the lowest quality, the
+  image is downscaled and the quality ladder is retried, repeating until it fits.
 - Response headers include generation metadata:
   ```http
-  Content-Type: image/png
+  Content-Type: image/jpeg
   X-Avatar-Type: Man
   X-Gender: Man
   X-Glasses: false
@@ -176,6 +180,7 @@ curl -X POST http://localhost:8000/v1/avatar \
   X-Visor-Status: ok
   X-Tries: 1
   X-Seconds-Elapsed: 24.3
+  X-Output-Bytes: 184320
   ```
 
 **Validation Rejection (400 Bad Request)**:

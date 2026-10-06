@@ -1,3 +1,4 @@
+import io
 import os
 import time
 import json
@@ -274,7 +275,43 @@ def score_output(user_emb: Optional[dict], out: Image.Image, info: dict) -> dict
         **vis,
     }
 
-def generate_avatar(user_image_path: Path, info: dict) -> Tuple[Image.Image, dict]:
+def encode_jpeg_capped(img: Image.Image, max_bytes: int = None) -> bytes:
+    """Encode `img` as JPEG, stepping quality down and then resolution down
+    until the encoded size is at or under `max_bytes`. Falls back to the
+    smallest encoding found (with a logged warning) if the budget still can't
+    be met at the lowest quality/resolution tried."""
+    max_bytes = max_bytes or settings.OUTPUT_MAX_BYTES
+    rgb = img.convert("RGB")
+    quality_steps = (95, 90, 85, 80, 75, 70, 65, 60, 55, 50, 45, 40, 35, 30, 25, 20)
+    scale = 1.0
+    smallest: Optional[bytes] = None
+    for _ in range(8):
+        work = (
+            rgb
+            if scale >= 0.999
+            else rgb.resize(
+                (max(1, int(rgb.width * scale)), max(1, int(rgb.height * scale))),
+                Image.LANCZOS,
+            )
+        )
+        for quality in quality_steps:
+            buf = io.BytesIO()
+            work.save(buf, format="JPEG", quality=quality, optimize=True)
+            data = buf.getvalue()
+            if smallest is None or len(data) < len(smallest):
+                smallest = data
+            if len(data) <= max_bytes:
+                return data
+        scale *= 0.85
+    logger.warning(
+        "Could not encode output under %d bytes after quality/resolution search; "
+        "returning smallest JPEG found (%d bytes).",
+        max_bytes,
+        len(smallest),
+    )
+    return smallest
+
+def generate_avatar(user_image_path: Path, info: dict) -> Tuple[bytes, dict]:
     t0 = time.time()
     user_path = Path(user_image_path)
     rec: Dict[str, Any] = {"file": user_path.name}
@@ -369,6 +406,7 @@ def generate_avatar(user_image_path: Path, info: dict) -> Tuple[Image.Image, dic
                 break
 
         out, v = best["out"], best["v"]
+        jpeg_bytes = encode_jpeg_capped(out, settings.OUTPUT_MAX_BYTES)
         rec.update(
             status="done",
             gender=info["gender"],
@@ -388,16 +426,20 @@ def generate_avatar(user_image_path: Path, info: dict) -> Tuple[Image.Image, dic
             score=v["score"],
             visor=v["visor"],
             visor_score=v["visor_score"],
+            output_bytes=len(jpeg_bytes),
         )
         logger.info(
-            "Best candidate selected: try %d of %d, id_sim=%s, visor=%s, score=%s in %.1fs",
+            "Best candidate selected: try %d of %d, id_sim=%s, visor=%s, score=%s in %.1fs, "
+            "output=%d bytes (JPEG, cap=%d)",
             best["k"],
             k,
             v["id_sim"],
             v["visor"],
             v["score"],
             rec["seconds"],
+            len(jpeg_bytes),
+            settings.OUTPUT_MAX_BYTES,
         )
-        return out, rec
+        return jpeg_bytes, rec
     finally:
         models.set_lora(settings.LORA_STRENGTH)
