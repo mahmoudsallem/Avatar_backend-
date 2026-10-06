@@ -21,8 +21,19 @@ The service executes a 2-step AI pipeline:
    - **Identity & Visor Verification**: Evaluates generated candidates via ArcFace cosine similarity (in a persistent CPU worker) and OpenCV HSV visor detection. Retries up to `BEST_OF_N` candidates within a configured `TIME_BUDGET` (default: 40s), keeping the highest-scoring candidate.
 
 3. **Concurrency Model**:
-   - Because FLUX.2-klein-9B is a ~9B parameter model requiring significant GPU VRAM, generation requests are serialized behind an asynchronous GPU lock (`models.gpu_lock`).
+   - Because FLUX.2-klein-9B is a ~9B parameter model requiring significant GPU VRAM, generation requests are serialized behind an asynchronous GPU lock (`pipeline.gpu_lock`).
    - Heavy blocking operations run in a thread pool (`asyncio.to_thread`), ensuring `GET /health` remains responsive even when generation is in progress.
+
+### Code Layout
+The whole service is 5 files:
+```
+app/
+  __init__.py
+  config.py             # pydantic-settings, reads .env
+  pipeline.py           # Step 1 validation + Step 2 generation + model/worker lifecycle
+  deepface_worker.py    # CPU subprocess worker (modes: "detect" one-shot, "embed" persistent)
+  main.py               # FastAPI app, lifespan, /health and /v1/avatar routes
+```
 
 ---
 
@@ -90,7 +101,7 @@ Backend/
     Saytara_Femal.png         # Fallback female template
 ```
 If you ever replace these with new artwork, keep the same filenames (or update `AVATAR_DIR`/the
-filename maps in `app/pipeline/generate.py`) and redeploy `Backend/` as a self-contained folder.
+filename maps in `app/pipeline.py`) and redeploy `Backend/` as a self-contained folder.
 
 ### Step 6: Configure Environment
 Copy the example configuration to `.env` and set your secret API key:
@@ -159,29 +170,18 @@ Generates a sci-fi avatar from a portrait photo.
 curl -X POST http://localhost:8000/v1/avatar \
   -H "X-API-Key: your-secure-production-api-key" \
   -F "file=@photo.jpg" \
-  --output avatar.jpg \
-  -D headers.txt
+  --output avatar.jpg
 ```
 
 **Success Response (200 OK)**:
-- Returns binary JPEG image bytes (`image/jpeg`). The output is always re-encoded as JPEG and is
-  guaranteed to be at or under `OUTPUT_MAX_BYTES` (default **300 KB** / `307200` bytes): quality is
-  stepped down from 95 towards 20 first, and if it's still over budget at the lowest quality, the
-  image is downscaled and the quality ladder is retried, repeating until it fits.
-- Response headers include generation metadata:
-  ```http
-  Content-Type: image/jpeg
-  X-Avatar-Type: Man
-  X-Gender: Man
-  X-Glasses: false
-  X-Hijab: false
-  X-Beard: true
-  X-Identity-Similarity: 0.582
-  X-Visor-Status: ok
-  X-Tries: 1
-  X-Seconds-Elapsed: 24.3
-  X-Output-Bytes: 184320
-  ```
+- The response body is *just* the generated avatar - raw JPEG bytes (`Content-Type: image/jpeg`),
+  nothing else attached. It is always re-encoded as JPEG and guaranteed to be at or under
+  `OUTPUT_MAX_BYTES` (default **300 KB** / `307200` bytes): quality is stepped down from 95 towards
+  20 first, and if it's still over budget at the lowest quality, the image is downscaled and the
+  quality ladder is retried, repeating until it fits.
+- Classification/scoring metadata (gender, glasses, hijab, beard, identity similarity, visor status,
+  tries, timing, output size) is still computed and logged server-side for debugging, it's just not
+  echoed back over HTTP.
 
 **Validation Rejection (400 Bad Request)**:
 Returned when a photo is rejected by Step 1 validation (multiple faces, no face, non-human subject, uncertain gender, etc.):

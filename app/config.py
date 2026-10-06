@@ -35,10 +35,9 @@ class Settings(BaseSettings):
     REJECT_DIR: Path = BASE_DIR / "rejected"
     VAL_TMP_DIR: Path = BASE_DIR / "output" / "_val_tmp"
 
-    # Worker paths
-    DEEPFACE_WORKER_PATH: Path = BASE_DIR / "app" / "deepface_worker.py"
-    VAL_WORKER_PATH: Path = BASE_DIR / "app" / "val_worker.py"
-    VAL_WORKER_LOG: Path = BASE_DIR / "val_worker.log"
+    # Worker path - one script, dispatched by a "detect" / "embed" mode argument
+    WORKER_PATH: Path = BASE_DIR / "app" / "deepface_worker.py"
+    WORKER_LOG: Path = BASE_DIR / "worker.log"
     WORKER_TIMEOUT: int = 600
 
     # ---------------- Models ----------------
