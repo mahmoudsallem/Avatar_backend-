@@ -1,0 +1,33 @@
+# ==============================================================================
+# Saytara Avatar Generation Backend - Requirements
+# ==============================================================================
+# CRITICAL: Install PyTorch with the correct CUDA index for your EC2 instance FIRST!
+# Example for CUDA 12.4:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#
+# Do NOT install generic PyPI torch without CUDA support.
+# ==============================================================================
+
+# Web Framework & Server
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+pydantic>=2.9.0
+pydantic-settings>=2.5.0
+
+# Diffusion & Transformers Models
+diffusers>=0.41.0
+transformers>=4.56.0
+accelerate>=0.34.0
+peft>=0.13.0
+safetensors>=0.4.5
+huggingface-hub>=0.25.0
+
+# Face Analysis & Embeddings (DeepFace CPU subprocesses)
+deepface>=0.0.93
+tf-keras>=2.17.0
+
+# Image & Data Processing
+opencv-python-headless>=4.10.0
+numpy>=1.26.0,<2.0.0
+pillow>=10.4.0

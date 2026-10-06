@@ -1,0 +1,25 @@
+# Environment and secrets
+.env
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Output and temporary runtime directories
+crop/
+output/
+rejected/
+_val_tmp/
+*.log
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
