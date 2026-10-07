@@ -173,9 +173,14 @@ curl -X POST http://localhost:8000/v1/avatar \
   `OUTPUT_MAX_BYTES` (default **300 KB** / `307200` bytes): quality is stepped down from 95 towards
   20 first, and if it's still over budget at the lowest quality, the image is downscaled and the
   quality ladder is retried, repeating until it fits.
-- Classification/scoring metadata (gender, glasses, hijab, beard, identity similarity, visor status,
-  tries, timing, output size) is still computed and logged server-side for debugging, it's just not
-  echoed back over HTTP.
+- A few scoring/progress fields are echoed back as response headers (the rest is still only
+  logged server-side for debugging):
+  - `X-Tries-Used`: how many generation attempts were run.
+  - `X-Best-Try`: which attempt (1-based) was picked as the best candidate.
+  - `X-Stop-Reason`: why the retry loop stopped (`good`, `all tries`, or `budget`).
+  - `X-Generation-Seconds`: total time spent generating, in seconds.
+  - `X-Identity-Similarity`: ArcFace cosine similarity of the best candidate to the user's face.
+  - `X-Visor-Status`: whether the visor was detected correctly on the best candidate.
 
 **Validation Rejection (400 Bad Request)**:
 Returned when a photo is rejected by Step 1 validation (multiple faces, no face, non-human subject, uncertain gender, etc.):

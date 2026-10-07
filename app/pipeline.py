@@ -77,7 +77,7 @@ gpu_lock = asyncio.Lock()
 
 # Persistent ArcFace embedding worker state
 _VW = {"p": None}
-_VLOCK = threading.Lock()
+_VLOCK = threading.RLock()
 _POOL = ThreadPoolExecutor(max_workers=1)
 
 def close_val_worker() -> None:

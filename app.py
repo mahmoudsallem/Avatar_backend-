@@ -64,6 +64,14 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=[
+        "X-Tries-Used",
+        "X-Best-Try",
+        "X-Stop-Reason",
+        "X-Generation-Seconds",
+        "X-Identity-Similarity",
+        "X-Visor-Status",
+    ],
 )
 
 @app.exception_handler(pipeline.Rejected)
@@ -129,9 +137,17 @@ async def _generate_avatar_from_bytes(content: bytes, filename: str):
 
             # Returns the final avatar as JPEG bytes, already capped at
             # settings.OUTPUT_MAX_BYTES - that's the entire response body.
-            jpeg_bytes, _metadata = await asyncio.to_thread(pipeline.generate_avatar, temp_path, info)
+            jpeg_bytes, metadata = await asyncio.to_thread(pipeline.generate_avatar, temp_path, info)
 
-        return Response(content=jpeg_bytes, media_type="image/jpeg")
+        headers = {
+            "X-Tries-Used": str(metadata.get("tries", "")),
+            "X-Best-Try": str(metadata.get("best_try", "")),
+            "X-Stop-Reason": str(metadata.get("stopped", "")),
+            "X-Generation-Seconds": str(metadata.get("seconds", "")),
+            "X-Identity-Similarity": str(metadata.get("id_sim", "")),
+            "X-Visor-Status": str(metadata.get("visor", "")),
+        }
+        return Response(content=jpeg_bytes, media_type="image/jpeg", headers=headers)
 
     except pipeline.Rejected as r:
         logger.info("Image validation rejected: %s", r)
