@@ -19,13 +19,11 @@ import threading
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
 import torch
-from tqdm import tqdm
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageEnhance, ImageOps
 
 from app.config import settings
 
@@ -82,7 +80,6 @@ gpu_lock = asyncio.Lock()
 # Persistent ArcFace embedding worker state
 _VW = {"p": None}
 _VLOCK = threading.RLock()
-_POOL = ThreadPoolExecutor(max_workers=1)
 
 def close_val_worker() -> None:
     with _VLOCK:
@@ -223,7 +220,7 @@ def _lora_selftest() -> None:
     logger.info("LoRA self-test: generating 4 tiny images (a few seconds)...")
     av, _ = load_avatar("Man")
     base = av.resize((512, 512), Image.LANCZOS)
-    face = pad_square(base.crop((140, 20, 400, 300)), 512)
+    face = base.crop((140, 20, 400, 300)).resize((512, 512), Image.LANCZOS)
 
     def gen(weight, kwargs_mode):
         _LORA["mode"] = "kwargs" if kwargs_mode else "adapters"
@@ -332,13 +329,14 @@ def load_models() -> None:
         )
     logger.info("FLUX + LoRA pipeline loaded successfully.")
 
-    # Start persistent ArcFace identity verification worker
-    get_val_worker()
+    # Start persistent ArcFace identity verification worker (only needed when VALIDATE is on -
+    # off by default since ArcFace is unreliable on illustrated avatars)
+    if settings.VALIDATE:
+        get_val_worker()
 
 def shutdown_models() -> None:
     logger.info("Shutting down model resources...")
     close_val_worker()
-    _POOL.shutdown(wait=False)
     logger.info("Model resources shut down cleanly.")
 
 # ============================================================================
@@ -606,7 +604,7 @@ def analyse_user(user_path: Path, crop_dir: Path = None) -> dict:
 # Prompt assembly (verbatim, tuned text - do not reword)
 # ============================================================================
 
-_SEMI_REAL = (
+_SEMI_REAL_STYLE_TEXT = (
     "render the swapped head in the semi-realistic digital painting style of Picture 1: a realistic, true-to-life "
     "face with natural proportions and a recognisable likeness, painted with smooth airbrushed skin and soft "
     "realistic shading (not flat cartoon colors, not a photo and not a vector icon). subtle thin dark line work only "
@@ -614,234 +612,118 @@ _SEMI_REAL = (
     "glossy lips, natural eyebrows, fine individually painted hair strands with a glossy sheen, warm natural skin "
     "tones with gentle highlights, a strong red rim light along the hair, forehead and cheek edge, and cool blue "
     "fill light on the shadow side, matching the color palette and lighting of the jacket and emblem. the head "
-    "blends seamlessly into the painting with no visible swap seam and no harsh photographic texture, "
+    "blends seamlessly into the painting with no visible swap seam, no harsh photographic texture, no visible pores, "
     "and keeps exactly the face of Picture 2: same face shape, jaw, hairline, facial hair and the real eye color of "
-    "Picture 2 (do not turn the eyes blue). "
-    "keep the natural age, forehead lines, smile lines, under-eye detail and any grey in the beard or hair of "
-    "Picture 2; the airbrushed finish must not slim the face, soften the jaw or change any proportion. "
-    "sharp detail, high quality, 4k."
+    "Picture 2 (do not turn the eyes blue). sharp detail, high quality, 4k."
 )
 
-_COMIC = (
+_COMIC_STYLE_TEXT = (
     "render the swapped head fully in the illustration style of Picture 1, not as a photo: a premium digital "
     "comic-book vector portrait with bold clean ink outlines of consistent line weight, cel-shaded skin with smooth "
     "airbrushed gradients and crisp highlight and shadow shapes, rich saturated warm skin tones, individually inked "
     "hair strands with a glossy sheen, glossy lips and sharp eye catchlights, a strong red rim light along the hair, "
     "forehead, cheek and jaw edge and cool blue fill shadows on the opposite side, matching the line quality, color "
     "palette and lighting of the jacket and emblem. the head blends seamlessly into the illustration with no "
-    "photographic texture and no swap seam, while still looking exactly like the person in "
+    "photographic texture, no visible pores and no swap seam, while still looking exactly like the person in "
     "Picture 2: same face shape, hairline, facial hair and the real eye color of Picture 2 (do not turn the eyes "
     "blue). sharp detail, high quality, 4k."
 )
 
-IDENTITY = (
-    "IDENTITY IS THE TOP PRIORITY: the result must look like the same real person as Picture 2, not like the person "
-    "or the face shape in Picture 1. copy the exact face geometry of Picture 2: overall face width-to-height ratio, "
-    "forehead height and width, cheekbone position, full cheeks, jaw width, jawline angle and chin shape (never slim, "
-    "narrow, sharpen, shorten or elongate the face, never make it more handsome, younger or more glamorous), the exact "
-    "nose length, bridge and nostril width, the exact lip shape and thickness and the same mouth expression (a "
-    "closed-mouth smile stays closed, an open smile with visible teeth stays open with the same visible teeth), the "
-    "same eyebrow shape, thickness and spacing, the same eye shape, eye size and eye distance, the exact eye color of "
-    "Picture 2 (dark brown stays dark brown, never lighten to blue, green or grey), the same skin tone, apparent age, "
-    "smile lines and under-eye detail. keep every facial landmark in the same relative position "
-    "as Picture 2; only the painting style comes from Picture 1. "
-)
+AVATAR_STYLE_TEXT = {"semi_real": _SEMI_REAL_STYLE_TEXT, "comic": _COMIC_STYLE_TEXT}
 
-BUILD = (
-    "BUILD: match the fullness of the person in Picture 2. if the face is round, full or heavy, keep it a little "
-    "fuller: fuller cheeks, softer wider jaw, a fuller chin (even a soft double chin) and a thicker neck. if the face "
-    "is thin or lean, keep it a little thinner: leaner cheeks, a defined narrower jaw, visible cheekbones and a "
-    "slimmer neck. if average, keep it average. never slim down a full face and never fatten a thin face, and never "
-    "copy the build of the person in Picture 1. "
-)
-
-FACE_CLEAN = (
-    "FACE QUALITY: a clean, continuous, smooth jawline and chin contour from ear to chin on both sides, symmetrical and "
-    "undistorted, joining the neck naturally, with no warped, melted, doubled, broken or jagged jaw outline. the skin "
-    "is clean, smooth and evenly painted in one natural skin tone. "
-)
-
-VISOR_MANDATORY = (
-    "CRITICAL REQUIREMENT: The face MUST wear the exact angular electric-blue wraparound visor "
-    "from Picture 1 or 3. This is non-negotiable. No ordinary glasses, no sunglasses, no other eyewear. "
-    "Only the futuristic visor with the clear transparent lens and blue frame. "
-)
-
-VISOR_LOOK_MAN = (
-    "the visor is exactly the one worn in Picture 1: a single flat, angular, futuristic wraparound shield made of ONE "
-    "continuous transparent panel, with a perfectly straight horizontal top edge running just under the eyebrows from "
-    "the outer eye corner on one side, across the bridge of the nose, to the temple on the other side; sharp "
-    "chamfered (cut, faceted) lower corners and a shallow notch for the nose; a thin light electric-blue frame line "
-    "along its edges; a chunky faceted cyan-blue corner block with a white highlight at the outer end on the side "
-    "nearest the camera; and a thick silver-white and blue arm running back along the temple to the ear on the far "
-    "side. the lens is clear and transparent with only a very light icy-blue tint and a few crisp white diagonal "
-    "glints, so the eyes, eyelashes, eyelids and eyebrows of Picture 2 stay sharp and fully visible through it. "
-)
-
-VISOR_LOOK_DEFAULT = (
-    "the visor is exactly the large angular futuristic shield worn in Picture 1: ONE continuous transparent panel "
-    "covering both eyes, with a straight thin electric-blue upper rim just under the eyebrows, broad faceted outer "
-    "corners, a shallow V-shaped lower edge around the nose, cyan-blue side blocks and slim arms returning to both "
-    "temples. the lens is clear and transparent with only a very light icy-blue tint and a few crisp white glints, "
-    "so the eyes, eyelashes, eyelids and eyebrows of Picture 2 stay sharp and fully visible through it. do not turn "
-    "it into ordinary eyeglasses or two separate lenses. "
-)
-
-VISOR_REF_TEXT = (
-    "Picture 3 is a close-up of the exact visor glasses: copy this visor exactly onto the face (same shape, straight "
-    "top edge, angular corners, blue frame, clear lens, corner blocks and side arms). use ONLY the glasses from "
-    "Picture 3, never its face. "
-)
-
-VISOR_CORE = (
-    "EYEWEAR (mandatory): the face wears the Picture 1 visor and NOTHING else. if Picture 2 wears eyeglasses of any "
-    "kind (black, thick, round, rectangular, thin metal or clear), DELETE them: erase their frames, rims, nose pads, "
-    "arms and lens reflections completely and paint bare natural skin where they were, then put the visor on top. "
-)
-
-VISOR_NEG = (
-    "exactly ONE pair of glasses on the face: no black frame, no thick rims, no second frame, no double lines above "
-    "or below the visor, no round or rectangular eyeglasses, no rounded goggles, no sunglasses, no opaque or solid "
-    "blue lens. "
-)
-
-VISOR_FIT = (
-    "fit the visor to the face of Picture 2: its width spans exactly from temple to temple of that face and is never "
-    "wider than the face, it sits level across the bridge of the nose directly over both eyes with the eyes centered "
-    "behind the lens, it follows the same head tilt and perspective as the face, and its arms end at the temples and "
-    "ears. not oversized, not floating, not tilted, not sliding off the face. "
-)
-
-VISOR_RETRY = (
-    "REMINDER: ordinary or thick eyeglasses must NOT appear anywhere; only the angular blue-framed clear wraparound "
-    "visor of Picture 1 appears on the face, clearly visible. "
-)
-
-HIJAB_VISOR_NOTE = (
-    "the visor sits on the face inside the hijab opening: it is no wider than the visible face between the two edges "
-    "of the hijab, its arms and corner blocks tuck against the hijab at the temples (they may rest slightly over the "
-    "fabric edge), the hijab edge above the eyebrows stays fully visible and is not covered, and the visor never "
-    "sticks out beyond the hijab outline or covers the forehead fabric. the hijab fabric is not deformed by it. the "
-    "visor MUST be clearly visible on her face. "
-)
-
-HIJAB_USER = (
-    "she wears her own hijab from Picture 2, copied exactly: the same fabric colors (including any two-tone or "
-    "lighter under-scarf), the same sheen and soft folds, wrapped the same way tightly around the face with the "
-    "edge sitting at the same place on the forehead, cheeks and under the chin, covering all hair, both ears and the "
-    "neck, then falling in soft drapes onto the shoulders and chest and flowing into the jacket collar of Picture 1. "
-    "no hair visible, no pins, brooches or patterns added, the fabric is not changed to another color. only her head "
-    "and hijab are taken from Picture 2; ignore her clothes, cardigan, shirt, body and background. "
-)
-
-HIJAB_FACE = (
-    "keep her natural look from Picture 2: the full natural face with its full cheeks and soft jaw (do not slim or "
-    "shrink it), her natural skin tone and smile lines, her natural makeup level and "
-    "lip color only - do NOT add eyeliner, eyeshadow, long lashes, contouring or glamour retouching, and do not make "
-    "her look younger. the hijab frames the face exactly like Picture 2, not looser and not further back. "
-)
-
-FEMALE_FACE = (
-    "FEMALE FACE DETAILS: copy her face details exactly from Picture 2: the eyebrow shape, thickness and arch, the eye "
-    "shape, size and eyelid fold, her natural lash level, the nose width, bridge and tip, the lip shape, fullness and "
-    "natural lip color, the smile with the same visible teeth, the cheek fullness, the forehead, the face shape and "
-    "chin, her skin tone and dimples. use only a subtle natural makeup level like Picture 2; do not "
-    "add glamour makeup, strong lipstick, long lashes or contouring, and do not make her look younger or thinner. "
-    "from Picture 1 take only the hairstyle, jacket, painting style and visor. "
-)
-
-HAIR_USER = (
-    "HAIR: ignore the hairstyle of Picture 1 completely and keep the exact hair of Picture 2: the same color (never "
-    "add red, orange or blond highlights), length, texture (curly, wavy or straight), volume, hairline, parting and "
-    "side length. if Picture 2 has short hair keep it short; if Picture 2 is bald, shaved or has a receding hairline "
-    "keep the scalp bald or receding exactly as in Picture 2 and do NOT add, grow or paint any hair. do not smooth, "
-    "slick back, comb up, restyle or thicken the hair. the only change allowed on the hair is a thin red rim light. "
-)
-
-def visor_block(info, attempt=0, ref=False):
-    look = VISOR_LOOK_MAN if info.get("avatar") == "Man" else VISOR_LOOK_DEFAULT
+def _visor_text(info: dict) -> str:
+    """The avatar's own visor glasses are ALWAYS present on the output (no Picture 3 reference image -
+    the visor is described in text only)."""
     return (
-        VISOR_CORE
-        + (VISOR_REF_TEXT if ref else "")
-        + look
-        + VISOR_NEG
-        + VISOR_FIT
-        + (VISOR_RETRY if attempt > 0 else "")
+        "the face wears the slim wraparound visor glasses of Picture 1: exactly the same shape, thin frame and "
+        "the same electric blue color as Picture 1, sitting across the eyes with perfectly clear see-through "
+        "lenses so the eyes, eyelashes and eyebrows of Picture 2 stay sharp and fully visible. the lenses carry crisp "
+        "white and blue glass reflections near the temples and a thin clean ink outline, drawn in the same "
+        "illustration style as the rest of the avatar. "
+        "the Picture 1 visor is the ONLY eyewear on the face; do NOT copy any other glasses from Picture 2. "
     )
 
-def build_prompt(info, attempt=0, ref=False, style_mode=None, keep_user_expression=None):
-    if style_mode is None:
-        style_mode = settings.STYLE_MODE
+def _bfs_prompt(keep_user_expression: Optional[bool] = None) -> str:
     if keep_user_expression is None:
         keep_user_expression = settings.KEEP_USER_EXPRESSION
-
     expr = (
         "copy the head rotation and eye direction from Picture 1, but keep the facial expression and smile of Picture 2"
         if keep_user_expression
         else "copy the direction of the eye, head rotation, micro expressions from Picture 1"
     )
-    bfs = (
+    style_text = AVATAR_STYLE_TEXT.get(settings.STYLE_MODE, "high quality, sharp details, 4k.")
+    return (
         "head_swap: start with Picture 1 as the base image, keeping its lighting, environment, and background. "
         "remove the head from Picture 1 completely and replace it with the head from Picture 2, strictly "
-        "preserving the face, hair, eye color and nose structure of Picture 2. "
-        + expr
-        + ". "
+        f"preserving the hair, eye color, nose structure of Picture 2. {expr}. {style_text}"
     )
 
-    style_text = (
-        (
-            "the painted finish applies to the rendering only and must never change the face proportions. "
-            + {"semi_real": _SEMI_REAL, "comic": _COMIC}[style_mode]
-        )
-        if style_mode in ("semi_real", "comic")
-        else "high quality, sharp details, 4k."
+def build_hijab_prompt(info: dict) -> str:
+    return (
+        f"{_bfs_prompt()} "
+        "exact face swap: keep the identity of Picture 2 - face shape, cheeks, chin, eyes, eyebrows, eyelashes, nose, "
+        "lips, lipstick color, skin tone and her natural smile with the same teeth. "
+        "her skin is clean, smooth and natural like Picture 2. "
+        "she wears her own hijab from Picture 2: the same fabric color, pattern and folds, with the inner cap if "
+        "visible, wrapped around her face and neck and flowing into the jacket collar of Picture 1. "
+        "the hijab fully covers her hair, ears and neck. "
+        "only her head and hijab are taken from Picture 2; ignore her clothes, shirt, body and background. "
+        f"{_visor_text(info)}"
+        "keep the jacket, emblem and solid black background of Picture 1 unchanged."
     )
-    V = visor_block(info, attempt, ref)
-    closing = (
-        "keep the jacket, emblem and solid black background of Picture 1 unchanged. "
-        "final check: the face and build match Picture 2, the jawline is clean, and the angular blue clear "
-        "visor of the avatar is on the face with no other glasses."
-    )
+
+def build_prompt(info: dict) -> str:
     if info.get("hijab", False):
-        return (
-            f"{VISOR_MANDATORY}{bfs}{IDENTITY}{BUILD}{V}{HIJAB_VISOR_NOTE}"
-            f"{HIJAB_FACE}{HIJAB_USER}{FACE_CLEAN}{style_text} {closing} the visor is present and fits her face."
-        )
+        return build_hijab_prompt(info)
+
     if info.get("gender") == "Woman":
         return (
-            f"{VISOR_MANDATORY}{bfs}{IDENTITY}{FEMALE_FACE}{BUILD}"
-            "her hair is styled exactly like Picture 1: long black hair with red and orange highlights woven "
-            "throughout, styled in a high voluminous bun or updo at the crown, sleek and professionally polished, "
-            f"framing the face. {V}{FACE_CLEAN}{style_text} " + closing
+            f"{_bfs_prompt()} "
+            "exact face swap: keep the identity of Picture 2 - the exact jawline, jaw width and chin shape, "
+            "full cheeks, nose, eye shape, the exact eye color, eyebrows, lips, skin tone, skin texture and age. "
+            "her hair is styled exactly like Picture 1: long black hair with red and orange highlights woven throughout, "
+            "styled in a high voluminous bun or updo at the crown, sleek and professionally polished, framing the face. "
+            f"{_visor_text(info)}"
+            "keep the jacket, emblem and solid black background of Picture 1 unchanged. "
+            "keep the same makeup and lipstick color as Picture 1."
         )
+
+    if info.get("beard", False):
+        beard = (
+            "keep the exact beard style of Picture 2: its moustache, beard and goatee with the same shape, "
+            "coverage, length, density and natural color, trimmed the same way along the cheeks, jaw and chin. "
+            "keep grey hairs only where Picture 2 has them, do not add white hairs, do not shave, thin or "
+            "shorten it. "
+        )
+    else:
+        beard = (
+            "Picture 2 shows a CLEAN-SHAVEN man with NO facial hair whatsoever. "
+            "the man has a smooth, bare face: absolutely NO beard, NO moustache, NO goatee, NO stubble, NO sideburns. "
+            "the cheeks, chin, jaw, neck and upper lip are smooth and hairless. "
+            "do NOT copy any beard from Picture 1; completely remove it from the face if present. "
+            "keep only the natural hair on the head. "
+        )
+
     return (
-        f"{VISOR_MANDATORY}{bfs}{IDENTITY}{BUILD}{HAIR_USER}"
-        "FACIAL HAIR: keep the facial hair of Picture 2 exactly as it is: if Picture 2 has a moustache, goatee, "
-        "beard or stubble keep the same shape, coverage, length, density and grey or black color with a neat "
-        "natural edge; if Picture 2 is clean-shaven keep the skin smooth and add no facial hair. do not copy any "
-        f"facial hair from Picture 1. {V}{FACE_CLEAN}{style_text} " + closing
+        f"{_bfs_prompt()} "
+        "exact face swap: keep the identity of Picture 2 - the exact jawline, jaw width and chin shape of Picture 2 "
+        "(do not slim, narrow or lengthen the face), full cheeks, nose, eye shape, the exact eye color of Picture 2, "
+        "eyebrows, lips, skin tone, skin texture and age. "
+        "keep the exact hairstyle of Picture 2: the same hair color, length, volume, hairline and parting. "
+        "keep the smile of Picture 2 with the same open mouth and teeth. "
+        f"{beard}"
+        f"{_visor_text(info)}"
+        "keep the jacket, emblem and solid black background of Picture 1 unchanged."
     )
 
 # ============================================================================
-# Step 2 - avatar generation from the Step-1 face crop
+# Step 2 - avatar generation from the cropped face (single pass, no retries)
 # ============================================================================
 
 AVATAR_PATHS = {
     "Man": "Saytara_male.jpg",
     "Woman": "Saytara_Femal.png",
     "Woman_Hijab": "Saytara_hijab.jpg",
-}
-
-TEST_AVATARS = {
-    "Man": "Saytara_male.jpg",
-    "Woman": "Saytara_Femal.png",
-    "Woman_Hijab": "Saytara_hijab.jpg",
-}
-
-VISOR_REFS = {
-    "Man":         {"file": "Saytara_male.jpg",   "box": (0.28, 0.22, 0.65, 0.40), "image": None},
-    "Woman":       {"file": "Saytara_Femal.png", "box": (0.25, 0.29, 0.63, 0.49), "image": None},
-    "Woman_Hijab": {"file": "Saytara_hijab.jpg",        "box": (0.26, 0.25, 0.64, 0.45), "image": None},
 }
 
 AVATAR_HEAD_BOX = {
@@ -851,7 +733,6 @@ AVATAR_HEAD_BOX = {
 }
 
 _AV: Dict[str, Tuple[Image.Image, str]] = {}
-_VR: Dict[str, Optional[Image.Image]] = {}
 
 def fit16(img: Image.Image) -> Image.Image:
     w, h = (img.width // 16) * 16, (img.height // 16) * 16
@@ -883,111 +764,97 @@ def avatar_on_black(path: Path) -> Image.Image:
 
 def load_avatar(key: str) -> Tuple[Image.Image, str]:
     if key not in _AV:
-        primary_filename = TEST_AVATARS.get(key)
-        primary_path = (settings.AVATAR_DIR / primary_filename) if primary_filename else None
-        if primary_path and primary_path.exists():
-            chosen = primary_path
-        else:
-            fallback_filename = AVATAR_PATHS.get(key)
-            if not fallback_filename:
-                raise KeyError(f"Unknown avatar key '{key}'")
-            fallback_path = settings.AVATAR_DIR / fallback_filename
-            if not fallback_path.exists():
-                raise FileNotFoundError(
-                    f"Avatar template '{key}' not found in {settings.AVATAR_DIR} "
-                    f"(looked for {primary_filename} and {fallback_filename})"
-                )
-            chosen = fallback_path
-        logger.info("Loaded avatar template for %s: %s", key, chosen.name)
-        _AV[key] = (avatar_on_black(chosen), chosen.name)
+        filename = AVATAR_PATHS.get(key)
+        if not filename:
+            raise KeyError(f"Unknown avatar key '{key}'")
+        path = settings.AVATAR_DIR / filename
+        if not path.exists():
+            raise FileNotFoundError(f"Avatar template '{key}' not found: {path}")
+        logger.info("Loaded avatar template for %s: %s", key, path.name)
+        _AV[key] = (avatar_on_black(path), path.name)
     return _AV[key]
 
-def load_visor_ref(key: str) -> Optional[Image.Image]:
-    if not settings.USE_VISOR_REF or key not in VISOR_REFS:
-        return None
-    if key not in _VR:
-        cfg = VISOR_REFS[key]
-        img = None
-        if cfg.get("image") and Path(cfg["image"]).exists():
-            crop = avatar_on_black(Path(cfg["image"]))
-        else:
-            primary_file = settings.AVATAR_DIR / cfg["file"]
-            fallback_file = settings.AVATAR_DIR / AVATAR_PATHS.get(key, "")
-            src_path = (
-                primary_file
-                if primary_file.exists()
-                else (fallback_file if fallback_file.exists() else None)
-            )
-            if src_path:
-                src = avatar_on_black(src_path)
-                w, h = src.size
-                x0, y0, x1, y1 = cfg["box"]
-                crop = src.crop((int(x0 * w), int(y0 * h), int(x1 * w), int(y1 * h)))
-            else:
-                crop = None
-                logger.warning(
-                    "Visor reference file not found for %s (%s) - using text description only",
-                    key,
-                    cfg["file"],
-                )
-        if crop is not None:
-            s = max(crop.size)
-            canvas = Image.new("RGB", (s, s), "black")
-            canvas.paste(crop, ((s - crop.width) // 2, (s - crop.height) // 2))
-            img = canvas.resize((768, 768), Image.LANCZOS)
-        _VR[key] = img
-    return _VR[key]
-
-def pad_square(img: Image.Image, size: int = None) -> Image.Image:
+def head_crop(info: dict, scale: float, size: int = None) -> Image.Image:
+    """Head crop straight from the user's original photo, using Step 1's face box - no
+    eye-leveling rotation, no blur-padding, just a square crop resized to fit."""
     size = size or settings.REF_SIZE
-    s = max(img.size)
-    bg = img.resize((s, s), Image.LANCZOS).filter(ImageFilter.GaussianBlur(max(2, s // 18)))
-    bg.paste(img, ((s - img.width) // 2, (s - img.height) // 2))
-    return bg.resize((size, size), Image.LANCZOS)
-
-def load_face(info: dict) -> Image.Image:
-    p = info.get("crop_path")
-    if p and Path(p).exists():
-        return pad_square(Image.open(p).convert("RGB"))
     img = ImageOps.exif_transpose(Image.open(info["user_path"])).convert("RGB")
     x, y, w, h = info["face_box"]
-    s = max(w, h) * (settings.HIJAB_SCALE if info.get("hijab") else settings.FALLBACK_SCALE)
-    cx, cy = x + w / 2, y + h / 2 - h * 0.05
-    return pad_square(
-        img.crop(
-            (
-                int(max(0, cx - s)),
-                int(max(0, cy - s)),
-                int(min(img.width, cx + s)),
-                int(min(img.height, cy + s)),
-            )
-        )
+    cx, cy, s = x + w / 2, y + h / 2 - h * 0.05, max(w, h) * scale
+    box = (
+        int(max(0, cx - s)),
+        int(max(0, cy - s)),
+        int(min(img.width, cx + s)),
+        int(min(img.height, cy + s)),
     )
+    return img.crop(box).resize((size, size), Image.LANCZOS)
+
+def _crop_frac(img: Image.Image, box: Tuple[float, float, float, float]) -> Image.Image:
+    w, h = img.size
+    x0, y0, x1, y1 = box
+    return img.crop((int(x0 * w), int(y0 * h), int(x1 * w), int(y1 * h)))
 
 def check_visor(out_img: Image.Image) -> dict:
     a = np.asarray(out_img.convert("RGB"))
     h, w = a.shape[:2]
-    regions = {
-        "left":   a[int(h * 0.20):int(h * 0.46), int(w * 0.26):int(w * 0.49)],
-        "bridge": a[int(h * 0.22):int(h * 0.43), int(w * 0.44):int(w * 0.57)],
-        "right":  a[int(h * 0.20):int(h * 0.46), int(w * 0.52):int(w * 0.76)],
-    }
-    s = {}
-    for name, r in regions.items():
-        hsv = cv2.cvtColor(np.ascontiguousarray(r), cv2.COLOR_RGB2HSV)
-        s[name] = float(
-            (
-                (hsv[..., 0] >= 85)
-                & (hsv[..., 0] <= 130)
-                & (hsv[..., 1] > 60)
-                & (hsv[..., 2] > 90)
-            ).mean()
-        )
-    ok = s["left"] > 0.006 and s["bridge"] > 0.002 and s["right"] > 0.006
-    return {
-        "visor": "ok" if ok else "weak",
-        "visor_score": round(min(s["left"], s["right"]) + s["bridge"], 4),
-    }
+    band = a[int(h * 0.20):int(h * 0.50), int(w * 0.25):int(w * 0.70)]
+    hsv = cv2.cvtColor(band, cv2.COLOR_RGB2HSV)
+    m = (hsv[..., 0] >= 85) & (hsv[..., 0] <= 130) & (hsv[..., 1] > 80) & (hsv[..., 2] > 90)
+    score = round(float(m.mean()), 4)
+    return {"glasses_check": "ok" if score > 0.02 else "weak", "visor_score": score}
+
+_CLIP_RAW: Dict[str, Any] = {}
+
+def _load_clip_raw():
+    if "m" not in _CLIP_RAW:
+        from transformers import CLIPModel, CLIPProcessor
+        _CLIP_RAW["m"] = CLIPModel.from_pretrained(settings.CLIP_MODEL).eval()
+        _CLIP_RAW["p"] = CLIPProcessor.from_pretrained(settings.CLIP_MODEL)
+    return _CLIP_RAW["m"], _CLIP_RAW["p"]
+
+_BEARD_LABELS = [
+    "a close-up photo of a man with a full thick beard",
+    "a close-up photo of a man with a goatee and a moustache",
+    "a close-up photo of a man with a short dense stubble beard on his cheeks and chin",
+    "a close-up photo of a clean-shaven man with smooth bare skin and no facial hair",
+]
+
+def _hair_prob(head_img: Image.Image) -> Tuple[Optional[float], Optional[List[float]]]:
+    try:
+        w, h = head_img.size
+        lower = head_img.convert("RGB").crop((int(w * 0.10), int(h * 0.40), int(w * 0.90), h))
+        m, p = _load_clip_raw()
+        inputs = p(text=_BEARD_LABELS, images=lower, return_tensors="pt", padding=True)
+        with torch.no_grad():
+            probs = m(**inputs).logits_per_image.softmax(-1)[0].tolist()
+        return round(1.0 - probs[3], 3), probs
+    except Exception as e:
+        logger.warning("Beard CLIP check failed: %s", e)
+        return None, None
+
+def _jaw_score(head_img: Image.Image) -> float:
+    g = np.asarray(head_img.convert("L")).astype(float)
+    h, w = g.shape
+    cheek = np.concatenate(
+        [
+            g[int(h * 0.48):int(h * 0.60), int(w * 0.18):int(w * 0.34)].ravel(),
+            g[int(h * 0.48):int(h * 0.60), int(w * 0.66):int(w * 0.82)].ravel(),
+        ]
+    )
+    jaw = g[int(h * 0.68):int(h * 0.92), int(w * 0.28):int(w * 0.72)]
+    return round(float((jaw < np.median(cheek) * 0.55).mean()), 3)
+
+def detect_beard_step2(head_img: Image.Image) -> Tuple[bool, float]:
+    """Re-detects the beard on the head_crop used for generation (more accurate than
+    Step 1's detect_beard, which runs on the raw Step-1 crop for template tagging only)."""
+    jaw = _jaw_score(head_img)
+    p_hair, probs = _hair_prob(head_img)
+    if p_hair is None:
+        return jaw > settings.JAW_BEARD, jaw
+    clean_shaven_score = probs[3]
+    beard_score = max(probs[0], probs[1], probs[2])
+    has_beard = (beard_score > clean_shaven_score) or (jaw > settings.JAW_BEARD and beard_score > 0.4)
+    return has_beard, max(beard_score, p_hair)
 
 def _prep(img: Image.Image) -> Image.Image:
     img = img.convert("RGB")
@@ -1055,30 +922,53 @@ def compare(user: dict, out: dict) -> Tuple[float, Optional[float], Optional[flo
     )
     return round(1.0 - d, 4), _ratio(u, user["width"]), _ratio(o, out["width"])
 
-def score_output(user_emb: Optional[dict], out: Image.Image, info: dict) -> dict:
+def verify_faces(
+    user_img: Image.Image, out_img: Image.Image, box: Optional[Tuple[float, float, float, float]] = None
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    user_emb = embed_user(user_img)
+    if user_emb is None:
+        return None, None, None
+    out_emb = embed(out_img, True, "out")
+    if out_emb is None and box is not None:
+        out_emb = embed(_crop_frac(out_img, box), False, "out")
+    if out_emb is None:
+        return None, None, None
+    return compare(user_emb, out_emb)
+
+def validate_output(user_img: Image.Image, out: Image.Image, info: dict) -> dict:
+    """Validates the single generated image (identity, jaw, beard, visor). Only runs when
+    settings.VALIDATE is True - off by default, since ArcFace gives unreliable scores on
+    illustrated avatars. Used for logging/response metadata, not for retrying (single pass)."""
+    box = AVATAR_HEAD_BOX.get(info["avatar"])
+    id_sim, u_ratio, o_ratio = verify_faces(user_img, out, box)
+    jaw_diff = (abs(o_ratio - u_ratio) / u_ratio) if (u_ratio and o_ratio) else None
+
+    beard_ok = None
+    if info["gender"] == "Man" and box:
+        p_out, _ = _hair_prob(_crop_frac(out, box))
+        if p_out is not None:
+            beard_ok = (p_out > settings.BEARD_P) == bool(info.get("beard", False))
+
     vis = check_visor(out)
-    sim = u_r = o_r = None
-    if settings.VALIDATE and user_emb is not None:
-        o = embed(out, True, "out")
-        if o is None:
-            box = AVATAR_HEAD_BOX.get(info["avatar"], (0.25, 0.05, 0.68, 0.62))
-            w, h = out.size
-            o = embed(
-                out.crop((int(box[0] * w), int(box[1] * h), int(box[2] * w), int(box[3] * h))),
-                False,
-                "out",
-            )
-        if o is not None:
-            sim, u_r, o_r = compare(user_emb, o)
-    jaw = (abs(o_r - u_r) / u_r) if (u_r and o_r) else None
+    visor_ok = vis["glasses_check"] == "ok"
+
+    passed = (
+        (id_sim is None or id_sim >= settings.ID_PASS)
+        and (jaw_diff is None or jaw_diff <= settings.JAW_TOL)
+        and (beard_ok is None or beard_ok)
+        and visor_ok
+    )
     score = (
-        (sim or 0.0)
-        - settings.W_JAW * (jaw or 0.0)
-        - (settings.W_NO_VISOR if vis["visor"] == "weak" else 0.0)
+        (id_sim or 0.0)
+        - 0.5 * (jaw_diff or 0.0)
+        - (0.3 if beard_ok is False else 0.0)
+        - (0.4 if not visor_ok else 0.0)
     )
     return {
-        "id_sim": None if sim is None else round(sim, 3),
-        "jaw_diff": None if jaw is None else round(jaw, 3),
+        "id_sim": None if id_sim is None else round(id_sim, 3),
+        "jaw_diff": None if jaw_diff is None else round(jaw_diff, 3),
+        "beard_ok": beard_ok,
+        "passed": passed,
         "score": round(score, 3),
         **vis,
     }
@@ -1120,121 +1010,80 @@ def encode_jpeg_capped(img: Image.Image, max_bytes: int = None) -> bytes:
     return smallest
 
 def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = None) -> Tuple[bytes, dict]:
-    # t0 defaults to "now" (generation-only budget) but callers should pass the
-    # timestamp from before Step 1 analysis so TIME_BUDGET covers the whole
-    # image end-to-end, matching the notebook.
+    # t0 defaults to "now" but callers should pass the timestamp from before Step 1
+    # analysis so "seconds" reports the whole image end-to-end, matching the notebook.
     if t0 is None:
         t0 = time.time()
     user_path = Path(user_image_path)
     rec: Dict[str, Any] = {"file": user_path.name}
 
-    test_lora = settings.LORA_STRENGTH * settings.ID_LORA_MULT
-    progress = None
     try:
         avatar, _ = load_avatar(info["avatar"])
-        face = load_face(info)
-        visor_ref = load_visor_ref(info["avatar"])
-        images = [avatar, face] + ([visor_ref] if visor_ref is not None else [])
+        scale = settings.HIJAB_SCALE if info.get("hijab") else settings.FALLBACK_SCALE
+        face = head_crop(info, scale)
         seed = settings.SEED
         w, h = avatar.size
-        max_k = settings.BEST_OF_N if settings.VALIDATE else 1
-        extras = 0
 
-        dbg = None
+        has_beard, beard_score = (
+            detect_beard_step2(face) if info["gender"] == "Man" else (False, 0.0)
+        )
+        info["beard"] = has_beard
+        logger.info("Step 2 beard re-check: %s (score %.3f)", has_beard, beard_score or 0.0)
+
+        prompt = build_prompt(info)
+
         if settings.DEBUG_DUMP:
             dbg = settings.OUTPUT_DIR / "debug" / f"{info['key']}_{info['avatar']}"
             dbg.mkdir(parents=True, exist_ok=True)
             avatar.save(dbg / "0_avatar.png")
             face.save(dbg / "1_face_ref.png")
-            if visor_ref is not None:
-                visor_ref.save(dbg / "2_visor_ref.png")
             (dbg / "info.json").write_text(json.dumps(info, indent=2, default=str), encoding="utf-8")
-            (dbg / "prompt_try1.txt").write_text(build_prompt(info, 0, visor_ref is not None), encoding="utf-8")
+            (dbg / "prompt.txt").write_text(prompt, encoding="utf-8")
             logger.info("DEBUG_DUMP -> %s (adapters=%s, lora_layers=%d)", dbg, _adapters(), lora_layers)
 
-        # CPU embedding runs in thread while GPU generates try #1
-        fut = _POOL.submit(embed_user, face) if settings.VALIDATE else None
+        set_lora(settings.LORA_STRENGTH)
+        tg = time.time()
+        with torch.no_grad():
+            out = pipe(
+                prompt=prompt,
+                image=[avatar, face],
+                attention_kwargs=lora_kwargs(),
+                width=w,
+                height=h,
+                num_inference_steps=settings.STEPS,
+                guidance_scale=settings.CFG,
+                generator=torch.Generator("cuda").manual_seed(seed),
+            ).images[0]
+        torch.cuda.empty_cache()
+        gen_s = time.time() - tg
 
-        best, k, gen_s, val_s, stopped = None, 0, 0.0, 0.0, "all tries"
-        t_loop = time.time()
+        tv = time.time()
+        if settings.VALIDATE and info["avatar"] in settings.VALIDATE_AVATARS:
+            v = validate_output(face, out, info)
+        else:
+            vis = check_visor(out)
+            visor_ok = vis["glasses_check"] == "ok"
+            v = {
+                "id_sim": None,
+                "jaw_diff": None,
+                "beard_ok": None,
+                "passed": visor_ok,
+                "score": vis["visor_score"],
+                **vis,
+            }
+        val_s = time.time() - tv
 
-        progress = tqdm(total=max_k, desc=f"Generating avatar ({user_path.name})", unit="try")
-        while True:
-            mult = settings.ID_LORA_SCHEDULE[k % len(settings.ID_LORA_SCHEDULE)]
-            set_lora(test_lora * mult)
-            prompt = build_prompt(info, attempt=k, ref=visor_ref is not None)
+        logger.info(
+            "id_sim=%s, jaw_diff=%s, beard_ok=%s, visor=%s, score=%s (gen=%.1fs, validate=%.1fs)",
+            v["id_sim"],
+            v["jaw_diff"],
+            v["beard_ok"],
+            v["glasses_check"],
+            v["score"],
+            gen_s,
+            val_s,
+        )
 
-            tg = time.time()
-            with torch.no_grad():
-                out = pipe(
-                    prompt=prompt,
-                    image=images,
-                    attention_kwargs=lora_kwargs(),
-                    width=w,
-                    height=h,
-                    num_inference_steps=settings.STEPS,
-                    guidance_scale=settings.CFG,
-                    generator=torch.Generator("cuda").manual_seed(seed + k),
-                ).images[0]
-            torch.cuda.empty_cache()
-            g = time.time() - tg
-
-            tv = time.time()
-            user_emb = fut.result() if fut is not None else None
-            v = score_output(user_emb, out, info)
-            s = time.time() - tv
-
-            gen_s, val_s = gen_s + g, val_s + s
-            if dbg is not None:
-                out.save(dbg / f"try{k + 1}_seed{seed + k}_lora{mult}.png")
-            logger.info(
-                "Try %d (seed=%d, lora_mult=%.1f): id_sim=%s, jaw_diff=%s, visor=%s, score=%s (gen=%.1fs, score=%.1fs)",
-                k + 1,
-                seed + k,
-                mult,
-                v["id_sim"],
-                v["jaw_diff"],
-                v["visor"],
-                v["score"],
-                g,
-                s,
-            )
-
-            if best is None or (v["visor"] == "ok", v["score"]) > (
-                best["v"]["visor"] == "ok",
-                best["v"]["score"],
-            ):
-                best = {"out": out, "v": v, "k": k + 1, "mult": mult}
-
-            k += 1
-            progress.set_postfix(id_sim=v["id_sim"], visor=v["visor"], score=v["score"])
-            progress.update(1)
-
-            if settings.VALIDATE and (v["id_sim"] or 0) >= settings.STOP_ID and v["visor"] == "ok":
-                stopped = "good"
-                break
-
-            if k >= max_k:
-                if best["v"]["visor"] != "ok" and extras < settings.VISOR_EXTRA_TRIES:
-                    extras += 1
-                    max_k += 1
-                    progress.total = max_k
-                    progress.refresh()
-                    logger.info("Visor not ok - adding extra try (if budget permits)")
-                else:
-                    break
-
-            per_try = (time.time() - t_loop) / k
-            if settings.TIME_BUDGET > 0 and time.time() - t0 + per_try > settings.TIME_BUDGET:
-                stopped = "budget"
-                logger.info(
-                    "Time budget reached (%.1fs elapsed, ~%.1fs per try) - stopping search",
-                    time.time() - t0,
-                    per_try,
-                )
-                break
-
-        out, v = best["out"], best["v"]
         jpeg_bytes = encode_jpeg_capped(out, settings.OUTPUT_MAX_BYTES)
         rec.update(
             status="done",
@@ -1242,35 +1091,29 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
             hijab=info.get("hijab", False),
             avatar=info["avatar"],
             glasses=info.get("glasses", False),
-            beard=info.get("beard", False),
+            beard=has_beard,
+            beard_score=round(float(beard_score or 0.0), 3),
             seconds=round(time.time() - t0, 1),
             gen_s=round(gen_s, 1),
             val_s=round(val_s, 1),
-            tries=k,
-            best_try=best["k"],
-            stopped=stopped,
-            lora_mult=best["mult"],
+            validated=v["passed"],
             id_sim=v["id_sim"],
             jaw_diff=v["jaw_diff"],
-            score=v["score"],
-            visor=v["visor"],
+            beard_ok=v["beard_ok"],
+            visor=v["glasses_check"],
             visor_score=v["visor_score"],
+            score=v["score"],
             output_bytes=len(jpeg_bytes),
         )
         logger.info(
-            "Best candidate selected: try %d of %d, id_sim=%s, visor=%s, score=%s in %.1fs, "
-            "output=%d bytes (JPEG, cap=%d)",
-            best["k"],
-            k,
+            "Done: id_sim=%s, visor=%s, passed=%s in %.1fs, output=%d bytes (JPEG, cap=%d)",
             v["id_sim"],
-            v["visor"],
-            v["score"],
+            v["glasses_check"],
+            v["passed"],
             rec["seconds"],
             len(jpeg_bytes),
             settings.OUTPUT_MAX_BYTES,
         )
         return jpeg_bytes, rec
     finally:
-        if progress is not None:
-            progress.close()
         set_lora(settings.LORA_STRENGTH)

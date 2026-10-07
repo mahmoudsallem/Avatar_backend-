@@ -14,11 +14,17 @@ The service executes a 2-step AI pipeline:
    - **Attribute Detection**: Classifies Gender (DeepFace with CLIP fallback), Eyeglasses (CLIP multi-view), Beard (CLIP multi-view), and Hijab (CLIP multi-view).
    - Generates an exact aligned face crop used by the diffusion model.
 
-2. **Step 2: Sci-Fi Avatar Generation & Validation (`generate_avatar`)**
-   - Prepares avatar template (`Man`, `Woman`, or `Woman_Hijab`), user face crop, and avatar visor reference image.
-   - Assembles a detailed hand-tuned prompt enforcing facial likeness, build, and futuristic blue wraparound visor.
-   - Executes FLUX.2-klein-9B with BFS face-swap LoRA.
-   - **Identity & Visor Verification**: Evaluates generated candidates via ArcFace cosine similarity (in a persistent CPU worker) and OpenCV HSV visor detection. Retries up to `BEST_OF_N` candidates within a configured `TIME_BUDGET` (default: 40s), keeping the highest-scoring candidate.
+2. **Step 2: Sci-Fi Avatar Generation (`generate_avatar`)**
+   - Prepares the avatar template (`Man`, `Woman`, or `Woman_Hijab`) and a head crop taken directly from the user's
+     original photo (no Picture 3 visor reference image - the visor is described in the prompt text only).
+   - Re-checks beard presence specifically on that head crop (CLIP + jaw-darkness heuristic), overriding Step 1's
+     beard tag for prompt purposes.
+   - Assembles a detailed hand-tuned prompt enforcing facial likeness and the futuristic blue wraparound visor.
+   - Executes FLUX.2-klein-9B with BFS face-swap LoRA in a **single pass** (no retries).
+   - **Optional validation** (`VALIDATE`, off by default): scores the one generated image via ArcFace cosine
+     similarity (in a persistent CPU worker), jaw ratio, beard match, and OpenCV HSV visor detection - for response
+     metadata/logging only, since it's a single pass there's nothing to retry into. Off by default because ArcFace
+     gives unreliable scores on the illustrated avatar style.
 
 3. **Concurrency Model**:
    - Because FLUX.2-klein-9B is a ~9B parameter model requiring significant GPU VRAM, generation requests are serialized behind an asynchronous GPU lock (`pipeline.gpu_lock`).
@@ -173,14 +179,13 @@ curl -X POST http://localhost:8000/v1/avatar \
   `OUTPUT_MAX_BYTES` (default **300 KB** / `307200` bytes): quality is stepped down from 95 towards
   20 first, and if it's still over budget at the lowest quality, the image is downscaled and the
   quality ladder is retried, repeating until it fits.
-- A few scoring/progress fields are echoed back as response headers (the rest is still only
-  logged server-side for debugging):
-  - `X-Tries-Used`: how many generation attempts were run.
-  - `X-Best-Try`: which attempt (1-based) was picked as the best candidate.
-  - `X-Stop-Reason`: why the retry loop stopped (`good`, `all tries`, or `budget`).
-  - `X-Generation-Seconds`: total time spent generating, in seconds.
-  - `X-Identity-Similarity`: ArcFace cosine similarity of the best candidate to the user's face.
-  - `X-Visor-Status`: whether the visor was detected correctly on the best candidate.
+- A few scoring fields are echoed back as response headers (the rest is still only logged
+  server-side for debugging):
+  - `X-Generation-Seconds`: total time spent on the image end-to-end (Step 1 + Step 2), in seconds.
+  - `X-Identity-Similarity`: ArcFace cosine similarity to the user's face (empty unless `VALIDATE=true`).
+  - `X-Visor-Status`: whether the visor was detected on the generated image (`ok` or `weak`).
+  - `X-Validated`: whether the image passed validation (`true`/`false`) - always reflects at least the
+    visor check, even with `VALIDATE=false`.
 
 **Validation Rejection (400 Bad Request)**:
 Returned when a photo is rejected by Step 1 validation (multiple faces, no face, non-human subject, uncertain gender, etc.):
