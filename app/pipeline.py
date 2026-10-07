@@ -204,6 +204,13 @@ def _log_versions() -> None:
         except Exception:
             vs.append(f"{pkg}=?")
     logger.info("Library versions: %s", ", ".join(vs))
+    try:
+        if int(md.version("transformers").split(".")[0]) >= 5:
+            logger.warning(
+                "transformers %s is a 5.x release - the notebook was built on 4.x. If avatars ignore the user's "
+                "face/hair, run: pip install 'transformers>=4.56,<5' and restart.", md.version("transformers"))
+    except Exception:
+        pass
 
 def load_models() -> None:
     global clip, pipe

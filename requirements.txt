@@ -16,10 +16,12 @@ pydantic>=2.9.0
 pydantic-settings>=2.5.0
 
 # Diffusion & Transformers Models
-diffusers>=0.41.0
-transformers>=4.56.0
+diffusers>=0.41.0,<0.42
+# transformers 5.x changes the Qwen3 tokenizer / chat-template path that FLUX.2-klein's text encoder uses.
+# Stay on the 4.x line the notebook was developed with.
+transformers>=4.56.0,<5
 accelerate>=0.34.0
-peft>=0.13.0
+peft>=0.13.0,<0.22
 safetensors>=0.4.5
 huggingface-hub>=0.25.0
 
