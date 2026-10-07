@@ -60,6 +60,12 @@ class Settings(BaseSettings):
     HIJAB_POSITIVE_THRESHOLD: float = 0.50
     HIJAB_MIN_SCORE_MARGIN: float = 0.00
 
+    # Bald/hairless men (male avatar only). Needs BOTH a scalp-colour check and CLIP to agree.
+    DETECT_BALD: bool = True
+    BALD_POSITIVE_THRESHOLD: float = 0.52
+    BALD_MIN_SCORE_MARGIN: float = 0.03
+    BALD_FALLBACK_CLIP: float = 0.70  # CLIP-only confidence needed when the scalp area is outside the crop
+
     # ---------------- Generation Settings ----------------
     STEPS: int = 20
     CFG: float = 3.0

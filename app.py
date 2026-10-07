@@ -72,6 +72,7 @@ app.add_middleware(
         "X-Generation-Seconds",
         "X-Identity-Similarity",
         "X-Visor-Status",
+        "X-Bald-Status",
     ],
 )
 
@@ -152,6 +153,7 @@ async def _generate_avatar_from_bytes(content: bytes, filename: str):
             "X-Generation-Seconds": str(metadata.get("seconds", "")),
             "X-Identity-Similarity": str(metadata.get("id_sim", "")),
             "X-Visor-Status": str(metadata.get("visor", "")),
+            "X-Bald-Status": str(metadata.get("bald", "")),
         }
         return Response(content=jpeg_bytes, media_type="image/jpeg", headers=headers)
 
