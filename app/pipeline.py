@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 import torch
+from tqdm import tqdm
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 from app.config import settings
@@ -1019,6 +1020,7 @@ def generate_avatar(user_image_path: Path, info: dict) -> Tuple[bytes, dict]:
     rec: Dict[str, Any] = {"file": user_path.name}
 
     test_lora = settings.LORA_STRENGTH * settings.ID_LORA_MULT
+    progress = None
     try:
         avatar, _ = load_avatar(info["avatar"])
         face = load_face(info)
@@ -1035,6 +1037,7 @@ def generate_avatar(user_image_path: Path, info: dict) -> Tuple[bytes, dict]:
         best, k, gen_s, val_s, stopped = None, 0, 0.0, 0.0, "all tries"
         t_loop = time.time()
 
+        progress = tqdm(total=max_k, desc=f"Generating avatar ({user_path.name})", unit="try")
         while True:
             mult = settings.ID_LORA_SCHEDULE[k % len(settings.ID_LORA_SCHEDULE)]
             set_lora(test_lora * mult)
@@ -1080,6 +1083,8 @@ def generate_avatar(user_image_path: Path, info: dict) -> Tuple[bytes, dict]:
                 best = {"out": out, "v": v, "k": k + 1, "mult": mult}
 
             k += 1
+            progress.set_postfix(id_sim=v["id_sim"], visor=v["visor"], score=v["score"])
+            progress.update(1)
 
             if settings.VALIDATE and (v["id_sim"] or 0) >= settings.STOP_ID and v["visor"] == "ok":
                 stopped = "good"
@@ -1089,6 +1094,8 @@ def generate_avatar(user_image_path: Path, info: dict) -> Tuple[bytes, dict]:
                 if best["v"]["visor"] != "ok" and extras < settings.VISOR_EXTRA_TRIES:
                     extras += 1
                     max_k += 1
+                    progress.total = max_k
+                    progress.refresh()
                     logger.info("Visor not ok - adding extra try (if budget permits)")
                 else:
                     break
@@ -1140,4 +1147,6 @@ def generate_avatar(user_image_path: Path, info: dict) -> Tuple[bytes, dict]:
         )
         return jpeg_bytes, rec
     finally:
+        if progress is not None:
+            progress.close()
         set_lora(settings.LORA_STRENGTH)
