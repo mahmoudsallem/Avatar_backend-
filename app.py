@@ -1,4 +1,5 @@
 import sys
+import time
 import uuid
 import base64
 import logging
@@ -130,6 +131,9 @@ async def _generate_avatar_from_bytes(content: bytes, filename: str):
 
         # Acquire GPU lock to serialize generation requests safely
         async with pipeline.gpu_lock:
+            # TIME_BUDGET covers the whole image (Step 1 analysis + Step 2 generation),
+            # matching the notebook - start the clock before analyse_user, not after it.
+            t0 = time.time()
             try:
                 info = await asyncio.to_thread(pipeline.analyse_user, temp_path)
             except pipeline.Rejected as r:
@@ -138,7 +142,7 @@ async def _generate_avatar_from_bytes(content: bytes, filename: str):
 
             # Returns the final avatar as JPEG bytes, already capped at
             # settings.OUTPUT_MAX_BYTES - that's the entire response body.
-            jpeg_bytes, metadata = await asyncio.to_thread(pipeline.generate_avatar, temp_path, info)
+            jpeg_bytes, metadata = await asyncio.to_thread(pipeline.generate_avatar, temp_path, info, t0)
 
         headers = {
             "X-Tries-Used": str(metadata.get("tries", "")),

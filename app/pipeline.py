@@ -1055,8 +1055,12 @@ def encode_jpeg_capped(img: Image.Image, max_bytes: int = None) -> bytes:
     )
     return smallest
 
-def generate_avatar(user_image_path: Path, info: dict) -> Tuple[bytes, dict]:
-    t0 = time.time()
+def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = None) -> Tuple[bytes, dict]:
+    # t0 defaults to "now" (generation-only budget) but callers should pass the
+    # timestamp from before Step 1 analysis so TIME_BUDGET covers the whole
+    # image end-to-end, matching the notebook.
+    if t0 is None:
+        t0 = time.time()
     user_path = Path(user_image_path)
     rec: Dict[str, Any] = {"file": user_path.name}
 

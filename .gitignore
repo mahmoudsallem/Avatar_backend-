@@ -26,3 +26,5 @@ ENV/
 .idea/
 .DS_Store
 Thumbs.db
+
+users/
