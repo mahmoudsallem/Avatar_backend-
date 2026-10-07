@@ -72,6 +72,7 @@ class Settings(BaseSettings):
     REFINE_STRENGTH: float = 0.85
     FACE_CROP_SCALE: float = 0.75
     CLEAN_BG: bool = True
+    DEBUG_DUMP: bool = False  # save face ref / visor ref / prompt / every candidate to output/debug/<key>/
     VAE_TILING: bool = False  # False = same as notebook (no tiled VAE decode)
 
     FALLBACK_SCALE: float = 1.15

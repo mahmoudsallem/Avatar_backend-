@@ -13,6 +13,9 @@ rejected/
 _val_tmp/
 *.log
 
+# Local dev/debug test scripts and scratch files
+test/
+
 # Virtual environments
 .venv/
 venv/

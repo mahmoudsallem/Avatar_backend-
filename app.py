@@ -109,6 +109,7 @@ async def health_check():
         "clip_loaded": clip_loaded,
         "flux_loaded": flux_loaded,
         "val_worker_running": worker_ready,
+        "lora_layers_attached": pipeline.lora_layers,
         "gpu_free_vram_gb": free_gb,
         "gpu_total_vram_gb": total_gb,
     }

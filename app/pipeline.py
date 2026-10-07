@@ -180,6 +180,31 @@ def is_val_worker_alive() -> bool:
     p = _VW.get("p")
     return p is not None and p.poll() is None
 
+lora_layers = 0
+
+def _count_lora_layers() -> int:
+    try:
+        from peft.tuners.tuners_utils import BaseTunerLayer
+        return sum(isinstance(m, BaseTunerLayer) for m in pipe.transformer.modules())
+    except Exception:
+        return sum(1 for m in pipe.transformer.modules() if hasattr(m, "lora_A"))
+
+def _adapters():
+    try:
+        return pipe.get_active_adapters()
+    except Exception:
+        return None
+
+def _log_versions() -> None:
+    import importlib.metadata as md
+    vs = []
+    for pkg in ("torch", "diffusers", "transformers", "peft", "accelerate", "safetensors", "deepface", "tensorflow", "tf-keras"):
+        try:
+            vs.append(f"{pkg}={md.version(pkg)}")
+        except Exception:
+            vs.append(f"{pkg}=?")
+    logger.info("Library versions: %s", ", ".join(vs))
+
 def load_models() -> None:
     global clip, pipe
 
@@ -232,6 +257,15 @@ def load_models() -> None:
         shift=1.0,
         use_dynamic_shifting=False,
     )
+    global lora_layers
+    lora_layers = _count_lora_layers()
+    _log_versions()
+    logger.info("Active adapters: %s | LoRA layers attached to transformer: %d", _adapters(), lora_layers)
+    if lora_layers == 0:
+        raise RuntimeError(
+            "BFS LoRA loaded but NO LoRA layers are attached to the FLUX transformer - face swap would silently "
+            "ignore the user's face. Check diffusers / peft / transformers versions against the notebook."
+        )
     logger.info("FLUX + LoRA pipeline loaded successfully.")
 
     # Start persistent ArcFace identity verification worker
@@ -1038,6 +1072,18 @@ def generate_avatar(user_image_path: Path, info: dict) -> Tuple[bytes, dict]:
         max_k = settings.BEST_OF_N if settings.VALIDATE else 1
         extras = 0
 
+        dbg = None
+        if settings.DEBUG_DUMP:
+            dbg = settings.OUTPUT_DIR / "debug" / f"{info['key']}_{info['avatar']}"
+            dbg.mkdir(parents=True, exist_ok=True)
+            avatar.save(dbg / "0_avatar.png")
+            face.save(dbg / "1_face_ref.png")
+            if visor_ref is not None:
+                visor_ref.save(dbg / "2_visor_ref.png")
+            (dbg / "info.json").write_text(json.dumps(info, indent=2, default=str), encoding="utf-8")
+            (dbg / "prompt_try1.txt").write_text(build_prompt(info, 0, visor_ref is not None), encoding="utf-8")
+            logger.info("DEBUG_DUMP -> %s (adapters=%s, lora_layers=%d)", dbg, _adapters(), lora_layers)
+
         # CPU embedding runs in thread while GPU generates try #1
         fut = _POOL.submit(embed_user, face) if settings.VALIDATE else None
 
@@ -1071,6 +1117,8 @@ def generate_avatar(user_image_path: Path, info: dict) -> Tuple[bytes, dict]:
             s = time.time() - tv
 
             gen_s, val_s = gen_s + g, val_s + s
+            if dbg is not None:
+                out.save(dbg / f"try{k + 1}_seed{seed + k}_lora{mult}.png")
             logger.info(
                 "Try %d (seed=%d, lora_mult=%.1f): id_sim=%s, jaw_diff=%s, visor=%s, score=%s (gen=%.1fs, score=%.1fs)",
                 k + 1,
