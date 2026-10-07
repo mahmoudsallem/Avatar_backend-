@@ -221,8 +221,9 @@ def load_models() -> None:
 
     # Decode the final image in tiles instead of one giant allocation - this is what was
     # tipping requests into CUDA OOM right at the end of generation.
-    pipe.vae.enable_tiling()
-    pipe.vae.enable_slicing()
+    if settings.VAE_TILING:
+        pipe.vae.enable_tiling()
+        pipe.vae.enable_slicing()
 
     logger.info("Loading LoRA weights: %s / %s", settings.LORA, settings.LORA_FILE)
     pipe.load_lora_weights(settings.LORA, weight_name=settings.LORA_FILE, adapter_name="bfs")
@@ -1159,7 +1160,7 @@ def generate_avatar(user_image_path: Path, info: dict) -> Tuple[bytes, dict]:
                     break
 
             per_try = (time.time() - t_loop) / k
-            if time.time() - t0 + per_try > settings.TIME_BUDGET:
+            if settings.TIME_BUDGET > 0 and time.time() - t0 + per_try > settings.TIME_BUDGET:
                 stopped = "budget"
                 logger.info(
                     "Time budget reached (%.1fs elapsed, ~%.1fs per try) - stopping search",

@@ -74,6 +74,7 @@ class Settings(BaseSettings):
     REFINE_STRENGTH: float = 0.85
     FACE_CROP_SCALE: float = 0.75
     CLEAN_BG: bool = True
+    VAE_TILING: bool = False  # False = same as notebook (no tiled VAE decode)
 
     FALLBACK_SCALE: float = 1.15
     HIJAB_SCALE: float = 1.25
@@ -86,7 +87,7 @@ class Settings(BaseSettings):
     VALIDATE: bool = True
     BEST_OF_N: int = 3
     VISOR_EXTRA_TRIES: int = 2
-    TIME_BUDGET: float = 40.0
+    TIME_BUDGET: float = 0.0  # 0 = no limit (notebook behaviour)
     ID_LORA_SCHEDULE: List[float] = [1.0, 1.1, 1.2]
     STOP_ID: float = 0.55
     W_JAW: float = 0.8
