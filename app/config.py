@@ -65,6 +65,7 @@ class Settings(BaseSettings):
     CFG: float = 3.0
     REFINE_CFG: float = 2.0
     LORA_STRENGTH: float = 1.1
+    ID_LORA_MULT: float = 1.0
     SEED: int = 42
     HEAD_CROP_SCALE: float = 1.6
     REFINE_IDENTITY: bool = True
@@ -72,22 +73,25 @@ class Settings(BaseSettings):
     FACE_CROP_SCALE: float = 0.75
     CLEAN_BG: bool = True
     LORA_SELFTEST: bool = True  # at startup, prove the BFS LoRA really changes the output; auto-pick how to apply its strength
-    DEBUG_DUMP: bool = False  # save avatar/face ref + prompt to output/debug/<key>/
+    DEBUG_DUMP: bool = False  # save face ref / visor ref / prompt / every candidate to output/debug/<key>/
     VAE_TILING: bool = False  # False = same as notebook (no tiled VAE decode)
 
-    FALLBACK_SCALE: float = 1.15  # head-crop scale for Man/Woman (notebook: TEST_HEAD_SCALE)
-    HIJAB_SCALE: float = 1.25  # head-crop scale for Woman_Hijab (notebook: HIJAB_HEAD_SCALE)
+    FALLBACK_SCALE: float = 1.15
+    HIJAB_SCALE: float = 1.25
     REF_SIZE: int = 1024
-    STYLE_MODE: str = "semi_real"  # "semi_real" | "comic" | "off"
+    STYLE_MODE: str = "comic"  # "semi_real" | "comic" | "off"
     KEEP_USER_EXPRESSION: bool = True
 
-    # ---------------- Output Validation (single-pass; validates the one generated image, does not retry) ----------------
-    VALIDATE: bool = False  # ArcFace is unreliable on illustrated avatars (notebook: VALIDATE_OUTPUT)
-    VALIDATE_AVATARS: List[str] = ["Man", "Woman", "Woman_Hijab"]
-    ID_PASS: float = 0.40
-    JAW_TOL: float = 0.15
-    BEARD_P: float = 0.75
-    JAW_BEARD: float = 0.25
+    # ---------------- Visor & Similarity ----------------
+    USE_VISOR_REF: bool = True
+    VALIDATE: bool = True
+    BEST_OF_N: int = 3
+    VISOR_EXTRA_TRIES: int = 2
+    TIME_BUDGET: float = 0.0  # 0 = no limit (notebook behaviour)
+    ID_LORA_SCHEDULE: List[float] = [1.0, 1.1, 1.2]
+    STOP_ID: float = 0.55
+    W_JAW: float = 0.8
+    W_NO_VISOR: float = 5.0
     VERIFY_MODEL: str = "ArcFace"
     VERIFY_DETECTOR: str = "retinaface"
     VERIFY_MAX_SIDE: int = 512
