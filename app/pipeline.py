@@ -219,6 +219,11 @@ def load_models() -> None:
     else:
         pipe.to("cuda")
 
+    # Decode the final image in tiles instead of one giant allocation - this is what was
+    # tipping requests into CUDA OOM right at the end of generation.
+    pipe.vae.enable_tiling()
+    pipe.vae.enable_slicing()
+
     logger.info("Loading LoRA weights: %s / %s", settings.LORA, settings.LORA_FILE)
     pipe.load_lora_weights(settings.LORA, weight_name=settings.LORA_FILE, adapter_name="bfs")
     pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
@@ -1055,6 +1060,7 @@ def generate_avatar(user_image_path: Path, info: dict) -> Tuple[bytes, dict]:
                     guidance_scale=settings.CFG,
                     generator=torch.Generator("cuda").manual_seed(seed + k),
                 ).images[0]
+            torch.cuda.empty_cache()
             g = time.time() - tg
 
             tv = time.time()
