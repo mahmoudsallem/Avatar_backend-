@@ -536,7 +536,12 @@ def scalp_is_bare(crop_bgr: np.ndarray, rect: Tuple[int, int, int, int]) -> Opti
     d_e = float(np.linalg.norm(np.median(s, 0) - np.median(f, 0)))
     lum_ratio = float(np.median(s[:, 0])) / f_l
     dark_frac = float((s[:, 0] < 0.55 * f_l).mean())
-    return lum_ratio > 0.80 and dark_frac < 0.20 and d_e < 40.0
+    # Only the share of pixels clearly DARKER than the forehead skin (= hair) is used. The old extra tests
+    # (lum_ratio / colour distance to the forehead) failed real bald heads: a shiny scalp is brighter than the
+    # forehead and the strip above a tight face box often lands on the wall behind the head, so a bald man was
+    # read as "not bald". A dark backdrop only makes dark_frac high, which fails safe (not bald).
+    logger.info("Scalp check: dark_frac=%.2f lum_ratio=%.2f dE=%.1f -> bare=%s", dark_frac, lum_ratio, d_e, dark_frac < 0.12)
+    return dark_frac < 0.12
 
 def detect_bald(image: Image.Image, crop_bgr: np.ndarray = None, rect=None) -> Tuple[bool, dict]:
     """Bald only if the scalp-colour test AND CLIP agree (a false positive removes a man's real hair)."""
