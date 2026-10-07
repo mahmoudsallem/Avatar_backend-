@@ -185,14 +185,6 @@ def load_models() -> None:
     assert torch.cuda.is_available(), "PyTorch cannot see the GPU - FLUX needs CUDA."
     torch.backends.cudnn.enabled = False
 
-    if settings.effective_hf_token:
-        try:
-            import huggingface_hub
-            huggingface_hub.login(token=settings.effective_hf_token)
-            logger.info("Logged into Hugging Face Hub successfully.")
-        except Exception as e:
-            logger.warning("Hugging Face login failed: %s", e)
-
     free_gb, total_gb = get_gpu_memory_info()
     free_gb_val = free_gb if free_gb is not None else 0.0
     low_vram = free_gb_val < 45.0
@@ -735,14 +727,14 @@ AVATAR_PATHS = {
 }
 
 TEST_AVATARS = {
-    "Man": "Saytara_male_v2.png",
-    "Woman": "Saytara_Femal_clean.png",
+    "Man": "Saytara_male.jpg",
+    "Woman": "Saytara_Femal.png",
     "Woman_Hijab": "Saytara_hijab.jpg",
 }
 
 VISOR_REFS = {
-    "Man":         {"file": "Saytara_male_v2.png",   "box": (0.28, 0.22, 0.65, 0.40), "image": None},
-    "Woman":       {"file": "Saytara_Femal_clean.png", "box": (0.25, 0.29, 0.63, 0.49), "image": None},
+    "Man":         {"file": "Saytara_male.jpg",   "box": (0.28, 0.22, 0.65, 0.40), "image": None},
+    "Woman":       {"file": "Saytara_Femal.png", "box": (0.25, 0.29, 0.63, 0.49), "image": None},
     "Woman_Hijab": {"file": "Saytara_hijab.jpg",        "box": (0.26, 0.25, 0.64, 0.45), "image": None},
 }
 

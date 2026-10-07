@@ -27,12 +27,12 @@ The service executes a 2-step AI pipeline:
 ### Code Layout
 The whole service is 5 files:
 ```
+app.py                  # FastAPI app, lifespan, /health and /v1/avatar routes
 app/
   __init__.py
   config.py             # pydantic-settings, reads .env
   pipeline.py           # Step 1 validation + Step 2 generation + model/worker lifecycle
   deepface_worker.py    # CPU subprocess worker (modes: "detect" one-shot, "embed" persistent)
-  main.py               # FastAPI app, lifespan, /health and /v1/avatar routes
 ```
 
 ---
@@ -45,7 +45,7 @@ app/
 - **CUDA**: 12.1+ or 12.4+.
 
 ### Model Licenses
-- **FLUX.2-klein-9B**: Gated model on Hugging Face under the **FLUX Non-Commercial License**. You must have a Hugging Face account, accept the license on the [black-forest-labs/FLUX.2-klein-9B repository page](https://huggingface.co/black-forest-labs/FLUX.2-klein-9B), and provide your `HF_TOKEN`.
+- **FLUX.2-klein-9B**: Gated model on Hugging Face under the **FLUX Non-Commercial License**. You must have a Hugging Face account, accept the license on the [black-forest-labs/FLUX.2-klein-9B repository page](https://huggingface.co/black-forest-labs/FLUX.2-klein-9B), and authenticate once on the EC2 instance (see Step 4 below) so the weights can be downloaded and cached locally.
 - **BFS LoRA**: Public MIT license repository (`sisniha/BFS-Best-Face-Swap`).
 
 ---
@@ -83,10 +83,14 @@ pip install -r requirements.txt
 
 ### Step 4: Hugging Face Authentication
 Accept the license agreement at [huggingface.co/black-forest-labs/FLUX.2-klein-9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-9B).
-Then log in using `huggingface-cli` or specify `HF_TOKEN` in your `.env` file:
+Then log in **once** on the EC2 instance with `huggingface-cli`:
 ```bash
 huggingface-cli login
 ```
+This caches the gated weights locally (`~/.cache/huggingface/hub`) and your credentials with the
+Hub CLI. After that, `app/pipeline.py` loads `FLUX_MODEL` straight from that local cache on every
+startup (`Flux2KleinPipeline.from_pretrained(settings.FLUX_MODEL, ...)`), the same way the
+exploration notebooks do - no token needs to live in `.env` or be read by the app itself.
 
 ### Step 5: Avatar Template Images
 The template images already ship inside `Backend/Avatar/` (copied in from the project's original
@@ -94,34 +98,27 @@ The template images already ship inside `Backend/Avatar/` (copied in from the pr
 ```
 Backend/
   Avatar/
-    Saytara_male_v2.png       # Primary male template
-    Saytara_Femal_clean.png   # Primary female template
-    Saytara_hijab.jpg         # Primary hijab template
-    Saytara_male.jpg          # Fallback male template
-    Saytara_Femal.png         # Fallback female template
+    Saytara_male.jpg    # Male template
+    Saytara_Femal.png   # Female template
+    Saytara_hijab.jpg   # Hijab template
 ```
 If you ever replace these with new artwork, keep the same filenames (or update `AVATAR_DIR`/the
 filename maps in `app/pipeline.py`) and redeploy `Backend/` as a self-contained folder.
 
 ### Step 6: Configure Environment
-Copy the example configuration to `.env` and set your secret API key:
+Copy the example configuration to `.env` and adjust values if needed (defaults work out of the box):
 ```bash
 cp .env.example .env
 nano .env
-```
-Ensure you set:
-```ini
-API_KEY=your-secure-production-api-key
-HF_TOKEN=hf_your_token_here
 ```
 
 ---
 
 ## 4. Running the Service
 
-Start the backend using Uvicorn:
+Start the backend:
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+python app.py
 ```
 
 > **Why `--workers 1`?**
@@ -157,10 +154,8 @@ curl -X GET http://localhost:8000/health
 ---
 
 ### `POST /v1/avatar`
-Generates a sci-fi avatar from a portrait photo.
+Generates a sci-fi avatar from a portrait photo. No authentication required.
 
-- **Headers**:
-  - `X-API-Key`: Shared secret configured in `.env`.
 - **Form Data**:
   - `file`: Image file (`.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`). No server-side size limit is
     enforced - if you want one, add it at the reverse proxy/ALB layer in front of this service.
@@ -168,7 +163,6 @@ Generates a sci-fi avatar from a portrait photo.
 **Example Request**:
 ```bash
 curl -X POST http://localhost:8000/v1/avatar \
-  -H "X-API-Key: your-secure-production-api-key" \
   -F "file=@photo.jpg" \
   --output avatar.jpg
 ```
@@ -191,18 +185,30 @@ Returned when a photo is rejected by Step 1 validation (multiple faces, no face,
 }
 ```
 
-**Unauthorized (401 Unauthorized)**:
-Returned if `X-API-Key` is missing or invalid:
-```json
-{
-  "detail": "Invalid or missing X-API-Key header"
-}
-```
-
 **Internal Error (500 Internal Server Error)**:
 Returned on unexpected server errors. Full tracebacks are logged server-side only:
 ```json
 {
   "error": "An internal server error occurred during avatar generation."
 }
+```
+
+---
+
+### `POST /v1/avatar/base64`
+Same as `/v1/avatar`, but the photo is sent as a base64 string in a JSON body instead of
+multipart/form-data. Same responses as above.
+
+- **JSON Body**:
+  - `image` (required): base64-encoded image bytes. A `data:image/...;base64,...` data URL is
+    also accepted - the `data:...;base64,` prefix is stripped automatically.
+  - `filename` (optional, default `upload.jpg`): only used to infer the file extension
+    (`.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`).
+
+**Example Request**:
+```bash
+curl -X POST http://localhost:8000/v1/avatar/base64 \
+  -H "Content-Type: application/json" \
+  -d "{\"image\": \"$(base64 -w0 photo.jpg)\", \"filename\": \"photo.jpg\"}" \
+  --output avatar.jpg
 ```

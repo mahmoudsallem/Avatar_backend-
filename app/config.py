@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from typing import List, Optional
-from pydantic import Field, field_validator
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -16,16 +16,11 @@ class Settings(BaseSettings):
     # ---------------- Server & Security ----------------
     HOST: str = "0.0.0.0"
     PORT: int = 8000
-    API_KEY: str = "dev-insecure-secret-key-change-me"
     CORS_ORIGINS: List[str] = ["*"]
     LOG_LEVEL: str = "INFO"
 
     # ---------------- Output Encoding ----------------
     OUTPUT_MAX_BYTES: int = 300 * 1024  # final avatar JPEG must not exceed this
-
-    # ---------------- HF & Weights ----------------
-    HF_TOKEN: Optional[str] = Field(default=None, validation_alias="HF_TOKEN")
-    HUGGINGFACE_TOKEN: Optional[str] = Field(default=None, validation_alias="HUGGINGFACE_TOKEN")
 
     # ---------------- Directories ----------------
     PROJECT_DIR: Path = BASE_DIR
@@ -115,9 +110,5 @@ class Settings(BaseSettings):
         if local_clip.exists():
             return str(local_clip)
         return "openai/clip-vit-base-patch32"
-
-    @property
-    def effective_hf_token(self) -> Optional[str]:
-        return self.HF_TOKEN or self.HUGGINGFACE_TOKEN
 
 settings = Settings()

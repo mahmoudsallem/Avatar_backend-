@@ -1,15 +1,16 @@
 import sys
 import uuid
-import secrets
+import base64
 import logging
 import asyncio
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, File, Header, HTTPException, Request, Response, UploadFile, status
+from fastapi import FastAPI, File, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from app.config import settings
 from app import pipeline
@@ -77,14 +78,6 @@ async def generic_exception_handler(request: Request, exc: Exception):
         content={"error": "An unexpected internal server error occurred."},
     )
 
-def verify_api_key(x_api_key: Optional[str]) -> None:
-    if not x_api_key or not secrets.compare_digest(x_api_key, settings.API_KEY):
-        logger.warning("Unauthorized request: missing or invalid X-API-Key header.")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing X-API-Key header",
-        )
-
 @app.get("/health", summary="Health check endpoint")
 async def health_check():
     import torch
@@ -112,33 +105,13 @@ async def health_check():
         "gpu_total_vram_gb": total_gb,
     }
 
-@app.post(
-    "/v1/avatar",
-    responses={
-        200: {"content": {"image/jpeg": {}}, "description": "Generated avatar JPEG, at or under OUTPUT_MAX_BYTES."},
-        400: {"description": "Validation rejected."},
-        401: {"description": "Unauthorized."},
-        500: {"description": "Internal server error."},
-    },
-    summary="Generate Sci-Fi Avatar",
-    description="Upload a photo, get back just the generated avatar JPEG. Serialized behind a GPU lock.",
-)
-async def create_avatar(
-    file: UploadFile = File(..., description="User portrait photo"),
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-):
-    verify_api_key(x_api_key)
-
-    filename = file.filename or "upload.jpg"
+async def _generate_avatar_from_bytes(content: bytes, filename: str):
     ext = Path(filename).suffix.lower()
     if ext not in pipeline.IMAGE_EXTENSIONS:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
             content={"error": f"Unsupported file type '{ext}'. Allowed: {', '.join(sorted(pipeline.IMAGE_EXTENSIONS))}"},
         )
-
-    # No server-side upload size limit - read whatever was sent.
-    content = await file.read()
 
     settings.VAL_TMP_DIR.mkdir(parents=True, exist_ok=True)
     temp_path = settings.VAL_TMP_DIR / f"upload_{uuid.uuid4().hex}{ext}"
@@ -176,6 +149,48 @@ async def create_avatar(
             except Exception:
                 pass
 
+AVATAR_RESPONSES = {
+    200: {"content": {"image/jpeg": {}}, "description": "Generated avatar JPEG, at or under OUTPUT_MAX_BYTES."},
+    400: {"description": "Validation rejected."},
+    500: {"description": "Internal server error."},
+}
+
+@app.post(
+    "/v1/avatar",
+    responses=AVATAR_RESPONSES,
+    summary="Generate Sci-Fi Avatar",
+    description="Upload a photo, get back just the generated avatar JPEG. Serialized behind a GPU lock.",
+)
+async def create_avatar(
+    file: UploadFile = File(..., description="User portrait photo"),
+):
+    filename = file.filename or "upload.jpg"
+    # No server-side upload size limit - read whatever was sent.
+    content = await file.read()
+    return await _generate_avatar_from_bytes(content, filename)
+
+class AvatarBase64Request(BaseModel):
+    image: str  # base64-encoded image bytes (raw or "data:image/...;base64,..." data URL)
+    filename: Optional[str] = "upload.jpg"  # only used to infer the file extension
+
+@app.post(
+    "/v1/avatar/base64",
+    responses=AVATAR_RESPONSES,
+    summary="Generate Sci-Fi Avatar (base64 input)",
+    description="Same as /v1/avatar, but the photo is sent as a base64 string in a JSON body instead of multipart/form-data.",
+)
+async def create_avatar_base64(body: AvatarBase64Request):
+    filename = body.filename or "upload.jpg"
+    raw_b64 = body.image.split(",", 1)[-1] if body.image.startswith("data:") else body.image
+    try:
+        content = base64.b64decode(raw_b64, validate=True)
+    except Exception:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"error": "Invalid base64 image data."},
+        )
+    return await _generate_avatar_from_bytes(content, filename)
+
 @app.get("/", summary="Root status", include_in_schema=False)
 async def root():
     return {
@@ -187,4 +202,4 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app.main:app", host=settings.HOST, port=settings.PORT, reload=False, workers=1)
+    uvicorn.run(app, host=settings.HOST, port=settings.PORT, reload=False, workers=1)
