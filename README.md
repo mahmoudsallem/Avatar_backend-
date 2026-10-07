@@ -98,11 +98,9 @@ The template images already ship inside `Backend/Avatar/` (copied in from the pr
 ```
 Backend/
   Avatar/
-    Saytara_male_v2.png       # Primary male template
-    Saytara_Femal_clean.png   # Primary female template
-    Saytara_hijab.jpg         # Primary hijab template
-    Saytara_male.jpg          # Fallback male template
-    Saytara_Femal.png         # Fallback female template
+    Saytara_male.jpg    # Male template
+    Saytara_Femal.png   # Female template
+    Saytara_hijab.jpg   # Hijab template
 ```
 If you ever replace these with new artwork, keep the same filenames (or update `AVATAR_DIR`/the
 filename maps in `app/pipeline.py`) and redeploy `Backend/` as a self-contained folder.
