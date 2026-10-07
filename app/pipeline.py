@@ -64,13 +64,17 @@ HIJAB_PROMPT_PAIRS = [
 clip = None
 pipe = None
 
-_LORA = {"scale": 1.0}
+# mode "kwargs"   : strength passed per call as attention_kwargs={"scale": w}   (what the notebook does)
+# mode "adapters" : strength set with pipe.set_adapters(["bfs"], [w])            (fallback if the kwarg has no effect)
+_LORA = {"scale": 1.0, "mode": "kwargs"}
 
 def set_lora(weight: float) -> None:
     _LORA["scale"] = float(weight)
+    if _LORA["mode"] == "adapters" and pipe is not None:
+        pipe.set_adapters(["bfs"], adapter_weights=[float(weight)])
 
-def lora_kwargs() -> dict:
-    return {"scale": _LORA["scale"]}
+def lora_kwargs():
+    return {"scale": _LORA["scale"]} if _LORA["mode"] == "kwargs" else None
 
 # GPU serialization lock for async request handling
 gpu_lock = asyncio.Lock()
@@ -212,6 +216,57 @@ def _log_versions() -> None:
     except Exception:
         pass
 
+def _lora_selftest() -> None:
+    """Generate the same tiny image with the LoRA off and on. If the output does not change, the face-swap LoRA is
+    doing nothing (this is what makes avatars ignore the user's face). Tries the notebook's way (attention_kwargs
+    scale) first, then pipe.set_adapters; raises if neither changes the output."""
+    logger.info("LoRA self-test: generating 4 tiny images (a few seconds)...")
+    av, _ = load_avatar("Man")
+    base = av.resize((512, 512), Image.LANCZOS)
+    face = pad_square(base.crop((140, 20, 400, 300)), 512)
+
+    def gen(weight, kwargs_mode):
+        _LORA["mode"] = "kwargs" if kwargs_mode else "adapters"
+        if not kwargs_mode:
+            pipe.set_adapters(["bfs"], adapter_weights=[float(weight)])
+        else:
+            pipe.set_adapters(["bfs"], adapter_weights=[1.0])
+        with torch.no_grad():
+            im = pipe(
+                prompt="head_swap: start with Picture 1 as the base image, replace the head with the head from Picture 2.",
+                image=[base, face],
+                attention_kwargs={"scale": float(weight)} if kwargs_mode else None,
+                width=512, height=512, num_inference_steps=4, guidance_scale=settings.CFG,
+                generator=torch.Generator("cuda").manual_seed(1),
+            ).images[0]
+        torch.cuda.empty_cache()
+        return np.asarray(im.convert("RGB")).astype(np.int16)
+
+    thr = 1.0
+    try:
+        d_kwargs = float(np.abs(gen(0.0, True) - gen(1.1, True)).mean())
+        logger.info("LoRA self-test: attention_kwargs scale 0 vs 1.1 -> mean pixel diff %.2f", d_kwargs)
+        if d_kwargs > thr:
+            _LORA["mode"] = "kwargs"
+            logger.info("LoRA self-test PASSED (mode=kwargs, same as the notebook).")
+            return
+        d_ad = float(np.abs(gen(0.0, False) - gen(1.1, False)).mean())
+        logger.info("LoRA self-test: set_adapters weight 0 vs 1.1 -> mean pixel diff %.2f", d_ad)
+        if d_ad > thr:
+            _LORA["mode"] = "adapters"
+            logger.warning("attention_kwargs scale had NO effect with these library versions - switched to "
+                           "pipe.set_adapters for LoRA strength (mode=adapters).")
+            return
+    finally:
+        try:
+            pipe.set_adapters(["bfs"], adapter_weights=[1.0])
+        except Exception:
+            pass
+    raise RuntimeError(
+        "LoRA self-test FAILED: the BFS LoRA does not change the output at any strength, so the face swap would "
+        "ignore the user's photo. Check diffusers / peft / transformers versions (see env_report.py)."
+    )
+
 def load_models() -> None:
     global clip, pipe
 
@@ -266,6 +321,8 @@ def load_models() -> None:
     )
     global lora_layers
     lora_layers = _count_lora_layers()
+    if settings.LORA_SELFTEST:
+        _lora_selftest()
     _log_versions()
     logger.info("Active adapters: %s | LoRA layers attached to transformer: %d", _adapters(), lora_layers)
     if lora_layers == 0:
