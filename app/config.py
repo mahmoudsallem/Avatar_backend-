@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     GLASSES_MIN_SCORE_MARGIN: float = 0.08
     BEARD_POSITIVE_THRESHOLD: float = 0.56
     BEARD_MIN_SCORE_MARGIN: float = 0.05
+    BALD_POSITIVE_THRESHOLD: float = 0.52
+    BALD_MIN_SCORE_MARGIN: float = 0.03
     HIJAB_POSITIVE_THRESHOLD: float = 0.50
     HIJAB_MIN_SCORE_MARGIN: float = 0.00
 

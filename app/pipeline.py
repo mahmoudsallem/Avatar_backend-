@@ -417,6 +417,24 @@ def detect_beard(image: Image.Image) -> Tuple[bool, dict]:
     )
     return yes_no(scores, settings.BEARD_POSITIVE_THRESHOLD, settings.BEARD_MIN_SCORE_MARGIN), scores
 
+def detect_bald(image: Image.Image) -> Tuple[bool, dict]:
+    width, height = image.size
+    top_head = image.crop((0, 0, width, int(height * 0.45)))
+    scores = classify_binary(
+        [image, top_head, ImageEnhance.Contrast(top_head).enhance(1.10)],
+        [
+            "a photo of a bald man with a bare shaved scalp",
+            "a bald man with no hair on top of his head",
+            "a man with a completely bald shaved head",
+        ],
+        [
+            "a photo of a man with full hair on top of his head",
+            "a man with a haircut and visible hair on top",
+            "a man with thick hair on his head",
+        ],
+    )
+    return yes_no(scores, settings.BALD_POSITIVE_THRESHOLD, settings.BALD_MIN_SCORE_MARGIN), scores
+
 def classify_hijab(image: Image.Image) -> Tuple[bool, dict]:
     width, height = image.size
     head = image.crop((int(width * 0.05), 0, int(width * 0.95), int(height * 0.85)))
@@ -458,6 +476,7 @@ def analyse_user(user_path: Path, crop_dir: Path = None) -> dict:
     views = create_image_views(crop_pil)
     glasses, glasses_s = detect_glasses(views, gender)
     beard, beard_s = detect_beard(crop_pil) if gender == "Man" else (False, None)
+    bald, bald_s = detect_bald(crop_pil) if gender == "Man" else (False, None)
     hijab, hijab_s = classify_hijab(crop_pil) if gender == "Woman" else (False, None)
 
     ov = OVERRIDES.get(key, {})
@@ -467,8 +486,10 @@ def analyse_user(user_path: Path, crop_dir: Path = None) -> dict:
         hijab = bool(ov["hijab"])
     if "beard" in ov and gender == "Man":
         beard = bool(ov["beard"])
+    if "bald" in ov and gender == "Man":
+        bald = bool(ov["bald"])
 
-    tags = [gender] + (["Glasses"] if glasses else []) + (["Hijab"] if hijab else [])
+    tags = [gender] + (["Glasses"] if glasses else []) + (["Hijab"] if hijab else []) + (["Bald"] if bald else [])
     target_crop_dir = crop_dir or settings.CROP_DIR
     target_crop_dir.mkdir(parents=True, exist_ok=True)
     crop_path = target_crop_dir / f"{key}_{'_'.join(tags)}.jpg"
@@ -488,10 +509,11 @@ def analyse_user(user_path: Path, crop_dir: Path = None) -> dict:
         "glasses_source": glasses_s.get("source", "step1_clip") if isinstance(glasses_s, dict) else "step1_clip",
         "hijab": hijab,
         "beard": beard,
+        "bald": bald,
         "avatar": "Woman_Hijab" if hijab else gender,
     }
     logger.info(
-        "Step 1 analysis complete for %s: avatar=%s, gender=%s (%.1f%% %s), glasses=%s, hijab=%s, beard=%s",
+        "Step 1 analysis complete for %s: avatar=%s, gender=%s (%.1f%% %s), glasses=%s, hijab=%s, beard=%s, bald=%s",
         key,
         info["avatar"],
         gender,
@@ -500,6 +522,7 @@ def analyse_user(user_path: Path, crop_dir: Path = None) -> dict:
         glasses,
         hijab,
         beard,
+        bald,
     )
     return info
 
@@ -659,6 +682,15 @@ HAIR_USER = (
     "slick back, comb up, restyle or thicken the hair. the only change allowed on the hair is a thin red rim light. "
 )
 
+BALD_USER = (
+    "BALD HEAD / NO HAIR: Picture 2 is a BALD man with a completely bare shaved scalp. "
+    "Do NOT include or copy any hair from Picture 1 or anywhere else. "
+    "The head MUST BE COMPLETELY BALD with a bare, smooth shaved scalp and NO HAIR whatsoever on top, forehead, sides or back. "
+    "Completely remove the hair of Picture 1 and replace it with a smooth bare bald scalp matching Picture 2. "
+    "Do not draw, paint, grow or add any hair, hairline, haircut, tufts or strands of hair. "
+    "The top of the head must be clean smooth bare skin. "
+)
+
 def visor_block(info, attempt=0, ref=False):
     look = VISOR_LOOK_MAN if info.get("avatar") == "Man" else VISOR_LOOK_DEFAULT
     return (
@@ -676,22 +708,40 @@ def build_prompt(info, attempt=0, ref=False, style_mode=None, keep_user_expressi
     if keep_user_expression is None:
         keep_user_expression = settings.KEEP_USER_EXPRESSION
 
+    is_bald = info.get("bald", False)
+
     expr = (
         "copy the head rotation and eye direction from Picture 1, but keep the facial expression and smile of Picture 2"
         if keep_user_expression
         else "copy the direction of the eye, head rotation, micro expressions from Picture 1"
     )
+    
+    hair_desc = "bare bald scalp (no hair)" if is_bald else "hair"
     bfs = (
         "head_swap: start with Picture 1 as the base image, keeping its lighting, environment, and background. "
         "remove the head from Picture 1 completely and replace it with the head from Picture 2, strictly "
-        "preserving the face, hair, eye color and nose structure of Picture 2. "
+        f"preserving the face, {hair_desc}, eye color and nose structure of Picture 2. "
         + expr
         + ". "
     )
+
+    base_style = {"semi_real": _SEMI_REAL, "comic": _COMIC}[style_mode] if style_mode in ("semi_real", "comic") else "high quality, sharp details, 4k."
+    if is_bald and style_mode in ("semi_real", "comic"):
+        base_style = (
+            base_style.replace("around the eyes, lips, hair strands and jacket edges.", "around the eyes, lips, scalp contour and jacket edges.")
+            .replace("fine individually painted hair strands with a glossy sheen,", "")
+            .replace("individually inked hair strands with a glossy sheen,", "")
+            .replace("along the hair,", "along the bald scalp,")
+            .replace("along the hair", "along the bald scalp")
+            .replace("beard or hair", "beard or scalp")
+            .replace("same face shape, jaw, hairline,", "same face shape, jaw, bald scalp,")
+            .replace("same face shape, hairline,", "same face shape, bald scalp,")
+        )
+
     style_text = (
         (
             "the painted finish applies to the rendering only and must never change the face proportions. "
-            + {"semi_real": _SEMI_REAL, "comic": _COMIC}[style_mode]
+            + base_style
         )
         if style_mode in ("semi_real", "comic")
         else "high quality, sharp details, 4k."
@@ -714,8 +764,10 @@ def build_prompt(info, attempt=0, ref=False, style_mode=None, keep_user_expressi
             "throughout, styled in a high voluminous bun or updo at the crown, sleek and professionally polished, "
             f"framing the face. {V}{FACE_CLEAN}{style_text} " + closing
         )
+
+    hair_user_block = BALD_USER if is_bald else HAIR_USER
     return (
-        f"{VISOR_MANDATORY}{bfs}{IDENTITY}{BUILD}{HAIR_USER}"
+        f"{VISOR_MANDATORY}{bfs}{IDENTITY}{BUILD}{hair_user_block}"
         "FACIAL HAIR: keep the facial hair of Picture 2 exactly as it is: if Picture 2 has a moustache, goatee, "
         "beard or stubble keep the same shape, coverage, length, density and grey or black color with a neat "
         "natural edge; if Picture 2 is clean-shaven keep the skin smooth and add no facial hair. do not copy any "
@@ -733,14 +785,14 @@ AVATAR_PATHS = {
 }
 
 TEST_AVATARS = {
-    "Man": "Saytara_male.jpg",
-    "Woman": "Saytara_Femal.png",
+    "Man": "Saytara_male_v2.png",
+    "Woman": "Saytara_Femal_clean.png",
     "Woman_Hijab": "Saytara_hijab.jpg",
 }
 
 VISOR_REFS = {
-    "Man":         {"file": "Saytara_male.jpg",   "box": (0.28, 0.22, 0.65, 0.40), "image": None},
-    "Woman":       {"file": "Saytara_Femal.png", "box": (0.25, 0.29, 0.63, 0.49), "image": None},
+    "Man":         {"file": "Saytara_male_v2.png",   "box": (0.28, 0.22, 0.65, 0.40), "image": None},
+    "Woman":       {"file": "Saytara_Femal_clean.png", "box": (0.25, 0.29, 0.63, 0.49), "image": None},
     "Woman_Hijab": {"file": "Saytara_hijab.jpg",        "box": (0.26, 0.25, 0.64, 0.45), "image": None},
 }
 
@@ -1125,6 +1177,7 @@ def generate_avatar(user_image_path: Path, info: dict) -> Tuple[bytes, dict]:
             avatar=info["avatar"],
             glasses=info.get("glasses", False),
             beard=info.get("beard", False),
+            bald=info.get("bald", False),
             seconds=round(time.time() - t0, 1),
             gen_s=round(gen_s, 1),
             val_s=round(val_s, 1),
