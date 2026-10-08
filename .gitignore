@@ -28,3 +28,6 @@ ENV/
 Thumbs.db
 
 users/
+# Test outputs and private test photos
+test_results/
+users/
