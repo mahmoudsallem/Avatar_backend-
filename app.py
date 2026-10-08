@@ -114,6 +114,8 @@ async def health_check():
         "lora_layers_attached": pipeline.lora_layers,
         "lora_mode": pipeline._LORA["mode"],
         "gpu_slots": len(pipeline.slots),
+        "gpu_slots_requested": settings.GPU_SLOTS,
+        "gpu_slot_errors": pipeline.slot_errors,
         "gpu_free_vram_gb": free_gb,
         "gpu_total_vram_gb": total_gb,
     }

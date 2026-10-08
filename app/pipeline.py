@@ -87,6 +87,7 @@ class GpuSlot:
         return {"scale": self.lora["scale"]} if self.lora["mode"] == "kwargs" else None
 
 slots: List[GpuSlot] = []
+slot_errors: List[str] = []   # why an extra slot could not be loaded (shown in /health)
 _slot_q: Optional[asyncio.Queue] = None
 
 async def acquire_slot() -> GpuSlot:
@@ -371,25 +372,42 @@ def load_models() -> None:
     except Exception:
         te_has_lora = True
     shared = {} if te_has_lora else dict(text_encoder=pipe.text_encoder, tokenizer=pipe.tokenizer, vae=pipe.vae)
+    slot_errors.clear()
+    logger.info("GPU slots: GPU_SLOTS=%s (0=auto) SLOT_MIN_FREE_GB=%s -> trying to load up to %d slot(s); low_vram=%s",
+                settings.GPU_SLOTS, settings.SLOT_MIN_FREE_GB, wanted, low_vram)
+    if low_vram and settings.GPU_SLOTS != 1:
+        slot_errors.append(f"low VRAM at startup ({free_gb_val:.1f} GB free < 45 GB) -> CPU-offload mode, 1 slot only")
     for i in range(1, wanted):
         free_now, _t = get_gpu_memory_info()
         if free_now is None or free_now < settings.SLOT_MIN_FREE_GB:
-            logger.warning("Only %s GB VRAM free - stopping at %d GPU slot(s).", free_now, len(slots))
+            msg = f"stopped at {len(slots)} slot(s): only {free_now} GB VRAM free (< SLOT_MIN_FREE_GB={settings.SLOT_MIN_FREE_GB})"
+            logger.warning(msg)
+            slot_errors.append(msg)
             break
-        try:
-            logger.info("Loading GPU slot %d (shared text encoder/VAE: %s)...", i, bool(shared))
-            sp = Flux2KleinPipeline.from_pretrained(settings.FLUX_MODEL, dtype=torch.bfloat16, **shared)
-            sp.to("cuda")
-            sp.load_lora_weights(settings.LORA, weight_name=settings.LORA_FILE, adapter_name="bfs")
-            sp.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
-                sp.scheduler.config, shift=1.0, use_dynamic_shifting=False)
-            st = GpuSlot(i, sp, {"scale": 1.0, "mode": _LORA["mode"]})
-            if st.lora["mode"] == "adapters":
-                sp.set_adapters(["bfs"], adapter_weights=[1.0])
-            slots.append(st)
-        except Exception as exc:
-            logger.warning("Could not load GPU slot %d (%s) - continuing with %d slot(s).", i, exc, len(slots))
-            torch.cuda.empty_cache()
+        sp = None
+        # try 1: share text encoder + VAE (saves ~16 GB); try 2: fully separate pipeline
+        for attempt, comps in (("shared text encoder/VAE", shared), ("separate full copy", {})):
+            if attempt == "separate full copy" and (not shared or (get_gpu_memory_info()[0] or 0) < 36):
+                break
+            try:
+                logger.info("Loading GPU slot %d (%s)...", i, attempt)
+                sp = Flux2KleinPipeline.from_pretrained(settings.FLUX_MODEL, dtype=torch.bfloat16, **comps)
+                sp.to("cuda")
+                sp.load_lora_weights(settings.LORA, weight_name=settings.LORA_FILE, adapter_name="bfs")
+                sp.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+                    sp.scheduler.config, shift=1.0, use_dynamic_shifting=False)
+                st = GpuSlot(i, sp, {"scale": 1.0, "mode": _LORA["mode"]})
+                if st.lora["mode"] == "adapters":
+                    sp.set_adapters(["bfs"], adapter_weights=[1.0])
+                slots.append(st)
+                break
+            except Exception as exc:
+                sp = None
+                logger.exception("GPU slot %d failed (%s)", i, attempt)
+                slot_errors.append(f"slot {i} ({attempt}): {type(exc).__name__}: {str(exc)[:300]}")
+                torch.cuda.empty_cache()
+        if sp is None:
+            logger.warning("Could not load GPU slot %d - continuing with %d slot(s).", i, len(slots))
             break
     _slot_q = asyncio.Queue()
     for s in slots:
