@@ -68,16 +68,43 @@ pipe = None
 # mode "adapters" : strength set with pipe.set_adapters(["bfs"], [w])            (fallback if the kwarg has no effect)
 _LORA = {"scale": 1.0, "mode": "kwargs"}
 
-def set_lora(weight: float) -> None:
-    _LORA["scale"] = float(weight)
-    if _LORA["mode"] == "adapters" and pipe is not None:
-        pipe.set_adapters(["bfs"], adapter_weights=[float(weight)])
+class GpuSlot:
+    """One independent FLUX pipeline (own transformer + LoRA state + scheduler + CUDA stream).
+    A request owns a slot for the whole of Step 2, so several avatars generate at once."""
+
+    def __init__(self, idx: int, slot_pipe, lora_state: Optional[dict] = None):
+        self.idx = idx
+        self.pipe = slot_pipe
+        self.lora = lora_state if lora_state is not None else {"scale": 1.0, "mode": "kwargs"}
+        self.stream = torch.cuda.Stream()
+
+    def set_lora(self, weight: float) -> None:
+        self.lora["scale"] = float(weight)
+        if self.lora["mode"] == "adapters":
+            self.pipe.set_adapters(["bfs"], adapter_weights=[float(weight)])
+
+    def lora_kwargs(self):
+        return {"scale": self.lora["scale"]} if self.lora["mode"] == "kwargs" else None
+
+slots: List[GpuSlot] = []
+_slot_q: Optional[asyncio.Queue] = None
+
+async def acquire_slot() -> GpuSlot:
+    """Wait until one of the GPU slots is free (replaces the old single global GPU lock)."""
+    return await _slot_q.get()
+
+def release_slot(slot: GpuSlot) -> None:
+    _slot_q.put_nowait(slot)
+
+def set_lora(weight: float) -> None:  # slot 0 helper, kept for older callers/tests
+    slots[0].set_lora(weight)
 
 def lora_kwargs():
-    return {"scale": _LORA["scale"]} if _LORA["mode"] == "kwargs" else None
+    return slots[0].lora_kwargs()
 
-# GPU serialization lock for async request handling
-gpu_lock = asyncio.Lock()
+# Step 1 (CPU: RetinaFace/DeepFace subprocess + CLIP) runs outside the GPU slots, this many at a time
+analysis_sem = asyncio.Semaphore(settings.ANALYSIS_CONCURRENCY)
+_CLIP_LOCK = threading.Lock()
 
 # Persistent ArcFace embedding worker state
 _VW = {"p": None}
@@ -332,6 +359,44 @@ def load_models() -> None:
         )
     logger.info("FLUX + LoRA pipeline loaded successfully.")
 
+    # ---- GPU slots: slot 0 is the pipeline above; extra slots add concurrency ----
+    global _slot_q
+    slots.clear()
+    slots.append(GpuSlot(0, pipe, _LORA))
+    wanted = 1 if low_vram else max(1, settings.GPU_SLOTS)
+    if low_vram and settings.GPU_SLOTS > 1:
+        logger.warning("Low free VRAM - running with 1 GPU slot (CPU-offload mode cannot run concurrent jobs).")
+    try:
+        te_has_lora = any(hasattr(m, "lora_A") for m in pipe.text_encoder.modules())
+    except Exception:
+        te_has_lora = True
+    shared = {} if te_has_lora else dict(text_encoder=pipe.text_encoder, tokenizer=pipe.tokenizer, vae=pipe.vae)
+    for i in range(1, wanted):
+        free_now, _t = get_gpu_memory_info()
+        if free_now is None or free_now < settings.SLOT_MIN_FREE_GB:
+            logger.warning("Only %s GB VRAM free - stopping at %d GPU slot(s).", free_now, len(slots))
+            break
+        try:
+            logger.info("Loading GPU slot %d (shared text encoder/VAE: %s)...", i, bool(shared))
+            sp = Flux2KleinPipeline.from_pretrained(settings.FLUX_MODEL, dtype=torch.bfloat16, **shared)
+            sp.to("cuda")
+            sp.load_lora_weights(settings.LORA, weight_name=settings.LORA_FILE, adapter_name="bfs")
+            sp.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+                sp.scheduler.config, shift=1.0, use_dynamic_shifting=False)
+            st = GpuSlot(i, sp, {"scale": 1.0, "mode": _LORA["mode"]})
+            if st.lora["mode"] == "adapters":
+                sp.set_adapters(["bfs"], adapter_weights=[1.0])
+            slots.append(st)
+        except Exception as exc:
+            logger.warning("Could not load GPU slot %d (%s) - continuing with %d slot(s).", i, exc, len(slots))
+            torch.cuda.empty_cache()
+            break
+    _slot_q = asyncio.Queue()
+    for s in slots:
+        _slot_q.put_nowait(s)
+    free_after, _t = get_gpu_memory_info()
+    logger.info("GPU slots ready: %d concurrent avatar generations (free VRAM now %s GB).", len(slots), free_after)
+
     # Start persistent ArcFace identity verification worker
     get_val_worker()
 
@@ -354,7 +419,8 @@ def load_image(path: Path) -> np.ndarray:
 def clip_scores(pil_img: Image.Image, labels: List[str]) -> Dict[str, float]:
     if clip is None:
         raise RuntimeError("CLIP model is not loaded.")
-    res = clip(pil_img, candidate_labels=list(labels))
+    with _CLIP_LOCK:
+        res = clip(pil_img, candidate_labels=list(labels))
     return {r["label"]: float(r["score"]) for r in res}
 
 def check_scope(pil_img: Image.Image) -> Dict[str, float]:
@@ -1209,12 +1275,15 @@ def encode_jpeg_capped(img: Image.Image, max_bytes: int = None) -> bytes:
     )
     return smallest
 
-def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = None) -> Tuple[bytes, dict]:
+def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = None,
+                    slot: Optional[GpuSlot] = None) -> Tuple[bytes, dict]:
     # t0 defaults to "now" (generation-only budget) but callers should pass the
     # timestamp from before Step 1 analysis so TIME_BUDGET covers the whole
     # image end-to-end, matching the notebook.
     if t0 is None:
         t0 = time.time()
+    if slot is None:
+        slot = slots[0]
     user_path = Path(user_image_path)
     rec: Dict[str, Any] = {"file": user_path.name}
 
@@ -1251,21 +1320,22 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         progress = tqdm(total=max_k, desc=f"Generating avatar ({user_path.name})", unit="try")
         while True:
             mult = settings.ID_LORA_SCHEDULE[k % len(settings.ID_LORA_SCHEDULE)]
-            set_lora(test_lora * mult)
+            slot.set_lora(test_lora * mult)
             prompt = build_prompt(info, attempt=k, ref=visor_ref is not None)
 
             tg = time.time()
-            with torch.no_grad():
-                out = pipe(
+            with torch.no_grad(), torch.cuda.stream(slot.stream):
+                out = slot.pipe(
                     prompt=prompt,
                     image=images,
-                    attention_kwargs=lora_kwargs(),
+                    attention_kwargs=slot.lora_kwargs(),
                     width=w,
                     height=h,
                     num_inference_steps=settings.STEPS,
                     guidance_scale=settings.CFG,
                     generator=torch.Generator("cuda").manual_seed(seed + k),
                 ).images[0]
+            slot.stream.synchronize()
             torch.cuda.empty_cache()
             g = time.time() - tg
 
@@ -1364,4 +1434,4 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
     finally:
         if progress is not None:
             progress.close()
-        set_lora(settings.LORA_STRENGTH)
+        slot.set_lora(settings.LORA_STRENGTH)

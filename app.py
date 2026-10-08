@@ -113,6 +113,7 @@ async def health_check():
         "val_worker_running": worker_ready,
         "lora_layers_attached": pipeline.lora_layers,
         "lora_mode": pipeline._LORA["mode"],
+        "gpu_slots": len(pipeline.slots),
         "gpu_free_vram_gb": free_gb,
         "gpu_total_vram_gb": total_gb,
     }
@@ -131,20 +132,25 @@ async def _generate_avatar_from_bytes(content: bytes, filename: str):
     try:
         temp_path.write_bytes(content)
 
-        # Acquire GPU lock to serialize generation requests safely
-        async with pipeline.gpu_lock:
-            # TIME_BUDGET covers the whole image (Step 1 analysis + Step 2 generation),
-            # matching the notebook - start the clock before analyse_user, not after it.
-            t0 = time.time()
+        # TIME_BUDGET covers the whole image (Step 1 analysis + Step 2 generation),
+        # matching the notebook - start the clock before analyse_user, not after it.
+        t0 = time.time()
+
+        # Step 1 is CPU work: several requests analyse in parallel, without holding a GPU slot.
+        async with pipeline.analysis_sem:
             try:
                 info = await asyncio.to_thread(pipeline.analyse_user, temp_path)
             except pipeline.Rejected as r:
                 logger.info("Image validation rejected for %s: %s", filename, r)
                 return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"error": str(r)})
 
-            # Returns the final avatar as JPEG bytes, already capped at
-            # settings.OUTPUT_MAX_BYTES - that's the entire response body.
-            jpeg_bytes, metadata = await asyncio.to_thread(pipeline.generate_avatar, temp_path, info, t0)
+        # Step 2: take a free GPU slot (GPU_SLOTS avatars generate concurrently; extra requests wait here).
+        # Returns the final avatar as JPEG bytes, already capped at settings.OUTPUT_MAX_BYTES.
+        slot = await pipeline.acquire_slot()
+        try:
+            jpeg_bytes, metadata = await asyncio.to_thread(pipeline.generate_avatar, temp_path, info, t0, slot)
+        finally:
+            pipeline.release_slot(slot)
 
         headers = {
             "X-Tries-Used": str(metadata.get("tries", "")),

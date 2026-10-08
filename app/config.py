@@ -66,6 +66,13 @@ class Settings(BaseSettings):
     BALD_MIN_SCORE_MARGIN: float = 0.03
     BALD_FALLBACK_CLIP: float = 0.70  # CLIP-only confidence needed when the scalp area is outside the crop
 
+    # ---------------- GPU Concurrency ----------------
+    # Number of avatars generated at the same time on the GPU. Each extra slot loads another copy of the
+    # FLUX transformer (~18 GB bf16); the text encoder + VAE are shared between slots.
+    GPU_SLOTS: int = 2
+    SLOT_MIN_FREE_GB: float = 28.0   # don't load another slot unless this much VRAM is still free
+    ANALYSIS_CONCURRENCY: int = 4    # Step 1 (CPU subprocesses) running at once, outside the GPU slots
+
     # ---------------- Generation Settings ----------------
     STEPS: int = 20
     CFG: float = 3.0

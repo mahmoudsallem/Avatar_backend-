@@ -21,7 +21,7 @@ The service executes a 2-step AI pipeline:
    - **Identity & Visor Verification**: Evaluates generated candidates via ArcFace cosine similarity (in a persistent CPU worker) and OpenCV HSV visor detection. Retries up to `BEST_OF_N` candidates within a configured `TIME_BUDGET` (default: 40s), keeping the highest-scoring candidate.
 
 3. **Concurrency Model**:
-   - Because FLUX.2-klein-9B is a ~9B parameter model requiring significant GPU VRAM, generation requests are serialized behind an asynchronous GPU lock (`pipeline.gpu_lock`).
+   - Generation runs through a pool of `GPU_SLOTS` FLUX pipelines (default 2) inside the single worker process. Each slot has its own transformer, LoRA state, scheduler and CUDA stream; the text encoder and VAE are shared. Up to `GPU_SLOTS` avatars generate at the same time, extra requests wait for a free slot. Step 1 (face analysis) runs outside the slots, `ANALYSIS_CONCURRENCY` at a time. Each extra slot costs ~18 GB VRAM, so raise `GPU_SLOTS` only after checking `gpu_free_vram_gb` in `/health` (a 96 GB card fits 2-3 slots). In CPU-offload (low VRAM) mode it stays at 1 slot.
    - Heavy blocking operations run in a thread pool (`asyncio.to_thread`), ensuring `GET /health` remains responsive even when generation is in progress.
 
 ### Code Layout
