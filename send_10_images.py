@@ -3,6 +3,12 @@
     python send_10_images.py --url http://<ec2-ip>:8000                # sends EVERY photo in users/ at once
     python send_10_images.py --url http://<ec2-ip>:8000 --count 50     # or a fixed number: photos are re-sent (cycled) to reach it
 
+STEP-COUNT TEST (server needs ALLOW_TEST_OVERRIDES=true in .env; steps x tries):
+    python send_10_images.py --url http://<ec2-ip>:8000 --matrix 8x1,8x2,6x2,4x2,4x1
+sends the whole batch once per setting (same photos, same seeds, TIME_BUDGET off), then prints one comparison table
+(wall-clock, avatars/min, id_sim, visor, tries) and writes matrix_report.html with every setting side by side.
+Single setting:  --steps 4 --tries 2 [--time-budget 0]
+
 For every request it logs: input photo (name, size), output avatar (path, size), start / end clock
 time, duration, server generation time, tries and identity score. Everything is written to
 ./test_results/<run-time>/ :
@@ -53,6 +59,7 @@ def get_json(url, timeout=15):
 
 
 def send(endpoint, img, idx, out_dir, timeout, t_run):
+    # endpoint may already carry ?steps=..&tries=.. test overrides
     in_copy = out_dir / "inputs" / f"{idx:02d}_{img.name}"
     shutil.copyfile(img, in_copy)
     raw = img.read_bytes()
@@ -61,7 +68,7 @@ def send(endpoint, img, idx, out_dir, timeout, t_run):
     row = {"n": idx, "input": img.name, "input_kb": round(len(raw) / 1024), "input_copy": in_copy.relative_to(out_dir).as_posix(),
            "output": "", "output_kb": 0, "status": None, "ok": False, "rejected": False,
            "start": "", "end": "", "start_s": 0.0, "end_s": 0.0, "sec": 0.0,
-           "gen": "", "tries": "", "best_try": "", "id_sim": "", "visor": "", "note": ""}
+           "gen": "", "tries": "", "best_try": "", "id_sim": "", "visor": "", "steps": "", "note": ""}
     t0 = time.time()
     row["start"] = datetime.now().strftime("%H:%M:%S")
     row["start_s"] = round(t0 - t_run, 1)
@@ -77,6 +84,7 @@ def send(endpoint, img, idx, out_dir, timeout, t_run):
             row["best_try"] = h.get("X-Best-Try", "")
             row["id_sim"] = h.get("X-Identity-Similarity", "")
             row["visor"] = h.get("X-Visor-Status", "")
+            row["steps"] = h.get("X-Steps-Used", "")
             if r.status == 200 and body[:3] == b"\xff\xd8\xff":
                 op = out_dir / "outputs" / f"{idx:02d}_{Path(img.name).stem}_avatar.jpg"
                 op.write_bytes(body)
@@ -138,6 +146,106 @@ def write_report(out_dir, rows, wall, meta):
     (out_dir / "report.html").write_text(page, encoding="utf-8")
 
 
+def make_query(steps, tries, time_budget):
+    parts = [f"{k}={v}" for k, v in (("steps", steps), ("tries", tries), ("time_budget", time_budget)) if v is not None]
+    return "?" + "&".join(parts) if parts else ""
+
+
+def run_batch(base, batch, out_dir, timeout, interval, query=""):
+    """Send the whole batch at once; returns (rows, wall-clock seconds)."""
+    RUNNING.clear()
+    DONE.clear()
+    (out_dir / "inputs").mkdir(parents=True, exist_ok=True)
+    (out_dir / "outputs").mkdir(exist_ok=True)
+    t_run = time.time()
+    rows = []
+    stop = threading.Event()
+    threading.Thread(target=heartbeat, args=(base, len(batch), t_run, stop, interval), daemon=True).start()
+    with ThreadPoolExecutor(max_workers=len(batch)) as pool:
+        futs = [pool.submit(send, base + "/v1/avatar/base64" + query, img, i + 1, out_dir, timeout, t_run) for i, img in enumerate(batch)]
+        for f in as_completed(futs):
+            rows.append(f.result())
+    stop.set()
+    rows.sort(key=lambda r: r["n"])
+    return rows, round(time.time() - t_run, 1)
+
+
+def _num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def run_matrix(a, base, batch, out_dir, meta, health):
+    """One batch per 'StepsxTries' setting, then a single comparison table + side-by-side report."""
+    if not (health.get("settings") or {}).get("allow_test_overrides"):
+        log("The server has ALLOW_TEST_OVERRIDES=false (or is an old version): add ALLOW_TEST_OVERRIDES=true to its .env and restart.")
+        sys.exit(2)
+    combos = []
+    for tok in a.matrix.split(","):
+        s, _, t = tok.strip().lower().partition("x")
+        combos.append((tok.strip(), int(s), int(t or 1)))
+    tb = a.time_budget if a.time_budget is not None else 0.0
+    results = {}
+    log(f"MATRIX {', '.join(c[0] for c in combos)} | {len(batch)} photos per setting | time_budget={tb}")
+    for label, steps, tries in combos:
+        sub_dir = out_dir / label
+        log()
+        log(f"=== setting {label}  (steps={steps}, tries={tries}) ===")
+        rows, wall = run_batch(base, batch, sub_dir, a.timeout, a.interval, make_query(steps, tries, tb))
+        ok = [r for r in rows if r["ok"]]
+        log(f"[{label}] done {len(ok)}/{len(rows)} in {wall}s -> {len(ok) / wall * 60:.1f} avatars/min")
+        results[label] = (rows, wall)
+
+    labels = [c[0] for c in combos]
+    ref = labels[0]
+    ref_rows = {r["n"]: r for r in results[ref][0]}
+    log()
+    hdr = f"{'setting':<8}{'wall s':>8}{'avatars/min':>12}{'s/avatar':>9}{'speed-up':>9}{'id_sim':>8}{'d id_sim':>9}{'worse>0.05':>11}{'visor ok':>9}{'tries':>6}{'fail':>5}"
+    log(hdr)
+    log("-" * len(hdr))
+    for lab in labels:
+        rows, wall = results[lab]
+        ok = [r for r in rows if r["ok"]]
+        sims = [_num(r["id_sim"]) for r in ok if _num(r["id_sim"]) is not None]
+        d, worse = [], 0
+        for r in ok:
+            b = ref_rows.get(r["n"])
+            x, y = _num(r["id_sim"]), _num(b["id_sim"]) if b else None
+            if x is not None and y is not None:
+                d.append(x - y)
+                worse += int(x - y < -0.05)
+        vis = sum(1 for r in ok if r["visor"] == "ok")
+        tr = [_num(r["tries"]) for r in ok if _num(r["tries"]) is not None]
+        ref_wall = results[ref][1]
+        log(f"{lab:<8}{wall:>8}{len(ok) / wall * 60:>12.1f}{wall / max(1, len(ok)):>9.1f}{ref_wall / wall:>8.2f}x"
+            f"{(sum(sims) / len(sims) if sims else 0):>8.3f}{(sum(d) / len(d) if d and lab != ref else 0):>+9.3f}"
+            f"{(worse if lab != ref else 0):>11}{vis:>6}/{len(ok):<2}{(sum(tr) / len(tr) if tr else 0):>6.1f}{len(rows) - len(ok):>5}")
+    log()
+    log(f"Reference = {labels[0]}. Judge by: id_sim not lower (d id_sim >= -0.02), worse>0.05 = 0, visor ok not lower, THEN look at matrix_report.html.")
+
+    cells = ["<tr><th>input</th>" + "".join(f"<th>{html.escape(l)} ({results[l][1]}s)</th>" for l in labels) + "</tr>"]
+    for r0 in results[ref][0]:
+        tds = f'<td><img src="{html.escape(ref)}/{html.escape(r0["input_copy"])}"><br>#{r0["n"]:02d} {html.escape(r0["input"])}</td>'
+        for l in labels:
+            r = next((z for z in results[l][0] if z["n"] == r0["n"]), None)
+            tds += (f'<td><img src="{html.escape(l)}/{html.escape(r["output"])}"><br>id_sim {r["id_sim"] or "-"} | visor {r["visor"] or "-"} | tries {r["tries"] or "-"}</td>'
+                    if r and r["ok"] else "<td>failed</td>")
+        cells.append("<tr>" + tds + "</tr>")
+    page = ("<!doctype html><meta charset=utf-8><title>Steps matrix</title><style>body{font:13px system-ui;background:#111;color:#eee}"
+            "img{width:230px;border-radius:6px}td,th{padding:6px;vertical-align:top}</style><h2>Steps x tries comparison</h2><table>"
+            + "".join(cells) + "</table>")
+    (out_dir / "matrix_report.html").write_text(page, encoding="utf-8")
+    with open(out_dir / "matrix.csv", "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["setting", "n", "input", "ok", "total_s", "gen_s", "tries", "steps", "id_sim", "visor"])
+        for l in labels:
+            for r in results[l][0]:
+                w.writerow([l, r["n"], r["input"], r["ok"], r["sec"], r["gen"], r["tries"], r["steps"], r["id_sim"], r["visor"]])
+    log(f"Saved to {out_dir.resolve()}  (open matrix_report.html)")
+
+
 def main():
     global LOG
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -147,6 +255,10 @@ def main():
     ap.add_argument("--out", default="test_results")
     ap.add_argument("--timeout", type=float, default=1800.0, help="per-request timeout in seconds (default 1800; 50 avatars at ~4/min need ~13 min)")
     ap.add_argument("--interval", type=float, default=5.0, help="seconds between live progress lines")
+    ap.add_argument("--steps", type=int, default=None, help="TEST: denoising steps for every request (needs ALLOW_TEST_OVERRIDES=true on the server)")
+    ap.add_argument("--tries", type=int, default=None, help="TEST: candidates per avatar (best-of-N)")
+    ap.add_argument("--time-budget", type=float, default=None, help="TEST: TIME_BUDGET seconds (0 = off)")
+    ap.add_argument("--matrix", default=None, help="TEST: compare settings, e.g. 8x1,8x2,6x2,4x2,4x1 (steps x tries); first = reference")
     a = ap.parse_args()
 
     out_dir = Path(a.out) / datetime.now().strftime("run_%Y%m%d_%H%M%S")
@@ -173,21 +285,24 @@ def main():
         log(f"No photos in {d.resolve()} - copy some test photos there first.")
         sys.exit(2)
     batch = list(imgs) if a.count <= 0 else [imgs[i % len(imgs)] for i in range(a.count)]   # default: all photos
+
+    if a.matrix:
+        run_matrix(a, base, batch, out_dir, meta, h)
+        LOG.close()
+        return
+
+    query = ""
+    if a.steps is not None or a.tries is not None or a.time_budget is not None:
+        if not (h.get("settings") or {}).get("allow_test_overrides"):
+            log("The server has ALLOW_TEST_OVERRIDES=false (or is an old version): add ALLOW_TEST_OVERRIDES=true to its .env and restart.")
+            sys.exit(2)
+        query = make_query(a.steps, a.tries, a.time_budget)
+        meta += f" | overrides {query}"
     meta += f" | {len(batch)} requests at once"
-    log(f"Sending {len(batch)} photos at the same time to {base}/v1/avatar/base64 ...")
+    log(f"Sending {len(batch)} photos at the same time to {base}/v1/avatar/base64{query} ...")
     log()
 
-    t_run = time.time()
-    rows = []
-    stop = threading.Event()
-    threading.Thread(target=heartbeat, args=(base, len(batch), t_run, stop, a.interval), daemon=True).start()
-    with ThreadPoolExecutor(max_workers=len(batch)) as pool:
-        futs = [pool.submit(send, base + "/v1/avatar/base64", img, i + 1, out_dir, a.timeout, t_run) for i, img in enumerate(batch)]
-        for f in as_completed(futs):
-            rows.append(f.result())
-    stop.set()
-    rows.sort(key=lambda r: r["n"])
-    wall = round(time.time() - t_run, 1)
+    rows, wall = run_batch(base, batch, out_dir, a.timeout, a.interval, query)
 
     log()
     log(f"{'#':>2}  {'input':<30} {'output':<34} {'start':>8} {'end':>8} {'total s':>8} {'gen s':>6} {'tries':>5} {'id_sim':>7}  result")

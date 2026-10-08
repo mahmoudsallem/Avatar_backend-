@@ -1529,7 +1529,7 @@ def encode_jpeg_capped(img: Image.Image, max_bytes: int = None) -> bytes:
     return smallest
 
 def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = None,
-                    slot: Optional[GpuSlot] = None) -> Tuple[bytes, dict]:
+                    slot: Optional[GpuSlot] = None, overrides: Optional[dict] = None) -> Tuple[bytes, dict]:
     # t0 defaults to "now" (generation-only budget) but callers should pass the
     # timestamp from before Step 1 analysis so TIME_BUDGET covers the whole
     # image end-to-end, matching the notebook.
@@ -1539,6 +1539,9 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         slot = slots[0]
     user_path = Path(user_image_path)
     rec: Dict[str, Any] = {"file": user_path.name}
+    ov = overrides or {}                       # per-request test overrides (see ALLOW_TEST_OVERRIDES in app.py)
+    steps = int(ov.get("steps", settings.STEPS))
+    time_budget = float(ov.get("time_budget", settings.TIME_BUDGET))
 
     test_lora = settings.LORA_STRENGTH * settings.ID_LORA_MULT
     progress = None
@@ -1549,7 +1552,7 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         images = [avatar, face] + ([visor_ref] if visor_ref is not None else [])
         seed = settings.SEED
         w, h = avatar.size
-        max_k = settings.BEST_OF_N if settings.VALIDATE else 1
+        max_k = int(ov.get("tries", settings.BEST_OF_N)) if settings.VALIDATE else 1
         extras = 0
 
         dbg = None
@@ -1584,7 +1587,7 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                     attention_kwargs=slot.lora_kwargs(),
                     width=w,
                     height=h,
-                    num_inference_steps=settings.STEPS,
+                    num_inference_steps=steps,
                     guidance_scale=settings.CFG,
                     generator=torch.Generator("cuda").manual_seed(seed + k),
                 ).images[0]
@@ -1638,7 +1641,7 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                     break
 
             per_try = (time.time() - t_loop) / k
-            if settings.TIME_BUDGET > 0 and time.time() - t0 + per_try > settings.TIME_BUDGET:
+            if time_budget > 0 and time.time() - t0 + per_try > time_budget:
                 stopped = "budget"
                 logger.info(
                     "Time budget reached (%.1fs elapsed, ~%.1fs per try) - stopping search",
@@ -1661,6 +1664,7 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
             gen_s=round(gen_s, 1),
             val_s=round(val_s, 1),
             tries=k,
+            steps=steps,
             best_try=best["k"],
             stopped=stopped,
             lora_mult=best["mult"],
