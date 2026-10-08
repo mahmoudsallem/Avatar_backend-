@@ -146,9 +146,12 @@ async def _generate_avatar_from_bytes(content: bytes, filename: str):
                 logger.info("Image validation rejected for %s: %s", filename, r)
                 return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"error": str(r)})
 
+        t_analysis = time.time() - t0   # Step 1 duration; time spent waiting for a slot must NOT eat TIME_BUDGET
+
         # Step 2: take a free GPU slot (GPU_SLOTS avatars generate concurrently; extra requests wait here).
         # Returns the final avatar as JPEG bytes, already capped at settings.OUTPUT_MAX_BYTES.
         slot = await pipeline.acquire_slot()
+        t0 = time.time() - t_analysis
         try:
             jpeg_bytes, metadata = await asyncio.to_thread(pipeline.generate_avatar, temp_path, info, t0, slot)
         finally:
