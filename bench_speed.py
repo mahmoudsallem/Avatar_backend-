@@ -9,6 +9,9 @@ and saves the avatars. `compare` then reports, against the right baseline:
     python bench_speed.py suite --only baseline,cache,fuse_compile
     python bench_speed.py run --name mytest --env CACHE_PROMPT_EMBEDS=true --env ATTENTION_BACKEND=native
     python bench_speed.py compare                    # re-print the table from saved results
+    python bench_speed.py quality                    # STEP-COUNT test: 8x1 vs 8x2 vs 6x2 vs 4x2 vs 4x1 (steps x tries) on 13 photos,
+                                                     # same seeds; prints speed + id_sim + visor table, writes quality_report.html
+    python bench_speed.py quality --limit 6          # quicker, fewer photos
 
 Outputs go to bench_results/<name>/ (avatars + results.json) and bench_results/summary.md.
 Read it like this: "mean abs diff" ~0 and PSNR > 45 dB = visually identical; identical best_try and an id_sim that
@@ -46,7 +49,21 @@ CONFIGS = [
                                               "CACHE_PROMPT_EMBEDS": "true", "CACHE_REF_LATENTS": "true",
                                               "PERSISTENT_DETECT": "true"}),
 ]
-REF_OF = {n: r for n, r, _ in CONFIGS}
+
+# --- quality test for the step count (python bench_speed.py quality): same photos, same seeds, full pipeline ---
+# Every setting that matters is pinned here, so the result does not depend on the server's .env.
+_Q = {"CFG": "1.0", "REFINE_CFG": "1.0", "ID_LORA_SCHEDULE": "[1.0,1.1]", "STOP_ID": "0.55",
+      "VISOR_EXTRA_TRIES": "1", "MAX_GLASSES_FIXES": "1"}
+def _q(steps, tries):
+    return {**_Q, "STEPS": str(steps), "BEST_OF_N": str(tries)}
+QCONFIGS = [
+    ("q_8x1", None,    _q(8, 1)),     # = what production effectively does today under load (8 steps, 1 try)
+    ("q_8x2", "q_8x1", _q(8, 2)),     # 8 steps with the best-of-2 search
+    ("q_6x2", "q_8x1", _q(6, 2)),
+    ("q_4x2", "q_8x1", _q(4, 2)),     # same GPU cost as q_8x1, but picks the better of 2 candidates
+    ("q_4x1", "q_8x1", _q(4, 1)),     # fastest, no candidate search
+]
+REF_OF = {n: r for n, r, _ in CONFIGS + QCONFIGS}
 
 
 # --------------------------------------------------------------------------------------------- run one config
@@ -191,12 +208,78 @@ def compare(_a=None):
     (OUT / "summary.md").write_text("```\n" + text + "\n```\n", encoding="utf-8")
 
 
+# --------------------------------------------------------------------------------------------- quality compare
+def compare_quality(a=None):
+    """Step-count evaluation: speed, identity score, visor checks and a side-by-side HTML report."""
+    base_name = QCONFIGS[0][0]
+    base = load(base_name)
+    if base is None:
+        print(f"no results for {base_name} yet - run: python bench_speed.py quality")
+        return
+    brows = {x["photo"]: x for x in base["rows"]}
+    lines = []
+    header = (f"{'config':<8}{'gen s':>7}{'total s':>8}{'speed-up':>9}{'id_sim':>8}{'d id_sim':>9}"
+              f"{'worse>0.05':>11}{'visor ok':>9}{'tries':>6}  verdict")
+    lines += [header, "-" * len(header)]
+    done = []
+    for name, ref, _ in QCONFIGS:
+        r = load(name)
+        if r is None:
+            continue
+        done.append(name)
+        rows = r["rows"]
+        vis = sum(1 for x in rows if x.get("visor") == "ok")
+        tr = avg(rows, "tries")
+        if ref is None:
+            lines.append(f"{name:<8}{avg(rows,'gen_s'):>7.1f}{avg(rows,'total_s'):>8.1f}{'1.00x':>9}{avg(rows,'id_sim'):>8.3f}"
+                         f"{'':>9}{'':>11}{vis:>6}/{len(rows):<2}{tr:>6.1f}  (reference)")
+            continue
+        d, worse = [], 0
+        for x in rows:
+            y = brows.get(x["photo"])
+            if y and isinstance(x.get("id_sim"), (int, float)) and isinstance(y.get("id_sim"), (int, float)):
+                d.append(x["id_sim"] - y["id_sim"])
+                worse += int(x["id_sim"] - y["id_sim"] < -0.05)
+        ds = statistics.mean(d) if d else float("nan")
+        bvis = sum(1 for x in base["rows"] if x.get("visor") == "ok")
+        speed = avg(base["rows"], "total_s") / avg(rows, "total_s")
+        if ds >= -0.02 and worse == 0 and vis >= bvis:
+            verdict = "OK - same or better (still look at the images)"
+        elif ds >= -0.04 and worse <= 1 and vis >= bvis:
+            verdict = "BORDERLINE - look at the images"
+        else:
+            verdict = "WORSE - keep more steps"
+        lines.append(f"{name:<8}{avg(rows,'gen_s'):>7.1f}{avg(rows,'total_s'):>8.1f}{speed:>8.2f}x{avg(rows,'id_sim'):>8.3f}"
+                     f"{ds:>+9.3f}{worse:>11}{vis:>6}/{len(rows):<2}{tr:>6.1f}  {verdict}")
+    text = "\n".join(lines)
+    print("\n" + text)
+    (OUT / "quality_summary.md").write_text("```\n" + text + "\n```\n", encoding="utf-8")
+
+    photos_dir = Path(getattr(a, "photos", "users")) if a else Path("users")
+    cells = ["<tr><th>input</th>" + "".join(f"<th>{n}</th>" for n in done) + "</tr>"]
+    for x in base["rows"]:
+        tds = f'<td><img src="{os.path.relpath(ROOT / photos_dir / x["photo"], OUT).replace(os.sep, "/")}"><br>{x["photo"]}</td>'
+        for n in done:
+            r = load(n)
+            y = next((z for z in r["rows"] if z["photo"] == x["photo"]), None)
+            tds += (f'<td><img src="{n}/{y["output"]}"><br>id_sim {y["id_sim"]} | visor {y["visor"]} | '
+                    f'gen {y["gen_s"]}s | tries {y["tries"]}</td>') if y else "<td>-</td>"
+        cells.append("<tr>" + tds + "</tr>")
+    html = ("<meta charset=utf-8><title>Steps quality report</title><style>body{font-family:sans-serif}"
+            "img{width:260px;border-radius:6px}td,th{padding:6px;vertical-align:top;font-size:12px}</style>"
+            "<h2>Steps / tries quality report</h2><pre>" + text + "</pre><table>" + "".join(cells) + "</table>")
+    (OUT / "quality_report.html").write_text(html, encoding="utf-8")
+    print(f"\nSide-by-side images: {OUT / 'quality_report.html'}")
+
+
 # --------------------------------------------------------------------------------------------- suite
 def suite(a):
+    quality = bool(getattr(a, "quality", False))
+    configs = QCONFIGS if quality else CONFIGS
     only = set(a.only.split(",")) if a.only else None
     if only:
         only |= {REF_OF[n] for n in list(only) if REF_OF.get(n)}      # a selected config always brings its baseline
-    for name, ref, env in CONFIGS:
+    for name, ref, env in configs:
         if only and name not in only:
             continue
         cmd = [sys.executable, str(Path(__file__).resolve()), "run", "--name", name, "--photos", a.photos,
@@ -205,25 +288,35 @@ def suite(a):
             cmd += ["--env", f"{k}={v}"]
         print(f"\n=== {name} ===", flush=True)
         subprocess.run(cmd, check=False)          # one process per config = clean GPU memory and settings
-    compare()
+    (compare_quality if quality else compare)(a)
+
+
+def quality(a):
+    a.quality = True
+    suite(a)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for cmd in ("run", "suite"):
+    for cmd in ("run", "suite", "quality"):
         p = sub.add_parser(cmd)
         p.add_argument("--photos", default="users")
-        p.add_argument("--limit", type=int, default=4, help="how many photos (default 4)")
-        p.add_argument("--repeat", type=int, default=2, help="timed repeats per photo (default 2)")
+        p.add_argument("--limit", type=int, default=13 if cmd == "quality" else 4,
+                       help="how many photos (default 4; 13 for 'quality')")
+        p.add_argument("--repeat", type=int, default=1 if cmd == "quality" else 2,
+                       help="timed repeats per photo (default 2; 1 for 'quality')")
         if cmd == "run":
             p.add_argument("--name", required=True)
             p.add_argument("--env", action="append", help="KEY=VALUE override, repeatable")
         else:
             p.add_argument("--only", default=None, help="comma list of config names")
+            p.add_argument("--quality", action="store_true", help=argparse.SUPPRESS)
     sub.add_parser("compare")
+    sub.add_parser("compare_quality")
     a = ap.parse_args()
-    {"run": run_config, "suite": suite, "compare": compare}[a.cmd](a)
+    {"run": run_config, "suite": suite, "compare": compare, "quality": quality,
+     "compare_quality": compare_quality}[a.cmd](a)
 
 
 if __name__ == "__main__":
