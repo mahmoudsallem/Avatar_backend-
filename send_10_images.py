@@ -19,6 +19,7 @@ import html
 import json
 import shutil
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -28,14 +29,18 @@ from pathlib import Path
 
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 LOG = None
+LOG_LOCK = threading.Lock()
+RUNNING = {}          # idx -> (input name, start time) for requests still waiting for the server
+DONE = []             # finished request numbers
 
 
 def log(msg=""):
     line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}" if msg else ""
-    print(line, flush=True)
-    if LOG:
-        LOG.write(line + "\n")
-        LOG.flush()
+    with LOG_LOCK:
+        print(line, flush=True)
+        if LOG:
+            LOG.write(line + "\n")
+            LOG.flush()
 
 
 def kb(n):
@@ -60,6 +65,7 @@ def send(endpoint, img, idx, out_dir, timeout, t_run):
     t0 = time.time()
     row["start"] = datetime.now().strftime("%H:%M:%S")
     row["start_s"] = round(t0 - t_run, 1)
+    RUNNING[idx] = (img.name, t0)
     log(f"#{idx:02d} SENT      input={img.name} ({kb(len(raw))})")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -87,12 +93,27 @@ def send(endpoint, img, idx, out_dir, timeout, t_run):
     row["end"] = datetime.now().strftime("%H:%M:%S")
     row["end_s"] = round(t1 - t_run, 1)
     row["sec"] = round(t1 - t0, 1)
+    RUNNING.pop(idx, None)
+    DONE.append(idx)
     res = "OK" if row["ok"] else ("REJECTED" if row["rejected"] else "FAILED")
     log(f"#{idx:02d} {res:<9} input={img.name} -> output={row['output'] or '-'}"
         f"{' (' + str(row['output_kb']) + ' KB)' if row['ok'] else ''}  "
         f"took {row['sec']}s (server gen {row['gen'] or '-'}s, tries={row['tries'] or '-'}, id_sim={row['id_sim'] or '-'}, "
         f"visor={row['visor'] or '-'}){'  ' + row['note'] if row['note'] else ''}")
     return row
+
+
+def heartbeat(base, total, t_run, stop, interval):
+    """Every few seconds: how many are done / still running, how long each has waited, and the GPU memory."""
+    while not stop.wait(interval):
+        try:
+            h = get_json(base + "/health", timeout=3)
+            gpu = f"VRAM free {h.get('gpu_free_vram_gb')} GB"
+        except Exception:
+            gpu = "VRAM n/a"
+        now = time.time()
+        waiting = ", ".join(f"#{i:02d} {int(now - s)}s" for i, (_, s) in sorted(RUNNING.items()))
+        log(f"... {int(now - t_run)}s elapsed | done {len(DONE)}/{total} | running {len(RUNNING)} | {gpu} | waiting: {waiting or '-'}")
 
 
 def write_report(out_dir, rows, wall, meta):
@@ -122,6 +143,7 @@ def main():
     ap.add_argument("--users-dir", default="users", help="folder with test photos (cycled if fewer than --count)")
     ap.add_argument("--out", default="test_results")
     ap.add_argument("--timeout", type=float, default=900.0)
+    ap.add_argument("--interval", type=float, default=5.0, help="seconds between live progress lines")
     a = ap.parse_args()
 
     out_dir = Path(a.out) / datetime.now().strftime("run_%Y%m%d_%H%M%S")
@@ -153,10 +175,13 @@ def main():
 
     t_run = time.time()
     rows = []
+    stop = threading.Event()
+    threading.Thread(target=heartbeat, args=(base, len(batch), t_run, stop, a.interval), daemon=True).start()
     with ThreadPoolExecutor(max_workers=len(batch)) as pool:
         futs = [pool.submit(send, base + "/v1/avatar/base64", img, i + 1, out_dir, a.timeout, t_run) for i, img in enumerate(batch)]
         for f in as_completed(futs):
             rows.append(f.result())
+    stop.set()
     rows.sort(key=lambda r: r["n"])
     wall = round(time.time() - t_run, 1)
 
