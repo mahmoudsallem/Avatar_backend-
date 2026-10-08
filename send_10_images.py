@@ -1,7 +1,7 @@
 """Fire N photos (default 10) at the avatar backend AT THE SAME TIME and report whether it works.
 
-    python send_10_images.py --url http://localhost:8000
-    python send_10_images.py --url http://<ec2-ip>:8000 --count 10 --users-dir users
+    python send_10_images.py --url http://<ec2-ip>:8000                # sends EVERY photo in users/ at once
+    python send_10_images.py --url http://<ec2-ip>:8000 --count 20     # or a fixed number (photos are cycled)
 
 For every request it logs: input photo (name, size), output avatar (path, size), start / end clock
 time, duration, server generation time, tries and identity score. Everything is written to
@@ -139,8 +139,8 @@ def main():
     global LOG
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", default="http://localhost:8000")
-    ap.add_argument("--count", type=int, default=10, help="how many requests to fire at once")
-    ap.add_argument("--users-dir", default="users", help="folder with test photos (cycled if fewer than --count)")
+    ap.add_argument("--count", type=int, default=0, help="how many requests to fire at once; 0 (default) = send EVERY photo in the folder, no limit")
+    ap.add_argument("--users-dir", default="users", help="folder with test photos")
     ap.add_argument("--out", default="test_results")
     ap.add_argument("--timeout", type=float, default=900.0)
     ap.add_argument("--interval", type=float, default=5.0, help="seconds between live progress lines")
@@ -158,7 +158,7 @@ def main():
         log(f"Cannot reach {base}/health: {e}")
         sys.exit(2)
     meta = (f"server {base} | status={h.get('status')} gpu={h.get('device_name')} gpu_slots={h.get('gpu_slots', '?')} "
-            f"free_vram={h.get('gpu_free_vram_gb')}GB | {a.count} requests at once")
+            f"free_vram={h.get('gpu_free_vram_gb')}GB")
     log(meta)
     if h.get("status") != "ok":
         log("Server is not healthy - fix that first.")
@@ -169,7 +169,8 @@ def main():
     if not imgs:
         log(f"No photos in {d.resolve()} - copy some test photos there first.")
         sys.exit(2)
-    batch = [imgs[i % len(imgs)] for i in range(a.count)]
+    batch = list(imgs) if a.count <= 0 else [imgs[i % len(imgs)] for i in range(a.count)]   # default: all photos
+    meta += f" | {len(batch)} requests at once"
     log(f"Sending {len(batch)} photos at the same time to {base}/v1/avatar/base64 ...")
     log()
 
@@ -201,11 +202,12 @@ def main():
     if ok:
         secs = [r["sec"] for r in ok]
         log(f"Per-avatar time: min {min(secs)}s | avg {sum(secs) / len(secs):.1f}s | max {max(secs)}s")
-    if gens:
-        seq = round(sum(gens), 1)
-        log(f"One-at-a-time would need about {seq}s (sum of server generation times) -> speed-up x{seq / wall:.2f}")
-        if seq / wall < 1.15:
-            log("   -> little/no overlap: check the server log for 'GPU slots ready: N' (N should be > 1).")
+    if ok:
+        log(f"Effective time per avatar: {wall / len(ok):.1f}s (wall-clock / avatars) -> about {len(ok) / wall * 3600:.0f} avatars per hour")
+        log("Note: per-avatar 'total s' is long because all requests run at the same time and share the GPU; compare the wall-clock between runs.")
+    tries1 = [r for r in ok if str(r["tries"]) == "1"]
+    if ok and len(tries1) == len(ok):
+        log("All avatars used only 1 try - if BEST_OF_N > 1, TIME_BUDGET is probably shorter than one try under load (set TIME_BUDGET=0 to test).")
 
     with open(out_dir / "results.csv", "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
