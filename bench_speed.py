@@ -35,6 +35,10 @@ CONFIGS = [
     ("attn_native",      "baseline",         {"ATTENTION_BACKEND": "native"}),
     ("attn_cudnn",       "baseline",         {"ATTENTION_BACKEND": "_native_cudnn"}),
     ("cudnn_on",         "baseline",         {"CUDNN_ENABLED": "true"}),
+    # --- these change the result on purpose: the table tells you how much (judge by the images + id_sim) ---
+    ("steps_4",          "baseline",         {"STEPS": "4"}),
+    ("steps_6",          "baseline",         {"STEPS": "6"}),
+    ("ref_768",          "baseline",         {"REF_SIZE": "768"}),
     ("baseline_uniform", None,               {"ID_LORA_SCHEDULE": UNIFORM}),
     ("fuse",             "baseline_uniform", {"ID_LORA_SCHEDULE": UNIFORM, "FUSE_LORA": "true"}),
     ("fuse_compile",     "baseline_uniform", {"ID_LORA_SCHEDULE": UNIFORM, "FUSE_LORA": "true", "COMPILE_TRANSFORMER": "true"}),
