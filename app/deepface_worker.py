@@ -31,9 +31,9 @@ with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.St
     from deepface import DeepFace
 
 def run_detect(argv):
+    """Returns the result dict (printing is done by the callers below)."""
     if len(argv) < 6:
-        print("__JSON__" + json.dumps({"error": "insufficient_arguments"}))
-        return
+        return {"error": "insufficient_arguments"}
 
     path, detector = argv[0], argv[1]
     scale = float(argv[2])
@@ -109,7 +109,26 @@ def run_detect(argv):
                         }]
                 result["background_faces_ignored"] = len(candidates) - 1
 
-    print("__JSON__" + json.dumps(result))
+    return result
+
+def run_detect_oneshot(argv):
+    print("__JSON__" + json.dumps(run_detect(argv)))
+
+def run_detect_server(argv):
+    """Persistent: prints __READY__, then reads {"args": [...]} JSON lines from stdin and answers each with
+    one __JSON__ line (same result as the one-shot 'detect' mode) until stdin closes."""
+    print("__READY__", flush=True)
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+            with contextlib.redirect_stdout(io.StringIO()):
+                out = run_detect([str(a) for a in req["args"]])
+        except Exception as e:
+            out = {"error": type(e).__name__ + ": " + str(e)[:300]}
+        print("__JSON__" + json.dumps(out), flush=True)
 
 def run_embed(argv):
     model = argv[0] if len(argv) > 0 else "ArcFace"
@@ -148,7 +167,9 @@ if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     rest = sys.argv[2:]
     if mode == "detect":
-        run_detect(rest)
+        run_detect_oneshot(rest)
+    elif mode == "detect_server":
+        run_detect_server(rest)
     elif mode == "embed":
         run_embed(rest)
     else:

@@ -73,6 +73,19 @@ class Settings(BaseSettings):
     SLOT_MIN_FREE_GB: float = 44.0   # don't load another slot unless this much VRAM is still free (each running job peaks at ~19 GB of activations)
     ANALYSIS_CONCURRENCY: int = 4    # Step 1 (CPU subprocesses) running at once, outside the GPU slots
 
+    # ---------------- Speed options (all OFF by default = identical behaviour to before) ----------------
+    # Exact / near-exact: they must not change the picture (check with bench_speed.py before enabling).
+    CACHE_PROMPT_EMBEDS: bool = False  # cache the text-encoder output per distinct prompt (bit-identical)
+    CACHE_REF_LATENTS: bool = False    # cache VAE latents of repeated reference images, e.g. the templates (bit-identical)
+    FUSE_LORA: bool = False            # merge the LoRA into the weights; needs a uniform ID_LORA_SCHEDULE (rounding-level change)
+    ATTENTION_BACKEND: str = ""        # "" = diffusers default; try "_native_cudnn" or "native" (rounding-level change)
+    COMPILE_TRANSFORMER: bool = False  # torch.compile the FLUX transformer (use together with FUSE_LORA; slow first start)
+    COMPILE_MODE: str = "default"      # "default" | "max-autotune-no-cudagraphs"
+    WARMUP_AT_STARTUP: bool = True     # with COMPILE_TRANSFORMER: compile every template shape before serving
+    CUDNN_ENABLED: bool = False        # the old code forced cuDNN off; True may speed up the VAE convolutions
+    PERSISTENT_DETECT: bool = False    # keep DeepFace face-detection processes alive instead of spawning one per photo
+    DETECT_WORKERS: int = 2            # how many persistent detection processes (each ~2 GB RAM)
+
     # ---------------- Generation Settings ----------------
     STEPS: int = 20
     CFG: float = 3.0

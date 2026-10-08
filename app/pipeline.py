@@ -9,6 +9,8 @@ Two DeepFace subprocess lifecycles are used against app/deepface_worker.py:
 """
 import io
 import os
+import queue
+import hashlib
 import sys
 import time
 import json
@@ -19,6 +21,7 @@ import threading
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
@@ -77,14 +80,34 @@ class GpuSlot:
         self.pipe = slot_pipe
         self.lora = lora_state if lora_state is not None else {"scale": 1.0, "mode": "kwargs"}
         self.stream = torch.cuda.Stream()
+        self.fused = False          # True once the LoRA is merged into the weights (FUSE_LORA)
+        self.fused_scale = None
 
     def set_lora(self, weight: float) -> None:
         self.lora["scale"] = float(weight)
+        if self.fused:
+            if abs(float(weight) - self.fused_scale) > 1e-6:
+                raise RuntimeError(
+                    f"LoRA strength {weight} requested but the LoRA is fused at {self.fused_scale}. "
+                    "Use FUSE_LORA=false, or a uniform ID_LORA_SCHEDULE.")
+            return
         if self.lora["mode"] == "adapters":
             self.pipe.set_adapters(["bfs"], adapter_weights=[float(weight)])
 
+    def reset_lora(self) -> None:
+        if not self.fused:
+            self.set_lora(settings.LORA_STRENGTH)
+
     def lora_kwargs(self):
+        if self.fused:
+            return None
         return {"scale": self.lora["scale"]} if self.lora["mode"] == "kwargs" else None
+
+    def fuse(self, strength: float) -> None:
+        """Merge the BFS LoRA into the transformer weights at one fixed strength (no per-step LoRA matmuls)."""
+        self.pipe.set_adapters(["bfs"], adapter_weights=[float(strength)])
+        self.pipe.fuse_lora(components=["transformer"], adapter_names=["bfs"], lora_scale=1.0)
+        self.fused, self.fused_scale = True, float(strength)
 
 slots: List[GpuSlot] = []
 slot_errors: List[str] = []   # why an extra slot could not be loaded (shown in /health)
@@ -190,6 +213,208 @@ def get_val_worker() -> subprocess.Popen:
         _VW["p"] = p
         logger.info("DeepFace embedding worker ready.")
         return p
+
+# ============================================================================
+# Speed options (all controlled from .env, default OFF)
+# ============================================================================
+
+_PROMPT_CACHE: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+_PROMPT_LOCK = threading.Lock()
+_REF_CACHE: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+_REF_SEEN: set = set()
+_REF_LOCK = threading.Lock()
+_CACHE_STATS = {"prompt_hit": 0, "prompt_miss": 0, "ref_hit": 0, "ref_miss": 0}
+
+def prompt_inputs(slot: "GpuSlot", prompt: str) -> dict:
+    """Either {"prompt": text} or, with CACHE_PROMPT_EMBEDS, {"prompt_embeds": cached encoder output}. Bit-identical."""
+    if not settings.CACHE_PROMPT_EMBEDS:
+        return {"prompt": prompt}
+    with _PROMPT_LOCK:
+        emb = _PROMPT_CACHE.get(prompt)
+        if emb is not None:
+            _PROMPT_CACHE.move_to_end(prompt)
+    if emb is None:
+        _CACHE_STATS["prompt_miss"] += 1
+        with torch.no_grad():
+            e, _ids = slot.pipe.encode_prompt(prompt=prompt, device=slot.pipe._execution_device)
+        emb = e.detach().to("cpu")          # synchronous copy; kept on the CPU so it is safe across CUDA streams
+        with _PROMPT_LOCK:
+            _PROMPT_CACHE[prompt] = emb
+            while len(_PROMPT_CACHE) > 256:
+                _PROMPT_CACHE.popitem(last=False)
+    else:
+        _CACHE_STATS["prompt_hit"] += 1
+    return {"prompt_embeds": emb.to(slot.pipe._execution_device)}
+
+def _tensor_key(x: torch.Tensor) -> str:
+    h = hashlib.blake2b(digest_size=16)
+    h.update(repr((tuple(x.shape), str(x.dtype))).encode())
+    h.update(x.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes())
+    return h.hexdigest()
+
+def _install_ref_cache(p) -> None:
+    """Cache the VAE latents of reference images that are seen repeatedly (avatar templates, visor refs).
+    A photo seen only once (every user's face) is never stored. Deterministic (VAE 'argmax' mode) -> identical."""
+    orig = p._encode_vae_image
+
+    def cached(image, generator=None):
+        key = _tensor_key(image)
+        with _REF_LOCK:
+            hit = _REF_CACHE.get(key)
+            if hit is not None:
+                _REF_CACHE.move_to_end(key)
+        if hit is not None:
+            _CACHE_STATS["ref_hit"] += 1
+            return hit.to(image.device)
+        _CACHE_STATS["ref_miss"] += 1
+        out = orig(image=image, generator=generator)
+        with _REF_LOCK:
+            if key in _REF_SEEN:                       # second sighting -> worth keeping
+                _REF_CACHE[key] = out.detach().to("cpu")
+                while len(_REF_CACHE) > 64:
+                    _REF_CACHE.popitem(last=False)
+            else:
+                _REF_SEEN.add(key)
+                if len(_REF_SEEN) > 20000:
+                    _REF_SEEN.clear()
+        return out
+
+    p._encode_vae_image = cached
+
+def apply_speed_options(slot: "GpuSlot") -> None:
+    p = slot.pipe
+    if settings.FUSE_LORA:
+        mults = [float(m) for m in settings.ID_LORA_SCHEDULE]
+        if len(set(round(m, 6) for m in mults)) != 1:
+            logger.warning("FUSE_LORA skipped: ID_LORA_SCHEDULE %s is not uniform (the LoRA strength changes per try, "
+                           "and a fused LoRA has one fixed strength). Use e.g. [1.0,1.0] to enable it.", mults)
+        else:
+            strength = settings.LORA_STRENGTH * settings.ID_LORA_MULT * mults[0]
+            slot.fuse(strength)
+            logger.info("Slot %d: LoRA fused into the weights at strength %.3f", slot.idx, strength)
+    if settings.ATTENTION_BACKEND:
+        try:
+            p.transformer.set_attention_backend(settings.ATTENTION_BACKEND)
+            logger.info("Slot %d: attention backend = %s", slot.idx, settings.ATTENTION_BACKEND)
+        except Exception as exc:
+            logger.warning("Slot %d: could not set attention backend %r (%s) - keeping the default",
+                           slot.idx, settings.ATTENTION_BACKEND, exc)
+    if settings.CACHE_REF_LATENTS:
+        _install_ref_cache(p)
+    if settings.COMPILE_TRANSFORMER:
+        if not slot.fused:
+            logger.warning("COMPILE_TRANSFORMER without a fused LoRA recompiles for every LoRA strength - "
+                           "enable FUSE_LORA with a uniform ID_LORA_SCHEDULE.")
+        p.transformer.compile(mode=settings.COMPILE_MODE, dynamic=False)
+        logger.info("Slot %d: transformer compiled (mode=%s) - first calls per shape are slow", slot.idx, settings.COMPILE_MODE)
+
+def warmup_slots() -> None:
+    """Run each template through each slot once so torch.compile builds every shape before the first request."""
+    if not (settings.COMPILE_TRANSFORMER and settings.WARMUP_AT_STARTUP):
+        return
+    for slot in slots:
+        for key in ("Man", "Woman", "Woman_Hijab"):
+            try:
+                t0 = time.time()
+                avatar, _ = load_avatar(key)
+                face = pad_square(avatar.resize((512, 512), Image.LANCZOS))
+                visor = load_visor_ref(key)
+                images = [avatar, face] + ([visor] if visor is not None else [])
+                slot.set_lora(settings.LORA_STRENGTH * settings.ID_LORA_MULT * settings.ID_LORA_SCHEDULE[0])
+                with torch.no_grad(), torch.cuda.stream(slot.stream):
+                    slot.pipe(prompt="warmup", image=images, attention_kwargs=slot.lora_kwargs(),
+                              width=avatar.size[0], height=avatar.size[1], num_inference_steps=2,
+                              guidance_scale=settings.CFG, generator=torch.Generator("cuda").manual_seed(0))
+                slot.stream.synchronize()
+                logger.info("Warm-up slot %d / %s done in %.1fs", slot.idx, key, time.time() - t0)
+            except Exception:
+                logger.exception("Warm-up slot %d / %s failed (continuing)", slot.idx, key)
+    torch.cuda.empty_cache()
+
+# ---- persistent face-detection workers (PERSISTENT_DETECT) ----
+_DETECT_Q: Optional["queue.Queue"] = None
+_DETECT_ALL: List[subprocess.Popen] = []
+
+def _spawn_detect_worker() -> subprocess.Popen:
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": "-1", "TF_USE_LEGACY_KERAS": "1",
+           "TF_CPP_MIN_LOG_LEVEL": "3", "TF_ENABLE_ONEDNN_OPTS": "0"}
+    log_file = open(settings.WORKER_LOG, "a", encoding="utf-8")
+    p = subprocess.Popen([sys.executable, str(settings.WORKER_PATH), "detect_server"],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log_file,
+                         text=True, bufsize=1, env=env)
+    t0 = time.time()
+    for line in p.stdout:
+        if line.startswith("__READY__"):
+            _DETECT_ALL.append(p)
+            return p
+        if time.time() - t0 > 180:
+            break
+    try:
+        p.kill()
+    except Exception:
+        pass
+    raise RuntimeError(f"Persistent detect worker failed to start - see {settings.WORKER_LOG}")
+
+def start_detect_pool() -> None:
+    global _DETECT_Q
+    if not settings.PERSISTENT_DETECT:
+        return
+    _DETECT_Q = queue.Queue()
+    for _ in range(max(1, settings.DETECT_WORKERS)):
+        _DETECT_Q.put(_spawn_detect_worker())
+    logger.info("Persistent face-detection pool ready (%d workers).", _DETECT_Q.qsize())
+
+def close_detect_pool() -> None:
+    for p in list(_DETECT_ALL):
+        try:
+            p.stdin.close()
+            p.terminate()
+            p.wait(timeout=2)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+    _DETECT_ALL.clear()
+
+atexit.register(close_detect_pool)
+
+def _run_detect_persistent(image_path: Path, timeout: int) -> dict:
+    p = _DETECT_Q.get()
+    ok = False
+    try:
+        args = [str(image_path), settings.FACE_DETECTOR, str(settings.CROP_SCALE), str(settings.MIN_FACE_CONFIDENCE),
+                str(settings.MIN_FACE_SIZE_PX), str(settings.MAIN_FACE_DOMINANCE)]
+        p.stdin.write(json.dumps({"args": args}) + "\n")
+        p.stdin.flush()
+        timer = threading.Timer(timeout, p.kill)
+        timer.start()
+        try:
+            while True:
+                line = p.stdout.readline()
+                if not line:
+                    raise RuntimeError("detect worker died or timed out")
+                if line.startswith("__JSON__"):
+                    res = json.loads(line[len("__JSON__"):])
+                    break
+        finally:
+            timer.cancel()
+        ok = True
+        return res
+    finally:
+        if ok:
+            _DETECT_Q.put(p)
+        else:                                    # replace a broken worker; callers fall back to the one-shot path
+            try:
+                p.kill()
+            except Exception:
+                pass
+            if p in _DETECT_ALL:
+                _DETECT_ALL.remove(p)
+            try:
+                _DETECT_Q.put(_spawn_detect_worker())
+            except Exception:
+                logger.exception("Could not respawn the detect worker")
 
 def get_gpu_memory_info() -> Tuple[Optional[float], Optional[float]]:
     try:
@@ -299,7 +524,7 @@ def load_models() -> None:
     global clip, pipe
 
     assert torch.cuda.is_available(), "PyTorch cannot see the GPU - FLUX needs CUDA."
-    torch.backends.cudnn.enabled = False
+    torch.backends.cudnn.enabled = bool(settings.CUDNN_ENABLED)
 
     free_gb, total_gb = get_gpu_memory_info()
     free_gb_val = free_gb if free_gb is not None else 0.0
@@ -409,6 +634,8 @@ def load_models() -> None:
         if sp is None:
             logger.warning("Could not load GPU slot %d - continuing with %d slot(s).", i, len(slots))
             break
+    for s in slots:
+        apply_speed_options(s)
     _slot_q = asyncio.Queue()
     for s in slots:
         _slot_q.put_nowait(s)
@@ -417,10 +644,13 @@ def load_models() -> None:
 
     # Start persistent ArcFace identity verification worker
     get_val_worker()
+    start_detect_pool()
+    warmup_slots()
 
 def shutdown_models() -> None:
     logger.info("Shutting down model resources...")
     close_val_worker()
+    close_detect_pool()
     _POOL.shutdown(wait=False)
     logger.info("Model resources shut down cleanly.")
 
@@ -451,6 +681,11 @@ def check_scope(pil_img: Image.Image) -> Dict[str, float]:
 
 def run_deepface_worker(image_path: Path, timeout: int = None) -> dict:
     timeout = timeout or settings.WORKER_TIMEOUT
+    if _DETECT_Q is not None:
+        try:
+            return _run_detect_persistent(image_path, timeout)
+        except Exception:
+            logger.exception("Persistent detect failed - falling back to a one-shot process")
     env = {
         **os.environ,
         "CUDA_VISIBLE_DEVICES": "-1",
@@ -1344,7 +1579,7 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
             tg = time.time()
             with torch.no_grad(), torch.cuda.stream(slot.stream):
                 out = slot.pipe(
-                    prompt=prompt,
+                    **prompt_inputs(slot, prompt),
                     image=images,
                     attention_kwargs=slot.lora_kwargs(),
                     width=w,
@@ -1452,4 +1687,4 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
     finally:
         if progress is not None:
             progress.close()
-        slot.set_lora(settings.LORA_STRENGTH)
+        slot.reset_lora()
