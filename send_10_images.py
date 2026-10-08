@@ -1,7 +1,7 @@
 """Fire N photos (default 10) at the avatar backend AT THE SAME TIME and report whether it works.
 
     python send_10_images.py --url http://<ec2-ip>:8000                # sends EVERY photo in users/ at once
-    python send_10_images.py --url http://<ec2-ip>:8000 --count 20     # or a fixed number (photos are cycled)
+    python send_10_images.py --url http://<ec2-ip>:8000 --count 50     # or a fixed number: photos are re-sent (cycled) to reach it
 
 For every request it logs: input photo (name, size), output avatar (path, size), start / end clock
 time, duration, server generation time, tries and identity score. Everything is written to
@@ -112,7 +112,10 @@ def heartbeat(base, total, t_run, stop, interval):
         except Exception:
             gpu = "VRAM n/a"
         now = time.time()
-        waiting = ", ".join(f"#{i:02d} {int(now - s)}s" for i, (_, s) in sorted(RUNNING.items()))
+        items = sorted(RUNNING.items(), key=lambda kv: kv[1][1])          # longest-waiting first
+        waiting = ", ".join(f"#{i:02d} {int(now - s)}s" for i, (_, s) in items[:8])
+        if len(items) > 8:
+            waiting += f", ... +{len(items) - 8} more"
         log(f"... {int(now - t_run)}s elapsed | done {len(DONE)}/{total} | running {len(RUNNING)} | {gpu} | waiting: {waiting or '-'}")
 
 
@@ -142,7 +145,7 @@ def main():
     ap.add_argument("--count", type=int, default=0, help="how many requests to fire at once; 0 (default) = send EVERY photo in the folder, no limit")
     ap.add_argument("--users-dir", default="users", help="folder with test photos")
     ap.add_argument("--out", default="test_results")
-    ap.add_argument("--timeout", type=float, default=900.0)
+    ap.add_argument("--timeout", type=float, default=1800.0, help="per-request timeout in seconds (default 1800; 50 avatars at ~4/min need ~13 min)")
     ap.add_argument("--interval", type=float, default=5.0, help="seconds between live progress lines")
     a = ap.parse_args()
 
