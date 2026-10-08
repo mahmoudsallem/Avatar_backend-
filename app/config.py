@@ -69,8 +69,8 @@ class Settings(BaseSettings):
     # ---------------- GPU Concurrency ----------------
     # Number of avatars generated at the same time on the GPU. Each extra slot loads another copy of the
     # FLUX transformer (~18 GB bf16); the text encoder + VAE are shared between slots.
-    GPU_SLOTS: int = 2
-    SLOT_MIN_FREE_GB: float = 28.0   # don't load another slot unless this much VRAM is still free
+    GPU_SLOTS: int = 2               # 0 = AUTO: keep adding slots while at least SLOT_MIN_FREE_GB VRAM stays free (max 8)
+    SLOT_MIN_FREE_GB: float = 32.0   # don't load another slot unless this much VRAM is still free (headroom for the running jobs)
     ANALYSIS_CONCURRENCY: int = 4    # Step 1 (CPU subprocesses) running at once, outside the GPU slots
 
     # ---------------- Generation Settings ----------------

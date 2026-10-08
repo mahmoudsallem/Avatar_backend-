@@ -363,7 +363,7 @@ def load_models() -> None:
     global _slot_q
     slots.clear()
     slots.append(GpuSlot(0, pipe, _LORA))
-    wanted = 1 if low_vram else max(1, settings.GPU_SLOTS)
+    wanted = 1 if low_vram else (settings.GPU_SLOTS if settings.GPU_SLOTS > 0 else 8)  # 0 = auto-fill VRAM
     if low_vram and settings.GPU_SLOTS > 1:
         logger.warning("Low free VRAM - running with 1 GPU slot (CPU-offload mode cannot run concurrent jobs).")
     try:
