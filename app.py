@@ -133,7 +133,7 @@ async def health_check():
         "gpu_total_vram_gb": total_gb,
     }
 
-async def _generate_avatar_from_bytes(content: bytes, filename: str, overrides: Optional[dict] = None):
+async def _generate_avatar_from_bytes(content: bytes, filename: str):
     ext = Path(filename).suffix.lower()
     if ext not in pipeline.IMAGE_EXTENSIONS:
         return JSONResponse(
@@ -165,7 +165,7 @@ async def _generate_avatar_from_bytes(content: bytes, filename: str, overrides: 
         slot = await pipeline.acquire_slot()
         t0 = time.time() - t_analysis
         try:
-            jpeg_bytes, metadata = await asyncio.to_thread(pipeline.generate_avatar, temp_path, info, t0, slot, overrides)
+            jpeg_bytes, metadata = await asyncio.to_thread(pipeline.generate_avatar, temp_path, info, t0, slot)
         finally:
             pipeline.release_slot(slot)
 
@@ -237,7 +237,7 @@ async def create_avatar_base64(body: AvatarBase64Request):
             status_code=status.HTTP_400_BAD_REQUEST,
             content={"error": "Invalid base64 image data."},
         )
-    return await _generate_avatar_from_bytes(content, filename, ov)
+    return await _generate_avatar_from_bytes(content, filename)
 
 @app.get("/", summary="Root status", include_in_schema=False)
 async def root():

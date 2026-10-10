@@ -121,7 +121,6 @@ class Settings(BaseSettings):
     BEST_OF_N: int = 3
     VISOR_EXTRA_TRIES: int = 2
     TIME_BUDGET: float = 0.0  # 0 = no limit (notebook behaviour)
-    ALLOW_TEST_OVERRIDES: bool = False  # TEST ONLY: let a request choose ?steps= ?tries= ?time_budget= (never enable on a public server)
     ID_LORA_SCHEDULE: List[float] = [1.0, 1.1, 1.2]
     STOP_ID: float = 0.55
     W_JAW: float = 0.8
