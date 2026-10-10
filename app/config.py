@@ -64,7 +64,13 @@ class Settings(BaseSettings):
     DETECT_BALD: bool = True
     BALD_POSITIVE_THRESHOLD: float = 0.52
     BALD_MIN_SCORE_MARGIN: float = 0.03
-    BALD_FALLBACK_CLIP: float = 0.70  # CLIP-only confidence needed when the scalp area is outside the crop
+    BALD_FALLBACK_CLIP: float = 0.62  # CLIP-only confidence needed when the scalp test cannot judge (scalp outside the crop, or the strip above the face is just background). Was 0.70 - check the logged "Bald check" scores and tune.
+    BALD_STRONG_CLIP: float = 0.70    # CLIP alone is trusted over a "not bare" scalp-colour test at this confidence
+    # Output guard: after each generated candidate of a BALD user, check that the avatar did not grow hair.
+    VERIFY_BALD_OUTPUT: bool = True
+    OUT_BALD_MIN: float = 0.50        # CLIP "bald" share of the avatar head needed to count the candidate as bald
+    W_HAIR: float = 5.0               # score penalty for a candidate that has hair although the user is bald
+    HAIR_EXTRA_TRIES: int = 2         # extra generations (beyond BEST_OF_N) when every candidate still has hair
 
     # ---------------- GPU Concurrency ----------------
     # Number of avatars generated at the same time on the GPU. Each extra slot loads another copy of the

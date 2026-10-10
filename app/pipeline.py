@@ -854,6 +854,18 @@ def scalp_is_bare(crop_bgr: np.ndarray, rect: Tuple[int, int, int, int]) -> Opti
     f_l = max(float(np.median(f[:, 0])), 1.0)
     d_e = float(np.linalg.norm(np.median(s, 0) - np.median(f, 0)))
     lum_ratio = float(np.median(s[:, 0])) / f_l
+    # Background-aware: when the face box starts at the very top of a bald head (or the photo is a round/tight
+    # crop on a black backdrop) the strip above the box is only background. That used to count as "dark = hair"
+    # and a bald man was read as "has hair" -> the avatar kept the template's hair. Background pixels (colour of
+    # the crop's top edge) are now excluded; if the strip is mostly background we cannot judge -> None (CLIP decides).
+    bg = _lab_pixels(crop_bgr[0:max(2, int(0.04 * crop_bgr.shape[0])), :])
+    bg_med = np.median(bg, 0)
+    bg_like = np.linalg.norm(s - bg_med, axis=1) < 14.0
+    if float(bg_like.mean()) > 0.50:
+        logger.info("Scalp check: strip above the face is %.0f%% background -> cannot judge (None)", 100 * float(bg_like.mean()))
+        return None
+    if (~bg_like).sum() > 0:
+        s = s[~bg_like]
     dark_frac = float((s[:, 0] < 0.55 * f_l).mean())
     # Only the share of pixels clearly DARKER than the forehead skin (= hair) is used. The old extra tests
     # (lum_ratio / colour distance to the forehead) failed real bald heads: a shiny scalp is brighter than the
@@ -882,10 +894,14 @@ def detect_bald(image: Image.Image, crop_bgr: np.ndarray = None, rect=None) -> T
     clip_yes = yes_no(scores, settings.BALD_POSITIVE_THRESHOLD, settings.BALD_MIN_SCORE_MARGIN)
     bare = scalp_is_bare(crop_bgr, rect) if (crop_bgr is not None and rect is not None) else None
     scores["scalp_bare"] = bare
+    # A dark ceiling / backdrop above a face box that starts at the top of a bald head looks like "dark hair" to
+    # the colour test, so a very confident CLIP verdict is allowed to override a "not bare" scalp test.
+    strong = bool(clip_yes and scores["positive"] >= settings.BALD_STRONG_CLIP)
     if bare is None:
         bald = scores["positive"] >= settings.BALD_FALLBACK_CLIP and clip_yes
     else:
-        bald = bool(bare and clip_yes)
+        bald = bool((bare and clip_yes) or strong)
+    scores["strong_clip"] = strong
     return bald, scores
 
 def classify_hijab(image: Image.Image) -> Tuple[bool, dict]:
@@ -1149,6 +1165,12 @@ BALD_USER = (
     "The top of the head must be clean smooth bare skin. "
 )
 
+BALD_RETRY = (
+    "RETRY - the previous attempt wrongly kept hair. The swept, curly or styled hair of Picture 1 must NOT appear: "
+    "paint the whole top and sides of the head above the forehead as one smooth, glossy bare scalp in skin tone with "
+    "only a thin red rim light on its edge, exactly like the bald head of Picture 2. "
+)
+
 def visor_block(info, attempt=0, ref=False):
     look = VISOR_LOOK_MAN if info.get("avatar") == "Man" else VISOR_LOOK_DEFAULT
     return (
@@ -1222,7 +1244,7 @@ def build_prompt(info, attempt=0, ref=False, style_mode=None, keep_user_expressi
             "throughout, styled in a high voluminous bun or updo at the crown, sleek and professionally polished, "
             f"framing the face. {V}{FACE_CLEAN}{style_text} " + closing
         )
-    hair_user_block = BALD_USER if is_bald else HAIR_USER
+    hair_user_block = (BALD_USER + (BALD_RETRY if attempt > 0 else "")) if is_bald else HAIR_USER
     return (
         f"{VISOR_MANDATORY}{bfs}{IDENTITY}{BUILD}{hair_user_block}"
         "FACIAL HAIR: keep the facial hair of Picture 2 exactly as it is: if Picture 2 has a moustache, goatee, "
@@ -1398,6 +1420,36 @@ def check_visor(out_img: Image.Image) -> dict:
         "visor_score": round(min(s["left"], s["right"]) + s["bridge"], 4),
     }
 
+def check_bald_output(out_img: Image.Image, info: dict) -> dict:
+    """Output guard for BALD users: did the avatar keep/grow hair (the template's hair) instead of a bare scalp?
+    CLIP on the avatar's head (and its top part) with illustration wording. Returns hair="ok"|"hair" and bald_score
+    (CLIP share for "bald"; higher = baldier, also used to rank candidates). Not bald / not male -> always ok."""
+    if not (settings.VERIFY_BALD_OUTPUT and info.get("bald") and info.get("avatar") == "Man"):
+        return {"hair": "ok", "bald_score": None}
+    try:
+        box = AVATAR_HEAD_BOX.get(info["avatar"], (0.25, 0.05, 0.68, 0.62))
+        w, h = out_img.size
+        head = out_img.convert("RGB").crop((int(box[0] * w), int(box[1] * h), int(box[2] * w), int(box[3] * h)))
+        top = head.crop((0, 0, head.width, int(head.height * 0.55)))
+        s = classify_binary(
+            [head, top],
+            [
+                "an illustration of a bald man with a bare shaved scalp",
+                "a stylized portrait of a man with no hair on his head",
+                "a digital painting of a completely bald man",
+            ],
+            [
+                "an illustration of a man with hair on his head",
+                "a stylized portrait of a man with a haircut and styled hair",
+                "a digital painting of a man with thick hair",
+            ],
+        )
+    except Exception:
+        logger.exception("Bald output check failed - treating the candidate as ok")
+        return {"hair": "ok", "bald_score": None}
+    ok = s["positive"] >= settings.OUT_BALD_MIN
+    return {"hair": "ok" if ok else "hair", "bald_score": round(s["positive"], 3)}
+
 def _prep(img: Image.Image) -> Image.Image:
     img = img.convert("RGB")
     k = settings.VERIFY_MAX_SIDE / max(img.size)
@@ -1466,6 +1518,7 @@ def compare(user: dict, out: dict) -> Tuple[float, Optional[float], Optional[flo
 
 def score_output(user_emb: Optional[dict], out: Image.Image, info: dict) -> dict:
     vis = check_visor(out)
+    vis.update(check_bald_output(out, info))
     sim = u_r = o_r = None
     if settings.VALIDATE and user_emb is not None:
         o = embed(out, True, "out")
@@ -1484,6 +1537,8 @@ def score_output(user_emb: Optional[dict], out: Image.Image, info: dict) -> dict
         (sim or 0.0)
         - settings.W_JAW * (jaw or 0.0)
         - (settings.W_NO_VISOR if vis["visor"] == "weak" else 0.0)
+        - (settings.W_HAIR if vis["hair"] == "hair" else 0.0)
+        + (0.5 * (vis["bald_score"] or 0.0) if info.get("bald") else 0.0)   # among bald candidates prefer the baldest
     )
     return {
         "id_sim": None if sim is None else round(sim, 3),
@@ -1554,6 +1609,7 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         w, h = avatar.size
         max_k = int(ov.get("tries", settings.BEST_OF_N)) if settings.VALIDATE else 1
         extras = 0
+        hair_extras = 0
 
         dbg = None
         if settings.DEBUG_DUMP:
@@ -1604,20 +1660,25 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
             if dbg is not None:
                 out.save(dbg / f"try{k + 1}_seed{seed + k}_lora{mult}.png")
             logger.info(
-                "Try %d (seed=%d, lora_mult=%.1f): id_sim=%s, jaw_diff=%s, visor=%s, score=%s (gen=%.1fs, score=%.1fs)",
+                "Try %d (seed=%d, lora_mult=%.1f): id_sim=%s, jaw_diff=%s, visor=%s, hair=%s(bald_score=%s), score=%s (gen=%.1fs, score=%.1fs)",
                 k + 1,
                 seed + k,
                 mult,
                 v["id_sim"],
                 v["jaw_diff"],
                 v["visor"],
+                v["hair"],
+                v["bald_score"],
                 v["score"],
                 g,
                 s,
             )
 
-            if best is None or (v["visor"] == "ok", v["score"]) > (
+            if v["hair"] != "ok":
+                logger.warning("Try %d: BALD user but the avatar has hair (bald_score=%s) - candidate penalised", k + 1, v["bald_score"])
+            if best is None or (v["visor"] == "ok", v["hair"] == "ok", v["score"]) > (
                 best["v"]["visor"] == "ok",
+                best["v"]["hair"] == "ok",
                 best["v"]["score"],
             ):
                 best = {"out": out, "v": v, "k": k + 1, "mult": mult}
@@ -1626,7 +1687,7 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
             progress.set_postfix(id_sim=v["id_sim"], visor=v["visor"], score=v["score"])
             progress.update(1)
 
-            if settings.VALIDATE and (v["id_sim"] or 0) >= settings.STOP_ID and v["visor"] == "ok":
+            if settings.VALIDATE and (v["id_sim"] or 0) >= settings.STOP_ID and v["visor"] == "ok" and v["hair"] == "ok":
                 stopped = "good"
                 break
 
@@ -1637,6 +1698,12 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                     progress.total = max_k
                     progress.refresh()
                     logger.info("Visor not ok - adding extra try (if budget permits)")
+                elif best["v"]["hair"] != "ok" and hair_extras < settings.HAIR_EXTRA_TRIES:
+                    hair_extras += 1
+                    max_k += 1
+                    progress.total = max_k
+                    progress.refresh()
+                    logger.info("Bald user but every candidate still has hair - adding extra try (if budget permits)")
                 else:
                     break
 
@@ -1660,6 +1727,8 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
             glasses=info.get("glasses", False),
             beard=info.get("beard", False),
             bald=info.get("bald", False),
+            hair=v["hair"],
+            bald_score=v["bald_score"],
             seconds=round(time.time() - t0, 1),
             gen_s=round(gen_s, 1),
             val_s=round(val_s, 1),
