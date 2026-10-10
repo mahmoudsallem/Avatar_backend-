@@ -908,7 +908,9 @@ def detect_bald(image: Image.Image, crop_bgr: np.ndarray = None, rect=None) -> T
     if bare is None:
         bald = scores["positive"] >= settings.BALD_FALLBACK_CLIP and clip_yes
     else:
-        bald = bool((bare and clip_yes) or strong)
+        # "bare" alone is weak evidence (a tall / receding forehead makes the strip above the face box look like skin),
+        # so CLIP must ALSO be clearly confident, not just above the 0.52 yes/no line.
+        bald = bool((bare and clip_yes and scores["positive"] >= settings.BALD_SCALP_CLIP) or strong)
     scores["strong_clip"] = strong
     return bald, scores
 
@@ -1213,6 +1215,12 @@ BALD_RETRY = (
     "only a thin red rim light on its edge, exactly like the bald head of Picture 2. "
 )
 
+HAIR_RETRY = (
+    "RETRY - the previous attempt wrongly made this man BALD. Picture 2 shows a man WITH hair on top of his head: paint "
+    "his real hair on the scalp, with the same color (dark or grey), the same slicked-back or combed direction and the "
+    "same receding hairline as Picture 2. the top of the head must be covered by hair, never a bare shiny scalp. "
+)
+
 def visor_block(info, attempt=0, ref=False):
     look = VISOR_LOOK_MAN if info.get("avatar") == "Man" else VISOR_LOOK_DEFAULT
     return (
@@ -1224,7 +1232,7 @@ def visor_block(info, attempt=0, ref=False):
         + (VISOR_RETRY if attempt > 0 else "")
     )
 
-def build_prompt(info, attempt=0, ref=False, style_mode=None, keep_user_expression=None):
+def build_prompt(info, attempt=0, ref=False, style_mode=None, keep_user_expression=None, hair_retry=False):
     if style_mode is None:
         style_mode = settings.STYLE_MODE
     if keep_user_expression is None:
@@ -1292,7 +1300,7 @@ def build_prompt(info, attempt=0, ref=False, style_mode=None, keep_user_expressi
             "throughout, styled in a high voluminous bun or updo at the crown, sleek and professionally polished, "
             f"framing the face. {V}{FACE_CLEAN}{style_text} " + closing
         )
-    hair_user_block = (BALD_USER + (BALD_RETRY if attempt > 0 else "")) if is_bald else HAIR_USER
+    hair_user_block = (BALD_USER + (BALD_RETRY if attempt > 0 else "")) if is_bald else (HAIR_USER + (HAIR_RETRY if hair_retry else ""))
     return (
         f"{head}{IDENTITY_TXT}{BUILD}{hair_user_block}"
         "FACIAL HAIR: keep the facial hair of Picture 2 exactly as it is: if Picture 2 has a moustache, goatee, "
@@ -1469,10 +1477,14 @@ def check_visor(out_img: Image.Image) -> dict:
     }
 
 def check_bald_output(out_img: Image.Image, info: dict) -> dict:
-    """Output guard for BALD users: did the avatar keep/grow hair (the template's hair) instead of a bare scalp?
-    CLIP on the avatar's head (and its top part) with illustration wording. Returns hair="ok"|"hair" and bald_score
-    (CLIP share for "bald"; higher = baldier, also used to rank candidates). Not bald / not male -> always ok."""
-    if not (settings.VERIFY_BALD_OUTPUT and info.get("bald") and info.get("avatar") == "Man"):
+    """Output guard (both directions) on the avatar's head, CLIP with illustration wording.
+    - BALD user: hair="hair" when the avatar kept/grew hair instead of a bare scalp.
+    - user WITH hair: hair="bald" when the avatar lost the hair (e.g. slicked-back / receding hair painted as a bare
+      scalp) - such a candidate is penalised and retried with HAIR_RETRY.
+    Returns hair="ok"|"hair"|"bald" and bald_score (CLIP share for "bald"; also used to rank bald candidates).
+    Women / hijab / other avatars -> always ok."""
+    is_bald = bool(info.get("bald"))
+    if info.get("avatar") != "Man" or not (settings.VERIFY_BALD_OUTPUT if is_bald else settings.VERIFY_HAIR_OUTPUT):
         return {"hair": "ok", "bald_score": None}
     try:
         box = AVATAR_HEAD_BOX.get(info["avatar"], (0.25, 0.05, 0.68, 0.62))
@@ -1495,8 +1507,11 @@ def check_bald_output(out_img: Image.Image, info: dict) -> dict:
     except Exception:
         logger.exception("Bald output check failed - treating the candidate as ok")
         return {"hair": "ok", "bald_score": None}
-    ok = s["positive"] >= settings.OUT_BALD_MIN
-    return {"hair": "ok" if ok else "hair", "bald_score": round(s["positive"], 3)}
+    if is_bald:
+        hair = "ok" if s["positive"] >= settings.OUT_BALD_MIN else "hair"
+    else:
+        hair = "bald" if s["positive"] >= settings.OUT_HAIR_BALD_MAX else "ok"
+    return {"hair": hair, "bald_score": round(s["positive"], 3)}
 
 def _prep(img: Image.Image) -> Image.Image:
     img = img.convert("RGB")
@@ -1585,7 +1600,7 @@ def score_output(user_emb: Optional[dict], out: Image.Image, info: dict) -> dict
         (sim or 0.0)
         - settings.W_JAW * (jaw or 0.0)
         - (settings.W_NO_VISOR if vis["visor"] == "weak" else 0.0)
-        - (settings.W_HAIR if vis["hair"] == "hair" else 0.0)
+        - (settings.W_HAIR if vis["hair"] != "ok" else 0.0)
         + (0.5 * (vis["bald_score"] or 0.0) if info.get("bald") else 0.0)   # among bald candidates prefer the baldest
     )
     return {
@@ -1658,6 +1673,7 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         max_k = int(ov.get("tries", settings.BEST_OF_N)) if settings.VALIDATE else 1
         extras = 0
         hair_extras = 0
+        prev_hair = "ok"
 
         dbg = None
         if settings.DEBUG_DUMP:
@@ -1681,7 +1697,7 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         while True:
             mult = settings.ID_LORA_SCHEDULE[k % len(settings.ID_LORA_SCHEDULE)]
             slot.set_lora(test_lora * mult)
-            prompt = build_prompt(info, attempt=k, ref=visor_ref is not None)
+            prompt = build_prompt(info, attempt=k, ref=visor_ref is not None, hair_retry=(prev_hair == "bald"))
 
             tg = time.time()
             with torch.no_grad(), torch.cuda.stream(slot.stream):
@@ -1722,8 +1738,11 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                 s,
             )
 
-            if v["hair"] != "ok":
+            prev_hair = v["hair"]
+            if v["hair"] == "hair":
                 logger.warning("Try %d: BALD user but the avatar has hair (bald_score=%s) - candidate penalised", k + 1, v["bald_score"])
+            elif v["hair"] == "bald":
+                logger.warning("Try %d: user HAS hair but the avatar is bald (bald_score=%s) - candidate penalised, retrying with HAIR_RETRY", k + 1, v["bald_score"])
             if best is None or (v["visor"] == "ok", v["hair"] == "ok", v["score"]) > (
                 best["v"]["visor"] == "ok",
                 best["v"]["hair"] == "ok",
@@ -1751,7 +1770,7 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                     max_k += 1
                     progress.total = max_k
                     progress.refresh()
-                    logger.info("Bald user but every candidate still has hair - adding extra try (if budget permits)")
+                    logger.info("Hair/bald mismatch in every candidate (hair=%s) - adding extra try (if budget permits)", best["v"]["hair"])
                 else:
                     break
 
