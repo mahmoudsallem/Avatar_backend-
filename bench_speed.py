@@ -42,6 +42,7 @@ CONFIGS = [
     ("steps_4",          "baseline",         {"STEPS": "4"}),
     ("steps_6",          "baseline",         {"STEPS": "6"}),
     ("ref_768",          "baseline",         {"REF_SIZE": "768"}),
+    ("prompt_id_focus", "baseline",         {"PROMPT_VARIANT": "id_focus"}),   # identity-first prompt: judge by id_sim + the images
     ("baseline_uniform", None,               {"ID_LORA_SCHEDULE": UNIFORM}),
     ("fuse",             "baseline_uniform", {"ID_LORA_SCHEDULE": UNIFORM, "FUSE_LORA": "true"}),
     ("fuse_compile",     "baseline_uniform", {"ID_LORA_SCHEDULE": UNIFORM, "FUSE_LORA": "true", "COMPILE_TRANSFORMER": "true"}),

@@ -1045,6 +1045,40 @@ IDENTITY = (
     "as Picture 2; only the painting style comes from Picture 1. "
 )
 
+# "id_focus" prompt variant (settings.PROMPT_VARIANT): identity text FIRST (the text encoder weights early tokens most;
+# the tuned prompt opens with ~6 visor sentences), concrete landmark-by-landmark copy instructions, and an explicit
+# "keep the real skin texture" rule (the airbrushed style wording erases wrinkles/pores/beard texture = looks like a
+# younger, different person). Same content rules as IDENTITY, just shorter, ordered and repeated once at the end.
+IDENTITY_FOCUS = (
+    "FACE IDENTITY (highest priority, above style and above the visor): the face must be recognisable as the exact "
+    "person in Picture 2 at first glance. Picture 2 is the ONLY source of facial structure; Picture 1 supplies only "
+    "painting style, lighting, jacket, emblem and background. copy from Picture 2, landmark by landmark: head and face "
+    "width-to-height ratio, forehead, cheekbones, cheek fullness, jaw width and jawline angle, chin, ear shape and "
+    "size, nose length, bridge and nostrils, lip shape and thickness, the same mouth and smile (closed stays closed, "
+    "visible teeth stay visible), eyebrow shape and thickness, eye shape, eye size, eye spacing and the real eye "
+    "color. keep every landmark at the same relative position and distance as Picture 2. keep the real skin texture "
+    "and age: forehead lines, smile lines, crow's feet, under-eye bags, pores, beard stubble and the true grey or "
+    "white strands in the beard; do not airbrush them away. never slim, sharpen, lengthen, rejuvenate or beautify the "
+    "face, never change the skin tone. "
+)
+
+IDENTITY_FOCUS_CLOSING = (
+    "final identity check: the head must read as the same real person as Picture 2: same face shape, jaw, cheeks, "
+    "ears, nose, mouth, eyes, eyebrows, beard shape and skin texture. "
+)
+
+def _id_focus_style(text: str) -> str:
+    """Dial back the style wording that smooths the face / shifts the skin colour (id_focus variant only)."""
+    return (
+        text.replace("painted with smooth airbrushed skin and soft realistic shading",
+                     "painted with softly shaded skin that keeps the visible skin texture")
+        .replace("cel-shaded skin with smooth airbrushed gradients and crisp highlight and shadow shapes, "
+                 "rich saturated warm skin tones,",
+                 "cel-shaded skin with soft gradients and crisp highlight and shadow shapes that keep the visible "
+                 "skin texture and the real skin tone of Picture 2,")
+        .replace("warm natural skin tones with gentle highlights,", "the natural skin tone of Picture 2 with gentle highlights,")
+    )
+
 BUILD = (
     "BUILD: match the fullness of the person in Picture 2. if the face is round, full or heavy, keep it a little "
     "fuller: fuller cheeks, softer wider jaw, a fuller chin (even a soft double chin) and a thicker neck. if the face "
@@ -1232,21 +1266,27 @@ def build_prompt(info, attempt=0, ref=False, style_mode=None, keep_user_expressi
         "final check: the face and build match Picture 2, the jawline is clean, and the angular blue clear "
         "visor of the avatar is on the face with no other glasses."
     )
+    # Prompt variant: "tuned" (default) is byte-for-byte the notebook order; "id_focus" puts the identity text first.
+    head, IDENTITY_TXT = f"{VISOR_MANDATORY}{bfs}", IDENTITY
+    if settings.PROMPT_VARIANT == "id_focus":
+        head, IDENTITY_TXT = f"{bfs}{IDENTITY_FOCUS}{VISOR_MANDATORY}", ""
+        style_text = _id_focus_style(style_text)
+        closing = IDENTITY_FOCUS_CLOSING + closing
     if info.get("hijab", False):
         return (
-            f"{VISOR_MANDATORY}{bfs}{IDENTITY}{BUILD}{V}{HIJAB_VISOR_NOTE}"
+            f"{head}{IDENTITY_TXT}{BUILD}{V}{HIJAB_VISOR_NOTE}"
             f"{HIJAB_FACE}{HIJAB_USER}{FACE_CLEAN}{style_text} {closing} the visor is present and fits her face."
         )
     if info.get("gender") == "Woman":
         return (
-            f"{VISOR_MANDATORY}{bfs}{IDENTITY}{FEMALE_FACE}{BUILD}"
+            f"{head}{IDENTITY_TXT}{FEMALE_FACE}{BUILD}"
             "her hair is styled exactly like Picture 1: long black hair with red and orange highlights woven "
             "throughout, styled in a high voluminous bun or updo at the crown, sleek and professionally polished, "
             f"framing the face. {V}{FACE_CLEAN}{style_text} " + closing
         )
     hair_user_block = (BALD_USER + (BALD_RETRY if attempt > 0 else "")) if is_bald else HAIR_USER
     return (
-        f"{VISOR_MANDATORY}{bfs}{IDENTITY}{BUILD}{hair_user_block}"
+        f"{head}{IDENTITY_TXT}{BUILD}{hair_user_block}"
         "FACIAL HAIR: keep the facial hair of Picture 2 exactly as it is: if Picture 2 has a moustache, goatee, "
         "beard or stubble keep the same shape, coverage, length, density and grey or black color with a neat "
         "natural edge; if Picture 2 is clean-shaven keep the skin smooth and add no facial hair. do not copy any "

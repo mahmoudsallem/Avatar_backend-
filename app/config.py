@@ -112,6 +112,7 @@ class Settings(BaseSettings):
     HIJAB_SCALE: float = 1.25
     REF_SIZE: int = 1024
     STYLE_MODE: str = "comic"  # "semi_real" | "comic" | "off"
+    PROMPT_VARIANT: str = "tuned"  # "tuned" = the notebook prompt (default) | "id_focus" = identity-first prompt (A/B test with bench_prompt_ab.py before switching)
     KEEP_USER_EXPRESSION: bool = True
 
     # ---------------- Visor & Similarity ----------------
