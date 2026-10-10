@@ -116,8 +116,7 @@ async def health_check():
         "lora_mode": pipeline._LORA["mode"],
         "gpu_slots": len(pipeline.slots),
         "gpu_slots_requested": settings.GPU_SLOTS,
-        "settings": {"steps": settings.STEPS, "best_of_n": settings.BEST_OF_N, "time_budget": settings.TIME_BUDGET,
-                     "allow_test_overrides": settings.ALLOW_TEST_OVERRIDES},
+        "settings": {"steps": settings.STEPS, "best_of_n": settings.BEST_OF_N, "time_budget": settings.TIME_BUDGET},
         "speed_options": {
             "cache_prompt_embeds": settings.CACHE_PROMPT_EMBEDS,
             "cache_ref_latents": settings.CACHE_REF_LATENTS,
@@ -133,20 +132,6 @@ async def health_check():
         "gpu_free_vram_gb": free_gb,
         "gpu_total_vram_gb": total_gb,
     }
-
-def _parse_overrides(steps: Optional[int], tries: Optional[int], time_budget: Optional[float]):
-    """Test-only per-request overrides. Returns (overrides dict, error response or None)."""
-    ov = {k: v for k, v in (("steps", steps), ("tries", tries), ("time_budget", time_budget)) if v is not None}
-    if not ov:
-        return {}, None
-    if not settings.ALLOW_TEST_OVERRIDES:
-        return {}, JSONResponse(status_code=status.HTTP_403_FORBIDDEN,
-                                content={"error": "steps/tries/time_budget overrides are disabled. Set ALLOW_TEST_OVERRIDES=true in .env (test servers only)."})
-    if not (1 <= ov.get("steps", 1) <= 50 and 1 <= ov.get("tries", 1) <= 8 and 0 <= ov.get("time_budget", 0) <= 3600):
-        return {}, JSONResponse(status_code=status.HTTP_400_BAD_REQUEST,
-                                content={"error": "steps must be 1-50, tries 1-8, time_budget 0-3600."})
-    return ov, None
-
 
 async def _generate_avatar_from_bytes(content: bytes, filename: str, overrides: Optional[dict] = None):
     ext = Path(filename).suffix.lower()
@@ -226,17 +211,11 @@ AVATAR_RESPONSES = {
 )
 async def create_avatar(
     file: UploadFile = File(..., description="User portrait photo"),
-    steps: Optional[int] = None,
-    tries: Optional[int] = None,
-    time_budget: Optional[float] = None,
 ):
-    ov, err = _parse_overrides(steps, tries, time_budget)
-    if err is not None:
-        return err
     filename = file.filename or "upload.jpg"
     # No server-side upload size limit - read whatever was sent.
     content = await file.read()
-    return await _generate_avatar_from_bytes(content, filename, ov)
+    return await _generate_avatar_from_bytes(content, filename)
 
 class AvatarBase64Request(BaseModel):
     image: str  # base64-encoded image bytes (raw or "data:image/...;base64,..." data URL)
@@ -248,11 +227,7 @@ class AvatarBase64Request(BaseModel):
     summary="Generate Sci-Fi Avatar (base64 input)",
     description="Same as /v1/avatar, but the photo is sent as a base64 string in a JSON body instead of multipart/form-data.",
 )
-async def create_avatar_base64(body: AvatarBase64Request, steps: Optional[int] = None,
-                              tries: Optional[int] = None, time_budget: Optional[float] = None):
-    ov, err = _parse_overrides(steps, tries, time_budget)
-    if err is not None:
-        return err
+async def create_avatar_base64(body: AvatarBase64Request):
     filename = body.filename or "upload.jpg"
     raw_b64 = body.image.split(",", 1)[-1] if body.image.startswith("data:") else body.image
     try:
