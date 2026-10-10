@@ -1,5 +1,5 @@
-# Environment and secrets
-.env
+# Environment: .env is tracked (settings only, NO secrets - keep it that way). Local override copy is ignored.
+.env.local
 
 # Python bytecode
 __pycache__/

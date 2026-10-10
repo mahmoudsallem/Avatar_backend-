@@ -782,9 +782,13 @@ def classify_binary(
     views: List[Image.Image], pos_prompts: List[str], neg_prompts: List[str]
 ) -> Dict[str, float]:
     pos_all, neg_all = [], []
+    # ONE CLIP call per view (all prompts together) instead of one per prompt pair. The result is identical:
+    # s[p] / (s[p] + s[n]) is a softmax ratio, which does not depend on which other labels share the softmax.
+    # Saves ~2/3 of the image encodings (glasses + beard + bald checks used to encode each view 3 times).
+    labels = list(pos_prompts) + list(neg_prompts)
     for v in views:
+        s = clip_scores(v, labels)
         for p, n in zip(pos_prompts, neg_prompts):
-            s = clip_scores(v, [p, n])
             tot = s[p] + s[n]
             pos_all.append(s[p] / tot if tot else 0.0)
             neg_all.append(s[n] / tot if tot else 0.0)
