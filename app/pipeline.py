@@ -888,11 +888,15 @@ def detect_bald(image: Image.Image, crop_bgr: np.ndarray = None, rect=None) -> T
             "a photo of a bald man with a bare shaved scalp",
             "a bald man with no hair on top of his head",
             "a man with a completely bald shaved head",
+            "a man whose scalp is completely bare and shiny",
+            "a man with a smooth hairless head",
         ],
         [
             "a photo of a man with full hair on top of his head",
             "a man with a haircut and visible hair on top",
             "a man with thick hair on his head",
+            "a man with slicked back hair and a receding hairline",
+            "a man with short dark hair combed back",
         ],
     )
     clip_yes = yes_no(scores, settings.BALD_POSITIVE_THRESHOLD, settings.BALD_MIN_SCORE_MARGIN)
