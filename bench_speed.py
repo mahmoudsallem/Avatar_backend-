@@ -7,6 +7,8 @@ and saves the avatars. `compare` then reports, against the right baseline:
 
     python bench_speed.py suite                      # run every configuration below, then compare
     python bench_speed.py suite --only baseline,cache,fuse_compile
+    python bench_speed.py suite --only baseline,cfg_1,cfg1_steps4,fast_stack   # scaling test plan: one speed-up at a time, then stacked;
+                                                     # the table ends with a fleet-size estimate for 1.5M avatars / 14 h
     python bench_speed.py run --name mytest --env CACHE_PROMPT_EMBEDS=true --env ATTENTION_BACKEND=native
     python bench_speed.py compare                    # re-print the table from saved results
     python bench_speed.py quality                    # STEP-COUNT test: 8x1 vs 8x2 vs 6x2 vs 4x2 vs 4x1 (steps x tries) on 13 photos,
@@ -49,7 +51,19 @@ CONFIGS = [
     ("all_in",           "baseline_uniform", {"ID_LORA_SCHEDULE": UNIFORM, "FUSE_LORA": "true", "COMPILE_TRANSFORMER": "true",
                                               "CACHE_PROMPT_EMBEDS": "true", "CACHE_REF_LATENTS": "true",
                                               "PERSISTENT_DETECT": "true"}),
+    # --- scaling test plan: add one speed-up at a time, then stack them. Judge by id_sim + the images ("DIFFERS" = do not use) ---
+    ("cfg_1",           "baseline",         {"CFG": "1.0", "REFINE_CFG": "1.0"}),                 # does CFG double the work? (watch gen s)
+    ("cfg1_steps4",     "baseline",         {"CFG": "1.0", "REFINE_CFG": "1.0", "STEPS": "4"}),
+    ("fast_stack",      "baseline",         {"CFG": "1.0", "REFINE_CFG": "1.0", "STEPS": "4", "ID_LORA_SCHEDULE": UNIFORM,
+                                              "FUSE_LORA": "true", "COMPILE_TRANSFORMER": "true", "CACHE_PROMPT_EMBEDS": "true",
+                                              "CACHE_REF_LATENTS": "true", "PERSISTENT_DETECT": "true"}),
 ]
+
+# --- fleet-size estimate printed under the table ---
+DAILY_IMAGES = 1_500_000      # target volume
+SERVING_HOURS = 14            # served within this many hours
+PARALLEL_GAIN = 1.5           # measured on the EC2 GPU: 1 image 30 s, 2 at once 40 s -> 2*30/40 = 1.5x throughput with 2 slots
+PEAK_HEADROOM = 1.5           # spare capacity for peaks
 
 # --- quality test for the step count (python bench_speed.py quality): same photos, same seeds, full pipeline ---
 # Every setting that matters is pinned here, so the result does not depend on the server's .env.
@@ -204,6 +218,22 @@ def compare(_a=None):
             verdict = "DIFFERS - do not use"
         lines.append(f"{name:<18}{ref:<18}{avg(rows,'step1_s'):>8.1f}{avg(rows,'gen_s'):>7.1f}{avg(rows,'total_s'):>8.1f}"
                      f"{speed:>8.2f}x{md:>11.3f}{mp:>9.1f}{avg(rows,'id_sim'):>8.3f}{ds:>+9.3f}{same_try:>6}/{n:<2}  {verdict}")
+    # fleet estimate: one benchmark run = one slot, one avatar at a time, so avatars/s per instance = PARALLEL_GAIN / total_s
+    need = DAILY_IMAGES / (SERVING_HOURS * 3600)
+    lines.append("")
+    lines.append(f"Fleet estimate for {DAILY_IMAGES:,} avatars in {SERVING_HOURS} h = {need:.1f} avatars/s "
+                 f"(2 GPU slots assumed to give {PARALLEL_GAIN}x; +{int((PEAK_HEADROOM-1)*100)}% peak headroom)")
+    lines.append(f"{'config':<18}{'total s':>8}{'avatars/min':>12}{'instances':>10}{'+headroom':>10}")
+    for name, _ref, _env in CONFIGS:
+        r = load(name)
+        if r is None:
+            continue
+        t = avg(r["rows"], "total_s")
+        if not t or t != t:
+            continue
+        per_s = PARALLEL_GAIN / t
+        n_inst = need / per_s
+        lines.append(f"{name:<18}{t:>8.1f}{per_s*60:>12.1f}{int(-(-n_inst//1)):>10}{int(-(-n_inst*PEAK_HEADROOM//1)):>10}")
     text = "\n".join(lines)
     print("\n" + text)
     (OUT / "summary.md").write_text("```\n" + text + "\n```\n", encoding="utf-8")
