@@ -130,6 +130,25 @@ def lora_kwargs():
 analysis_sem = asyncio.Semaphore(settings.ANALYSIS_CONCURRENCY)
 _CLIP_LOCK = threading.Lock()
 
+async def process_image_file(image_path: Path) -> Tuple[bytes, dict]:
+    """Run Step 1 (analysis) + Step 2 (generation) for a local image file.
+
+    Shared by the HTTP endpoints and the S3 folder watcher so both go through
+    the same GPU-slot/analysis-semaphore gating. Raises Rejected on an invalid
+    or unsupported photo.
+    """
+    async with analysis_sem:
+        t0 = time.time()
+        info = await asyncio.to_thread(analyse_user, image_path)
+
+    t_analysis = time.time() - t0
+    slot = await acquire_slot()
+    t0 = time.time() - t_analysis
+    try:
+        return await asyncio.to_thread(generate_avatar, image_path, info, t0, slot)
+    finally:
+        release_slot(slot)
+
 # Persistent ArcFace embedding worker state
 _VW = {"p": None}
 _VLOCK = threading.RLock()

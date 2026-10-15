@@ -35,6 +35,20 @@ class Settings(BaseSettings):
     WORKER_LOG: Path = BASE_DIR / "worker.log"
     WORKER_TIMEOUT: int = 600
 
+    # ---------------- S3 Folder Watcher ----------------
+    # Polls s3://S3_BUCKET/S3_USERS_PREFIX for new photos, generates an avatar for
+    # each, and uploads it to s3://S3_BUCKET/S3_GENERATED_PREFIX under the same
+    # base filename (always as .jpg - the pipeline's output is always JPEG).
+    # AWS credentials come from the normal boto3 chain (env vars, ~/.aws/credentials,
+    # or an EC2 instance role) - nothing extra is needed here.
+    S3_ENABLED: bool = False
+    S3_BUCKET: str = "avatar-etisalata"
+    S3_USERS_PREFIX: str = "Users/"
+    S3_GENERATED_PREFIX: str = "Generated_Avatar/"
+    S3_REGION: str = "us-east-1"
+    S3_POLL_INTERVAL: float = 5.0     # seconds between folder listings
+    S3_MAX_CONCURRENT: int = 2        # user photos the watcher processes at once
+
     # ---------------- Models ----------------
     CLIP_DIR: Path = Path("/Models/clip-vit-base-patch32")
     CLIP_MODEL: str = "openai/clip-vit-base-patch32"

@@ -1,5 +1,4 @@
 import sys
-import time
 import uuid
 import base64
 import logging
@@ -15,6 +14,7 @@ from pydantic import BaseModel
 
 from app.config import settings
 from app import pipeline
+from app import s3_watcher
 
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
@@ -43,9 +43,12 @@ async def lifespan(app: FastAPI):
         logger.critical("Fatal: Failed to load models on startup: %s", exc, exc_info=True)
         raise
 
+    s3_watcher.start()
+
     yield
 
     logger.info("Shutting down Saytara Avatar backend...")
+    await s3_watcher.stop()
     try:
         pipeline.shutdown_models()
     except Exception as exc:
@@ -131,6 +134,13 @@ async def health_check():
         "gpu_slot_errors": pipeline.slot_errors,
         "gpu_free_vram_gb": free_gb,
         "gpu_total_vram_gb": total_gb,
+        "s3_watcher": {
+            "enabled": settings.S3_ENABLED,
+            "running": s3_watcher.is_running(),
+            "bucket": settings.S3_BUCKET,
+            "users_prefix": settings.S3_USERS_PREFIX,
+            "generated_prefix": settings.S3_GENERATED_PREFIX,
+        },
     }
 
 async def _generate_avatar_from_bytes(content: bytes, filename: str):
@@ -147,27 +157,11 @@ async def _generate_avatar_from_bytes(content: bytes, filename: str):
     try:
         temp_path.write_bytes(content)
 
-        # TIME_BUDGET covers the whole image (Step 1 analysis + Step 2 generation),
-        # matching the notebook - start the clock before analyse_user, not after it.
-        # Step 1 is CPU work: several requests analyse in parallel, without holding a GPU slot.
-        async with pipeline.analysis_sem:
-            t0 = time.time()      # start AFTER the semaphore: waiting in line must not eat TIME_BUDGET
-            try:
-                info = await asyncio.to_thread(pipeline.analyse_user, temp_path)
-            except pipeline.Rejected as r:
-                logger.info("Image validation rejected for %s: %s", filename, r)
-                return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"error": str(r)})
-
-        t_analysis = time.time() - t0   # Step 1 duration; time spent waiting for a slot must NOT eat TIME_BUDGET
-
-        # Step 2: take a free GPU slot (GPU_SLOTS avatars generate concurrently; extra requests wait here).
-        # Returns the final avatar as JPEG bytes, already capped at settings.OUTPUT_MAX_BYTES.
-        slot = await pipeline.acquire_slot()
-        t0 = time.time() - t_analysis
         try:
-            jpeg_bytes, metadata = await asyncio.to_thread(pipeline.generate_avatar, temp_path, info, t0, slot)
-        finally:
-            pipeline.release_slot(slot)
+            jpeg_bytes, metadata = await pipeline.process_image_file(temp_path)
+        except pipeline.Rejected as r:
+            logger.info("Image validation rejected for %s: %s", filename, r)
+            return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"error": str(r)})
 
         headers = {
             "X-Tries-Used": str(metadata.get("tries", "")),
