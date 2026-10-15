@@ -1180,7 +1180,10 @@ VISOR_LOOK_MAN = (
     "along its edges; a chunky faceted cyan-blue corner block with a white highlight at the outer end on the side "
     "nearest the camera; and a thick silver-white and blue arm running back along the temple to the ear on the far "
     "side. the lens is clear and transparent with only a very light icy-blue tint and a few crisp white diagonal "
-    "glints, so the eyes, eyelashes, eyelids and eyebrows of Picture 2 stay sharp and fully visible through it. "
+    "glints, so the eyes, eyelashes, eyelids and eyebrows of Picture 2 stay sharp and fully visible through it. the "
+    "icy-blue exists only as the frame color and as small specular glint highlights floating on the lens surface; "
+    "it never recolors, tints or washes over the iris itself, which keeps its exact real color from Picture 2 (dark "
+    "brown stays dark brown, never blue or grey) as clearly as if seen through plain clear glass. "
 )
 
 VISOR_LOOK_DEFAULT = (
@@ -1188,7 +1191,10 @@ VISOR_LOOK_DEFAULT = (
     "covering both eyes, with a straight thin electric-blue upper rim just under the eyebrows, broad faceted outer "
     "corners, a shallow V-shaped lower edge around the nose, cyan-blue side blocks and slim arms returning to both "
     "temples. the lens is clear and transparent with only a very light icy-blue tint and a few crisp white glints, "
-    "so the eyes, eyelashes, eyelids and eyebrows of Picture 2 stay sharp and fully visible through it. do not turn "
+    "so the eyes, eyelashes, eyelids and eyebrows of Picture 2 stay sharp and fully visible through it. the icy-blue "
+    "exists only as the frame color and as small specular glint highlights floating on the lens surface; it never "
+    "recolors, tints or washes over the iris itself, which keeps its exact real color from Picture 2 (dark brown "
+    "stays dark brown, never blue or grey) as clearly as if seen through plain clear glass. do not turn "
     "it into ordinary eyeglasses or two separate lenses. "
 )
 
