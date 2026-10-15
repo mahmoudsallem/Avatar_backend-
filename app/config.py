@@ -46,8 +46,15 @@ class Settings(BaseSettings):
     S3_USERS_PREFIX: str = "Users/"
     S3_GENERATED_PREFIX: str = "Generated_Avatar/"
     S3_REGION: str = "us-east-1"
-    S3_POLL_INTERVAL: float = 5.0     # seconds between folder listings
+    S3_POLL_INTERVAL: float = 5.0     # seconds between folder listings (fallback mode, only used when S3_QUEUE_URL is empty)
     S3_MAX_CONCURRENT: int = 2        # user photos the watcher processes at once
+
+    # Real-time mode: an SQS queue fed by an S3 "ObjectCreated" event notification on Users/*.
+    # When set, the watcher long-polls this queue instead of periodically listing Users/ - a new
+    # photo is picked up within ~1-2s instead of waiting up to S3_POLL_INTERVAL. Leave empty to
+    # fall back to the polling loop (e.g. local/dev runs with no SQS set up).
+    S3_QUEUE_URL: str = ""
+    S3_QUEUE_WAIT_SECONDS: int = 20   # SQS long-poll wait (max 20); keeps the loop from hammering SQS with empty receives
 
     # ---------------- Models ----------------
     CLIP_DIR: Path = Path("/Models/clip-vit-base-patch32")

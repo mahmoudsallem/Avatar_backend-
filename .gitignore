@@ -32,3 +32,6 @@ users/
 test_results/
 users/
 bench_results/
+
+.claude
+skills-lock.json
