@@ -933,6 +933,33 @@ def detect_bald(image: Image.Image, crop_bgr: np.ndarray = None, rect=None) -> T
     scores["strong_clip"] = strong
     return bald, scores
 
+def hair_shortness_score(image: Image.Image, illustration: bool = False) -> float:
+    """CLIP share for short/cropped hair vs long/voluminous hair on the top-of-head region. Higher = shorter,
+    flatter hair. `illustration=True` uses painted-avatar wording, for scoring a generated candidate; the default
+    (photo wording) is for the user's real crop."""
+    width, height = image.size
+    top = image.crop((0, 0, width, int(height * 0.55)))
+    if illustration:
+        pos = [
+            "an illustration of a man with short, closely cropped hair",
+            "a stylized portrait of a man with a tight buzz cut or flat trimmed hair",
+        ]
+        neg = [
+            "an illustration of a man with long, thick, voluminous hair",
+            "a stylized portrait of a man with a full head of bushy, swept-back hair",
+        ]
+    else:
+        pos = [
+            "a photo of a man with short, closely cropped hair with very little volume",
+            "a man with a tight buzz cut or a flat, neatly trimmed haircut",
+        ]
+        neg = [
+            "a photo of a man with long, thick, voluminous hair",
+            "a man with a full head of bushy, swept-back hair",
+        ]
+    s = classify_binary([image, top], pos, neg)
+    return s["positive"]
+
 def classify_hijab(image: Image.Image) -> Tuple[bool, dict]:
     width, height = image.size
     head = image.crop((int(width * 0.05), 0, int(width * 0.95), int(height * 0.85)))
@@ -982,6 +1009,7 @@ def analyse_user(user_path: Path, crop_dir: Path = None) -> dict:
         bald, bald_s = detect_bald(crop_pil, crop_bgr, rect)
         logger.info("Bald check for %s: bald=%s %s", key, bald, {k: (round(v, 3) if isinstance(v, float) else v) for k, v in bald_s.items()})
     hijab, hijab_s = classify_hijab(crop_pil) if gender == "Woman" else (False, None)
+    hair_vol_user = hair_shortness_score(crop_pil) if (gender == "Man" and not bald) else None
 
     ov = OVERRIDES.get(key, {})
     if "glasses" in ov:
@@ -1014,6 +1042,7 @@ def analyse_user(user_path: Path, crop_dir: Path = None) -> dict:
         "hijab": hijab,
         "beard": beard,
         "bald": bald,
+        "hair_vol_user": hair_vol_user,
         "avatar": "Woman_Hijab" if hijab else gender,
     }
     logger.info(
@@ -1532,6 +1561,28 @@ def check_bald_output(out_img: Image.Image, info: dict) -> dict:
         hair = "bald" if s["positive"] >= settings.OUT_HAIR_BALD_MAX else "ok"
     return {"hair": hair, "bald_score": round(s["positive"], 3)}
 
+def check_hair_volume_output(out_img: Image.Image, info: dict) -> dict:
+    """Men with hair (not bald): flag a candidate whose hair volume drifted far from the user's real hair (e.g. a
+    short buzz cut came out fuller and swept-back). Separate from check_bald_output, which only tells bald from
+    not-bald; this catches a volume/texture mismatch between two candidates that are both "has hair"."""
+    if (
+        info.get("avatar") != "Man"
+        or info.get("bald")
+        or not settings.VERIFY_HAIR_VOLUME
+        or info.get("hair_vol_user") is None
+    ):
+        return {"hair_vol_mismatch": False, "hair_vol_diff": None}
+    try:
+        box = AVATAR_HEAD_BOX.get(info["avatar"], (0.25, 0.05, 0.68, 0.62))
+        w, h = out_img.size
+        head = out_img.convert("RGB").crop((int(box[0] * w), int(box[1] * h), int(box[2] * w), int(box[3] * h)))
+        out_score = hair_shortness_score(head, illustration=True)
+    except Exception:
+        logger.exception("Hair volume output check failed - treating the candidate as ok")
+        return {"hair_vol_mismatch": False, "hair_vol_diff": None}
+    diff = abs(out_score - info["hair_vol_user"])
+    return {"hair_vol_mismatch": diff >= settings.HAIR_VOLUME_MISMATCH, "hair_vol_diff": round(diff, 3)}
+
 def _prep(img: Image.Image) -> Image.Image:
     img = img.convert("RGB")
     k = settings.VERIFY_MAX_SIDE / max(img.size)
@@ -1601,6 +1652,7 @@ def compare(user: dict, out: dict) -> Tuple[float, Optional[float], Optional[flo
 def score_output(user_emb: Optional[dict], out: Image.Image, info: dict) -> dict:
     vis = check_visor(out)
     vis.update(check_bald_output(out, info))
+    vis.update(check_hair_volume_output(out, info))
     sim = u_r = o_r = None
     if settings.VALIDATE and user_emb is not None:
         o = embed(out, True, "out")
@@ -1620,6 +1672,7 @@ def score_output(user_emb: Optional[dict], out: Image.Image, info: dict) -> dict
         - settings.W_JAW * (jaw or 0.0)
         - (settings.W_NO_VISOR if vis["visor"] == "weak" else 0.0)
         - (settings.W_HAIR if vis["hair"] != "ok" else 0.0)
+        - (settings.W_HAIR_VOLUME if vis.get("hair_vol_mismatch") else 0.0)
         + (0.5 * (vis["bald_score"] or 0.0) if info.get("bald") else 0.0)   # among bald candidates prefer the baldest
     )
     return {
@@ -1692,6 +1745,7 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         max_k = int(ov.get("tries", settings.BEST_OF_N)) if settings.VALIDATE else 1
         extras = 0
         hair_extras = 0
+        hair_vol_extras = 0
         prev_hair = "ok"
 
         dbg = None
@@ -1743,7 +1797,8 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
             if dbg is not None:
                 out.save(dbg / f"try{k + 1}_seed{seed + k}_lora{mult}.png")
             logger.info(
-                "Try %d (seed=%d, lora_mult=%.1f): id_sim=%s, jaw_diff=%s, visor=%s, hair=%s(bald_score=%s), score=%s (gen=%.1fs, score=%.1fs)",
+                "Try %d (seed=%d, lora_mult=%.1f): id_sim=%s, jaw_diff=%s, visor=%s, hair=%s(bald_score=%s), "
+                "hair_vol_mismatch=%s(diff=%s), score=%s (gen=%.1fs, score=%.1fs)",
                 k + 1,
                 seed + k,
                 mult,
@@ -1752,6 +1807,8 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                 v["visor"],
                 v["hair"],
                 v["bald_score"],
+                v.get("hair_vol_mismatch"),
+                v.get("hair_vol_diff"),
                 v["score"],
                 g,
                 s,
@@ -1762,6 +1819,8 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                 logger.warning("Try %d: BALD user but the avatar has hair (bald_score=%s) - candidate penalised", k + 1, v["bald_score"])
             elif v["hair"] == "bald":
                 logger.warning("Try %d: user HAS hair but the avatar is bald (bald_score=%s) - candidate penalised, retrying with HAIR_RETRY", k + 1, v["bald_score"])
+            if v.get("hair_vol_mismatch"):
+                logger.warning("Try %d: hair volume drifted from the user's real photo (diff=%s) - candidate penalised", k + 1, v.get("hair_vol_diff"))
             if best is None or (v["visor"] == "ok", v["hair"] == "ok", v["score"]) > (
                 best["v"]["visor"] == "ok",
                 best["v"]["hair"] == "ok",
@@ -1773,7 +1832,13 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
             progress.set_postfix(id_sim=v["id_sim"], visor=v["visor"], score=v["score"])
             progress.update(1)
 
-            if settings.VALIDATE and (v["id_sim"] or 0) >= settings.STOP_ID and v["visor"] == "ok" and v["hair"] == "ok":
+            if (
+                settings.VALIDATE
+                and (v["id_sim"] or 0) >= settings.STOP_ID
+                and v["visor"] == "ok"
+                and v["hair"] == "ok"
+                and not v.get("hair_vol_mismatch")
+            ):
                 stopped = "good"
                 break
 
@@ -1790,6 +1855,12 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                     progress.total = max_k
                     progress.refresh()
                     logger.info("Hair/bald mismatch in every candidate (hair=%s) - adding extra try (if budget permits)", best["v"]["hair"])
+                elif best["v"].get("hair_vol_mismatch") and hair_vol_extras < settings.HAIR_VOLUME_EXTRA_TRIES:
+                    hair_vol_extras += 1
+                    max_k += 1
+                    progress.total = max_k
+                    progress.refresh()
+                    logger.info("Hair volume mismatch in every candidate (diff=%s) - adding extra try (if budget permits)", best["v"].get("hair_vol_diff"))
                 else:
                     break
 
@@ -1815,6 +1886,8 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
             bald=info.get("bald", False),
             hair=v["hair"],
             bald_score=v["bald_score"],
+            hair_vol_mismatch=v.get("hair_vol_mismatch"),
+            hair_vol_diff=v.get("hair_vol_diff"),
             seconds=round(time.time() - t0, 1),
             gen_s=round(gen_s, 1),
             val_s=round(val_s, 1),

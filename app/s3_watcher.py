@@ -3,10 +3,14 @@ Polls s3://<S3_BUCKET>/<S3_USERS_PREFIX> for new user photos. Each new photo
 is run through the same analysis + generation pipeline as the HTTP endpoints,
 and the resulting avatar is uploaded to s3://<S3_BUCKET>/<S3_GENERATED_PREFIX>
 under the same base filename (as a .jpg - the pipeline's output is always JPEG).
+The source photo is then deleted from S3_USERS_PREFIX, so it behaves like a
+move rather than a copy.
 
 A photo counts as "already done" when a same-named file already exists in
 S3_GENERATED_PREFIX, so the watcher is safe to restart without redoing work
-or needing a separate database of what's processed.
+or needing a separate database of what's processed - this also covers the
+rare case where the avatar was generated and uploaded but the source delete
+failed, leaving the photo behind in Users/.
 
 Enable with S3_ENABLED=true in .env. AWS credentials come from the normal
 boto3 chain (env vars, ~/.aws/credentials, or an EC2 instance role).
@@ -90,6 +94,14 @@ async def _process_one(s3, key: str) -> None:
             settings.S3_BUCKET, key, settings.S3_BUCKET, out_key,
             metadata.get("tries"), metadata.get("id_sim"),
         )
+
+        try:
+            await asyncio.to_thread(s3.delete_object, Bucket=settings.S3_BUCKET, Key=key)
+            logger.info("S3 watcher: removed processed photo s3://%s/%s", settings.S3_BUCKET, key)
+        except (BotoCoreError, ClientError):
+            # The avatar is already generated and uploaded - the next poll's "already in Generated_Avatar/"
+            # check keeps this from being reprocessed even if the source photo lingers in Users/.
+            logger.exception("S3 watcher: generated OK but could not delete source s3://%s/%s", settings.S3_BUCKET, key)
     except pipeline.Rejected as r:
         logger.warning("S3 watcher: rejected s3://%s/%s: %s", settings.S3_BUCKET, key, r)
         _failed_stems.add(stem)
