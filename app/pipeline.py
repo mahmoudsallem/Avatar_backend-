@@ -1113,11 +1113,14 @@ IDENTITY_FOCUS = (
     "painting style, lighting, jacket, emblem and background. copy from Picture 2, landmark by landmark: head and face "
     "width-to-height ratio, forehead, cheekbones, cheek fullness, jaw width and jawline angle, chin, ear shape and "
     "size, nose length, bridge and nostrils, lip shape and thickness, the same mouth and smile (closed stays closed, "
-    "visible teeth stay visible), eyebrow shape and thickness, eye shape, eye size, eye spacing and the real eye "
-    "color. keep every landmark at the same relative position and distance as Picture 2. keep the real skin texture "
-    "and age: forehead lines, smile lines, crow's feet, under-eye bags, pores, beard stubble and the true grey or "
-    "white strands in the beard; do not airbrush them away. never slim, sharpen, lengthen, rejuvenate or beautify the "
-    "face, never change the skin tone. "
+    "visible teeth stay visible), eyebrow shape and thickness, the exact eye shape, eye size and eye spacing of "
+    "Picture 2, and the exact eye color of Picture 2 (dark brown stays dark brown; never lighten, bluish-tint or "
+    "recolor the iris, even where the visor lens sits over it). keep every landmark at the same relative position "
+    "and distance as Picture 2. keep the real skin texture and age: forehead lines, smile lines, crow's feet, "
+    "under-eye bags, pores, beard stubble and the true grey or white strands in the beard; do not airbrush them "
+    "away. never slim, sharpen, lengthen, rejuvenate or beautify the face; the jawline angle and width must match "
+    "Picture 2 exactly, never redrawn narrower, wider or more angular/chiseled for the illustration style; never "
+    "change the skin tone. "
 )
 
 IDENTITY_FOCUS_CLOSING = (
@@ -1135,6 +1138,18 @@ def _id_focus_style(text: str) -> str:
                  "cel-shaded skin with soft gradients and crisp highlight and shadow shapes that keep the visible "
                  "skin texture and the real skin tone of Picture 2,")
         .replace("warm natural skin tones with gentle highlights,", "the natural skin tone of Picture 2 with gentle highlights,")
+    )
+
+def _strip_facial_hair(text: str) -> str:
+    """Drop the beard/facial-hair wording from the shared style and identity text for women: it's written with a
+    male subject in mind, and (especially combined with id_focus's "keep real skin texture, do not airbrush"
+    instruction) was making FLUX paint visible stubble onto female avatars."""
+    return (
+        text.replace("jaw, hairline, facial hair and the real eye color", "jaw, hairline and the real eye color")
+        .replace("any grey in the beard or hair of Picture 2", "any grey in the hair of Picture 2")
+        .replace("pores, beard stubble and the true grey or white strands in the beard",
+                 "pores and the true grey or white strands in the hair")
+        .replace("eyebrows, beard shape and skin texture", "eyebrows and skin texture")
     )
 
 BUILD = (
@@ -1336,6 +1351,11 @@ def build_prompt(info, attempt=0, ref=False, style_mode=None, keep_user_expressi
         head, IDENTITY_TXT = f"{bfs}{IDENTITY_FOCUS}{VISOR_MANDATORY}", ""
         style_text = _id_focus_style(style_text)
         closing = IDENTITY_FOCUS_CLOSING + closing
+    if info.get("gender") == "Woman":
+        head, IDENTITY_TXT, style_text, closing = (
+            _strip_facial_hair(head), _strip_facial_hair(IDENTITY_TXT),
+            _strip_facial_hair(style_text), _strip_facial_hair(closing),
+        )
     if info.get("hijab", False):
         return (
             f"{head}{IDENTITY_TXT}{BUILD}{V}{HIJAB_VISOR_NOTE}"
