@@ -1522,14 +1522,12 @@ def build_prompt(info, attempt=0, ref=False, style_mode=None, keep_user_expressi
     # Only the MALE prompt has a bald branch; women / hijab prompts are untouched.
     is_bald = bool(info.get("bald", False)) and not info.get("hijab", False) and info.get("gender") != "Woman"
 
+    # Restored to the 16-Oct 11:09 wording (best women/hijab run). The "Mona-Lisa-style gaze" text added in commit
+    # 0fa6920 made FLUX close every smile (Mona Lisa = closed lips) and brought back the template's dark neck drape.
     expr = (
-        "copy the head rotation from Picture 1, but the eyes look straight into the camera at the viewer: a "
-        "steady, direct Mona-Lisa-style gaze that meets the viewer's eyes regardless of the head angle, using the "
-        "exact eye shape and real eye color of Picture 2. keep the facial expression and smile of Picture 2"
+        "copy the head rotation and eye direction from Picture 1, but keep the facial expression and smile of Picture 2"
         if keep_user_expression
-        else "copy the head rotation and micro expressions from Picture 1, but the eyes look straight into the "
-        "camera at the viewer: a steady, direct Mona-Lisa-style gaze that meets the viewer's eyes regardless of "
-        "the head angle, using the exact eye shape and real eye color of Picture 2"
+        else "copy the direction of the eye, head rotation, micro expressions from Picture 1"
     )
     hair_desc = "bare bald scalp (no hair)" if is_bald else "hair"
     bfs = (
