@@ -1380,8 +1380,10 @@ WOMEN_SKIN_OLD = (
     "true grey or white strands in the hair; do not airbrush them away. "
 )
 WOMEN_SKIN_NEW = (
-    "keep her real age exactly as in Picture 2 (not younger, not older), her full natural cheeks and face shape, her "
-    "natural skin tone and the expression lines of her smile, painted with soft, even, natural shading. "
+    "keep her real age exactly as in Picture 2 (not younger, not older), her full natural cheeks and face shape and "
+    "her real skin tone. paint her skin exactly like the male avatars of this series: crisp semi-realistic digital "
+    "painting with clearly defined light and shadow shapes, warm healthy skin colour, visible natural skin texture, "
+    "sharp detail and strong contrast, lit by the red rim light and cool blue fill light. "
 )
 
 WOMEN_VISOR_FIT = (
@@ -1399,13 +1401,10 @@ WOMEN_VISOR_REF = (
 def _women_tune(p: str, info, ref: bool) -> str:
     hijab = bool(info.get("hijab", False))
     p = p.replace(WOMEN_SKIN_OLD, WOMEN_SKIN_NEW)
+    # skin style: leave the shared style text exactly as the men get it (no softening) - only the wrinkle list goes
     p = (
-        p.replace("painted with softly shaded skin that keeps the visible skin texture",
-                  "painted with soft, natural, evenly shaded skin")
-        .replace("painted with smooth airbrushed skin and soft realistic shading",
-                 "painted with soft, natural, evenly shaded skin")
-        .replace("keep the natural age, forehead lines, smile lines, under-eye detail and any grey in the hair of "
-                 "Picture 2;", "keep the natural age and smile of Picture 2;")
+        p.replace("keep the natural age, forehead lines, smile lines, under-eye detail and any grey in the hair of "
+                  "Picture 2;", "keep the natural age and smile of Picture 2;")
         .replace("the visor is exactly the large angular futuristic shield worn in Picture 1",
                  "the visor is exactly the angular futuristic shield worn in Picture 1")
         .replace("broad faceted outer corners", "compact faceted outer corners")

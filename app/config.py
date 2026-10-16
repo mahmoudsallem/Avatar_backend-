@@ -154,7 +154,8 @@ class Settings(BaseSettings):
     HIJAB_TEMPLATE_RECOLOR: bool = True
     # Skin-only clean-up (light smoothing, shine removal, tone nudged toward the user's real skin) for these avatars.
     # No hijab recolour / drape painting - that is HIJAB_POSTFIX, kept off.
-    SKIN_POSTFIX_AVATARS: List[str] = ["Woman", "Woman_Hijab"]
+    # Off: the smoothing / shine compression made women's skin flat and hazy next to the crisp male avatars.
+    SKIN_POSTFIX_AVATARS: List[str] = []
     SKIN_POSTFIX_SMOOTH: float = 0.35
     SKIN_POSTFIX_MATCH: float = 0.6
     HIJAB_POSTFIX: bool = True  # pixel post-process for hijab avatars (skin smooth/tone match, neck-cowl recolour)
