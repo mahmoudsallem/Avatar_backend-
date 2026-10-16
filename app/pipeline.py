@@ -1648,13 +1648,59 @@ def embed(img: Image.Image, enforce: bool = True, name: str = "out") -> Optional
                 raise
         if "error" in r or not r.get("faces"):
             return None
-        return {"faces": r["faces"], "width": im.width}
+        return {"faces": r["faces"], "width": im.width, "height": im.height}
     finally:
         if temp_path.exists():
             try:
                 temp_path.unlink()
             except Exception:
                 pass
+
+def _face_box(emb_res, target_w: int, target_h: int):
+    """Largest face box from an embed() result, scaled to a target_w x target_h image."""
+    try:
+        faces = [f for f in emb_res["faces"] if "x" in f and f.get("w", 0) > 0]
+        if not faces:
+            return None
+        f = max(faces, key=lambda t: t["w"] * t["h"])
+        sx = target_w / float(emb_res["width"])
+        sy = target_h / float(emb_res.get("height") or emb_res["width"])
+        return (int(f["x"] * sx), int(f["y"] * sy), int(f["w"] * sx), int(f["h"] * sy))
+    except Exception:
+        return None
+
+
+def _apply_hijab_postfix(out: Image.Image, face: Image.Image, user_emb, rec: dict, key_for_debug=None) -> Image.Image:
+    """Skin smoothing / tone match + neck-drape recolour for hijab avatars. Fail-soft: returns `out` on any problem."""
+    try:
+        from app.postprocess_hijab import fix_hijab_avatar
+        o = embed(out, True, "fix") or embed(out, False, "fix")
+        if not o:
+            rec["postfix"] = {"applied": False, "reason": "no_face_in_output"}
+            return out
+        ob = _face_box(o, out.width, out.height)
+        ub = _face_box(user_emb, face.width, face.height) if user_emb else None
+        if ob is None:
+            rec["postfix"] = {"applied": False, "reason": "no_box"}
+            return out
+        fixed, report = fix_hijab_avatar(
+            out, ob, face if ub else None, ub,
+            skin_smooth=settings.HIJAB_SKIN_SMOOTH,
+            skin_match=settings.HIJAB_SKIN_MATCH,
+            hijab_match=settings.HIJAB_COLOR_MATCH,
+            drape=settings.HIJAB_DRAPE_FIX,
+        )
+        rec["postfix"] = {"applied": True, **{k: v for k, v in report.items() if isinstance(v, (int, float, str, bool, type(None)))}}
+        if settings.DEBUG_DUMP and key_for_debug:
+            try:
+                out.save(Path(key_for_debug) / "before_postfix.png")
+            except Exception:
+                pass
+        return fixed
+    except Exception as e:
+        logger.warning("hijab postfix failed (kept original): %s", e)
+        rec["postfix"] = {"applied": False, "reason": str(e)[:120]}
+        return out
 
 def embed_user(face: Image.Image) -> Optional[dict]:
     return embed(face, True, "user") or embed(face, False, "user")
@@ -1907,6 +1953,8 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                 break
 
         out, v = best["out"], best["v"]
+        if info.get("hijab") and settings.HIJAB_POSTFIX:
+            out = _apply_hijab_postfix(out, face, user_emb, rec, key_for_debug=locals().get("dbg"))
         jpeg_bytes = encode_jpeg_capped(out, settings.OUTPUT_MAX_BYTES)
         rec.update(
             status="done",

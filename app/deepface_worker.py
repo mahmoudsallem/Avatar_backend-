@@ -155,6 +155,8 @@ def run_embed(argv):
                         "emb": [float(x) for x in r["embedding"]],
                         "w": int(r["facial_area"].get("w", 0)),
                         "h": int(r["facial_area"].get("h", 0)),
+                        "x": int(r["facial_area"].get("x", 0)),
+                        "y": int(r["facial_area"].get("y", 0)),
                     }
                     for r in reps
                 ]
