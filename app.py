@@ -119,7 +119,9 @@ async def health_check():
         "lora_mode": pipeline._LORA["mode"],
         "gpu_slots": len(pipeline.slots),
         "gpu_slots_requested": settings.GPU_SLOTS,
-        "settings": {"steps": settings.STEPS, "best_of_n": settings.BEST_OF_N, "time_budget": settings.TIME_BUDGET},
+        "settings": {"steps": settings.STEPS, "cfg": settings.CFG, "style_mode": settings.STYLE_MODE,
+                     "best_of_n": settings.BEST_OF_N, "time_budget": settings.TIME_BUDGET,
+                     "allow_test_overrides": settings.ALLOW_TEST_OVERRIDES},
         "speed_options": {
             "cache_prompt_embeds": settings.CACHE_PROMPT_EMBEDS,
             "cache_ref_latents": settings.CACHE_REF_LATENTS,
@@ -143,7 +145,17 @@ async def health_check():
         },
     }
 
-async def _generate_avatar_from_bytes(content: bytes, filename: str):
+def _test_overrides(steps, tries, time_budget, cfg, style) -> Optional[dict]:
+    """Per-request A/B overrides; only honoured when ALLOW_TEST_OVERRIDES=true (otherwise ignored)."""
+    if not settings.ALLOW_TEST_OVERRIDES:
+        return None
+    ov = {k: v for k, v in (
+        ("steps", steps), ("tries", tries), ("time_budget", time_budget), ("cfg", cfg),
+        ("style", style if style in ("semi_real", "comic", "off") else None),
+    ) if v is not None}
+    return ov or None
+
+async def _generate_avatar_from_bytes(content: bytes, filename: str, overrides: Optional[dict] = None):
     ext = Path(filename).suffix.lower()
     if ext not in pipeline.IMAGE_EXTENSIONS:
         return JSONResponse(
@@ -158,7 +170,7 @@ async def _generate_avatar_from_bytes(content: bytes, filename: str):
         temp_path.write_bytes(content)
 
         try:
-            jpeg_bytes, metadata = await pipeline.process_image_file(temp_path)
+            jpeg_bytes, metadata = await pipeline.process_image_file(temp_path, overrides)
         except pipeline.Rejected as r:
             logger.info("Image validation rejected for %s: %s", filename, r)
             return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"error": str(r)})
@@ -172,6 +184,8 @@ async def _generate_avatar_from_bytes(content: bytes, filename: str):
             "X-Visor-Status": str(metadata.get("visor", "")),
             "X-Bald-Status": str(metadata.get("bald", "")),
             "X-Steps-Used": str(metadata.get("steps", "")),
+            "X-Cfg-Used": str(metadata.get("cfg", "")),
+            "X-Style-Used": str(metadata.get("style", "")),
         }
         return Response(content=jpeg_bytes, media_type="image/jpeg", headers=headers)
 
@@ -205,11 +219,13 @@ AVATAR_RESPONSES = {
 )
 async def create_avatar(
     file: UploadFile = File(..., description="User portrait photo"),
+    steps: Optional[int] = None, tries: Optional[int] = None, time_budget: Optional[float] = None,
+    cfg: Optional[float] = None, style: Optional[str] = None,
 ):
     filename = file.filename or "upload.jpg"
     # No server-side upload size limit - read whatever was sent.
     content = await file.read()
-    return await _generate_avatar_from_bytes(content, filename)
+    return await _generate_avatar_from_bytes(content, filename, _test_overrides(steps, tries, time_budget, cfg, style))
 
 class AvatarBase64Request(BaseModel):
     image: str  # base64-encoded image bytes (raw or "data:image/...;base64,..." data URL)
@@ -221,7 +237,11 @@ class AvatarBase64Request(BaseModel):
     summary="Generate Sci-Fi Avatar (base64 input)",
     description="Same as /v1/avatar, but the photo is sent as a base64 string in a JSON body instead of multipart/form-data.",
 )
-async def create_avatar_base64(body: AvatarBase64Request):
+async def create_avatar_base64(
+    body: AvatarBase64Request,
+    steps: Optional[int] = None, tries: Optional[int] = None, time_budget: Optional[float] = None,
+    cfg: Optional[float] = None, style: Optional[str] = None,
+):
     filename = body.filename or "upload.jpg"
     raw_b64 = body.image.split(",", 1)[-1] if body.image.startswith("data:") else body.image
     try:
@@ -231,7 +251,7 @@ async def create_avatar_base64(body: AvatarBase64Request):
             status_code=status.HTTP_400_BAD_REQUEST,
             content={"error": "Invalid base64 image data."},
         )
-    return await _generate_avatar_from_bytes(content, filename)
+    return await _generate_avatar_from_bytes(content, filename, _test_overrides(steps, tries, time_budget, cfg, style))
 
 @app.get("/", summary="Root status", include_in_schema=False)
 async def root():

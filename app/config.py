@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     )
 
     # ---------------- Server & Security ----------------
+    # TEST ONLY: lets /v1/avatar accept ?steps=&tries=&time_budget=&cfg=&style= per request so settings can be A/B tested
+    # on the same photos (send_10_images.py --matrix). Keep false in production.
+    ALLOW_TEST_OVERRIDES: bool = False
     HOST: str = "0.0.0.0"
     PORT: int = 8000
     CORS_ORIGINS: List[str] = ["*"]

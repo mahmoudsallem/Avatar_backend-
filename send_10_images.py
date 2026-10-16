@@ -7,7 +7,10 @@ STEP-COUNT TEST (server needs ALLOW_TEST_OVERRIDES=true in .env; steps x tries):
     python send_10_images.py --url http://<ec2-ip>:8000 --matrix 8x1,8x2,6x2,4x2,4x1
 sends the whole batch once per setting (same photos, same seeds, TIME_BUDGET off), then prints one comparison table
 (wall-clock, avatars/min, id_sim, visor, tries) and writes matrix_report.html with every setting side by side.
-Single setting:  --steps 4 --tries 2 [--time-budget 0]
+Single setting:  --steps 4 --tries 2 [--time-budget 0] [--cfg 1.0] [--style semi_real|comic]
+QUALITY A/B (same photos, same seeds; token = STEPSxTRIES[@CFG[@STYLE]]), e.g. current profile vs. equal-cost vs. notebook-grade:
+    python send_10_images.py --url http://<ec2-ip>:8000 --matrix 4x2@3.0,8x2@1.0,12x2@1.0,20x3@3.0
+    python send_10_images.py --url http://<ec2-ip>:8000 --matrix 8x2@1.0@semi_real,8x2@1.0@comic
 
 For every request it logs: input photo (name, size), output avatar (path, size), start / end clock
 time, duration, server generation time, tries and identity score. Everything is written to
@@ -146,8 +149,9 @@ def write_report(out_dir, rows, wall, meta):
     (out_dir / "report.html").write_text(page, encoding="utf-8")
 
 
-def make_query(steps, tries, time_budget):
-    parts = [f"{k}={v}" for k, v in (("steps", steps), ("tries", tries), ("time_budget", time_budget)) if v is not None]
+def make_query(steps, tries, time_budget, cfg=None, style=None):
+    parts = [f"{k}={v}" for k, v in (("steps", steps), ("tries", tries), ("time_budget", time_budget),
+                                      ("cfg", cfg), ("style", style)) if v is not None]
     return "?" + "&".join(parts) if parts else ""
 
 
@@ -182,18 +186,21 @@ def run_matrix(a, base, batch, out_dir, meta, health):
     if not (health.get("settings") or {}).get("allow_test_overrides"):
         log("The server has ALLOW_TEST_OVERRIDES=false (or is an old version): add ALLOW_TEST_OVERRIDES=true to its .env and restart.")
         sys.exit(2)
-    combos = []
+    combos = []   # (label, steps, tries, cfg|None, style|None);  token = STEPSxTRIES[@CFG[@STYLE]]
     for tok in a.matrix.split(","):
-        s, _, t = tok.strip().lower().partition("x")
-        combos.append((tok.strip(), int(s), int(t or 1)))
+        head, *extra = tok.strip().lower().split("@")
+        st, _, t = head.partition("x")
+        cfg = float(extra[0]) if len(extra) > 0 and extra[0] else a.cfg
+        style = extra[1] if len(extra) > 1 and extra[1] else a.style
+        combos.append((tok.strip(), int(st), int(t or 1), cfg, style))
     tb = a.time_budget if a.time_budget is not None else 0.0
     results = {}
     log(f"MATRIX {', '.join(c[0] for c in combos)} | {len(batch)} photos per setting | time_budget={tb}")
-    for label, steps, tries in combos:
+    for label, steps, tries, cfg, style in combos:
         sub_dir = out_dir / label
         log()
-        log(f"=== setting {label}  (steps={steps}, tries={tries}) ===")
-        rows, wall = run_batch(base, batch, sub_dir, a.timeout, a.interval, make_query(steps, tries, tb))
+        log(f"=== setting {label}  (steps={steps}, tries={tries}, cfg={cfg if cfg is not None else 'server default'}, style={style or 'server default'}) ===")
+        rows, wall = run_batch(base, batch, sub_dir, a.timeout, a.interval, make_query(steps, tries, tb, cfg, style))
         ok = [r for r in rows if r["ok"]]
         log(f"[{label}] done {len(ok)}/{len(rows)} in {wall}s -> {len(ok) / wall * 60:.1f} avatars/min")
         results[label] = (rows, wall)
@@ -202,7 +209,7 @@ def run_matrix(a, base, batch, out_dir, meta, health):
     ref = labels[0]
     ref_rows = {r["n"]: r for r in results[ref][0]}
     log()
-    hdr = f"{'setting':<8}{'wall s':>8}{'avatars/min':>12}{'s/avatar':>9}{'speed-up':>9}{'id_sim':>8}{'d id_sim':>9}{'worse>0.05':>11}{'visor ok':>9}{'tries':>6}{'fail':>5}"
+    hdr = f"{'setting':<18}{'wall s':>8}{'avatars/min':>12}{'s/avatar':>9}{'speed-up':>9}{'id_sim':>8}{'d id_sim':>9}{'worse>0.05':>11}{'visor ok':>9}{'tries':>6}{'fail':>5}"
     log(hdr)
     log("-" * len(hdr))
     for lab in labels:
@@ -219,7 +226,7 @@ def run_matrix(a, base, batch, out_dir, meta, health):
         vis = sum(1 for r in ok if r["visor"] == "ok")
         tr = [_num(r["tries"]) for r in ok if _num(r["tries"]) is not None]
         ref_wall = results[ref][1]
-        log(f"{lab:<8}{wall:>8}{len(ok) / wall * 60:>12.1f}{wall / max(1, len(ok)):>9.1f}{ref_wall / wall:>8.2f}x"
+        log(f"{lab:<18}{wall:>8}{len(ok) / wall * 60:>12.1f}{wall / max(1, len(ok)):>9.1f}{ref_wall / wall:>8.2f}x"
             f"{(sum(sims) / len(sims) if sims else 0):>8.3f}{(sum(d) / len(d) if d and lab != ref else 0):>+9.3f}"
             f"{(worse if lab != ref else 0):>11}{vis:>6}/{len(ok):<2}{(sum(tr) / len(tr) if tr else 0):>6.1f}{len(rows) - len(ok):>5}")
     log()
@@ -258,6 +265,8 @@ def main():
     ap.add_argument("--steps", type=int, default=None, help="TEST: denoising steps for every request (needs ALLOW_TEST_OVERRIDES=true on the server)")
     ap.add_argument("--tries", type=int, default=None, help="TEST: candidates per avatar (best-of-N)")
     ap.add_argument("--time-budget", type=float, default=None, help="TEST: TIME_BUDGET seconds (0 = off)")
+    ap.add_argument("--cfg", type=float, default=None, help="TEST: guidance scale for every request (e.g. 1.0 = single forward pass per step)")
+    ap.add_argument("--style", default=None, choices=["semi_real", "comic", "off"], help="TEST: style prompt for every request")
     ap.add_argument("--matrix", default=None, help="TEST: compare settings, e.g. 8x1,8x2,6x2,4x2,4x1 (steps x tries); first = reference")
     a = ap.parse_args()
 
@@ -292,11 +301,11 @@ def main():
         return
 
     query = ""
-    if a.steps is not None or a.tries is not None or a.time_budget is not None:
+    if any(v is not None for v in (a.steps, a.tries, a.time_budget, a.cfg, a.style)):
         if not (h.get("settings") or {}).get("allow_test_overrides"):
             log("The server has ALLOW_TEST_OVERRIDES=false (or is an old version): add ALLOW_TEST_OVERRIDES=true to its .env and restart.")
             sys.exit(2)
-        query = make_query(a.steps, a.tries, a.time_budget)
+        query = make_query(a.steps, a.tries, a.time_budget, a.cfg, a.style)
         meta += f" | overrides {query}"
     meta += f" | {len(batch)} requests at once"
     log(f"Sending {len(batch)} photos at the same time to {base}/v1/avatar/base64{query} ...")

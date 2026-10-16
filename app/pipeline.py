@@ -130,7 +130,7 @@ def lora_kwargs():
 analysis_sem = asyncio.Semaphore(settings.ANALYSIS_CONCURRENCY)
 _CLIP_LOCK = threading.Lock()
 
-async def process_image_file(image_path: Path) -> Tuple[bytes, dict]:
+async def process_image_file(image_path: Path, overrides: Optional[dict] = None) -> Tuple[bytes, dict]:
     """Run Step 1 (analysis) + Step 2 (generation) for a local image file.
 
     Shared by the HTTP endpoints and the S3 folder watcher so both go through
@@ -145,7 +145,7 @@ async def process_image_file(image_path: Path) -> Tuple[bytes, dict]:
     slot = await acquire_slot()
     t0 = time.time() - t_analysis
     try:
-        return await asyncio.to_thread(generate_avatar, image_path, info, t0, slot)
+        return await asyncio.to_thread(generate_avatar, image_path, info, t0, slot, overrides)
     finally:
         release_slot(slot)
 
@@ -1758,6 +1758,8 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
     ov = overrides or {}                       # per-request test overrides (see ALLOW_TEST_OVERRIDES in app.py)
     steps = int(ov.get("steps", settings.STEPS))
     time_budget = float(ov.get("time_budget", settings.TIME_BUDGET))
+    cfg = float(ov.get("cfg", settings.CFG))
+    style_mode = ov.get("style") or None            # None -> settings.STYLE_MODE inside build_prompt
 
     test_lora = settings.LORA_STRENGTH * settings.ID_LORA_MULT
     progress = None
@@ -1796,7 +1798,7 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         while True:
             mult = settings.ID_LORA_SCHEDULE[k % len(settings.ID_LORA_SCHEDULE)]
             slot.set_lora(test_lora * mult)
-            prompt = build_prompt(info, attempt=k, ref=visor_ref is not None, hair_retry=(prev_hair == "bald"))
+            prompt = build_prompt(info, attempt=k, ref=visor_ref is not None, style_mode=style_mode, hair_retry=(prev_hair == "bald"))
 
             tg = time.time()
             with torch.no_grad(), torch.cuda.stream(slot.stream):
@@ -1807,7 +1809,7 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                     width=w,
                     height=h,
                     num_inference_steps=steps,
-                    guidance_scale=settings.CFG,
+                    guidance_scale=cfg,
                     generator=torch.Generator("cuda").manual_seed(seed + k),
                 ).images[0]
             slot.stream.synchronize()
@@ -1919,6 +1921,8 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
             val_s=round(val_s, 1),
             tries=k,
             steps=steps,
+            cfg=cfg,
+            style=style_mode or settings.STYLE_MODE,
             best_try=best["k"],
             stopped=stopped,
             lora_mult=best["mult"],
