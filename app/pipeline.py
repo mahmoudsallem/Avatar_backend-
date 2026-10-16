@@ -1444,8 +1444,8 @@ V3_BEARD = (
 )
 
 V3_WOMAN_HAIR = (
-    "her hair is styled like Picture 1: long dark hair with red and orange highlights in a high voluminous updo, "
-    "framing her face. "
+    "her hair is styled like Picture 1, a high voluminous updo with soft strands framing her face, in the real "
+    "hair colour of Picture 2 with a thin red rim light. "
 )
 
 V3_FEMALE = (
@@ -1454,11 +1454,12 @@ V3_FEMALE = (
 )
 
 V3_HIJAB = (
-    "she wears her own hijab from Picture 2, copied in its real colours (the hijab takes the colour of Picture 2's "
-    "hijab, not the black of the template), the same sheen and soft folds, wrapped snugly around the face with the "
+    "she wears her own {colour}hijab from Picture 2, copied in its real colours ({colour_rule}), the same sheen and "
+    "soft folds, wrapped snugly around the face with the "
     "edge in the same place on the forehead, cheeks and under the chin, covering all hair, ears and neck. the "
-    "scarf then falls over the shoulders and chest in soft shaded folds of the same fabric and colour, lit by the "
-    "red and blue lights of the jacket, and tucks into the jacket collar of Picture 1. only her head and hijab "
+    "scarf then falls over the shoulders and chest in soft shaded folds of the same fabric and colour as the "
+    "head covering, lit by the red and blue lights of the jacket, and tucks into the jacket collar of Picture 1 "
+    "with no flat patches. only her head and hijab "
     "come from Picture 2; her clothes and background do not. the visor sits inside the hijab opening, no wider "
     "than the face, with its arms resting at the temples, and the hijab edge above the eyebrows stays visible. "
 )
@@ -1467,6 +1468,21 @@ V3_CLOSING = (
     "final check: the same real person as Picture 2, one visor on the face, jacket, emblem and black background "
     "of Picture 1 unchanged."
 )
+
+V3_SKIN_TEXT = (
+    "real age and skin texture (smile lines, pores, under-eye detail)",
+    "natural skin tone and gentle smile lines, with clean, smooth, evenly painted skin and no pores, grain or blemish texture",
+)
+
+def _v3_women_skin(text: str) -> str:
+    """women/hijab: asking FLUX for real skin texture painted coarse, aged, orange skin on them; ask for clean skin.
+    Also keeps the visor no wider than her face (it stuck out past the cheek / hijab edge)."""
+    return (
+        text.replace(V3_SKIN_TEXT[0], V3_SKIN_TEXT[1])
+        .replace("softly shaded skin that keeps the real skin texture", "softly airbrushed, clean, smooth skin in the natural skin tone of Picture 2")
+        .replace("her natural look from Picture 2:", "her natural look from Picture 2, looking her real age, not older and not glamorised:")
+        .replace("it spans temple to temple, sits level", "it spans temple to temple and is never wider than her face, sits level")
+    )
 
 def _build_prompt_v3(info, attempt=0, ref=False, keep_user_expression=True, hair_retry=False):
     is_woman = info.get("gender") == "Woman"
@@ -1479,14 +1495,19 @@ def _build_prompt_v3(info, attempt=0, ref=False, keep_user_expression=True, hair
     if attempt > 0:
         visor += VISOR_RETRY
     if is_hijab:
-        p = V3_HEAD + ident + V3_FEMALE + V3_BUILD + V3_HIJAB + visor + V3_STYLE + V3_CLOSING
+        col = info.get("hijab_colour")
+        hij = V3_HIJAB.format(
+            colour=(col + " " if col else ""),
+            colour_rule=(f"the hijab is {col}, not black" if col else "the hijab takes the colour of Picture 2's hijab, not the black of the template"),
+        )
+        p = V3_HEAD + ident + V3_FEMALE + V3_BUILD + hij + visor + V3_STYLE + V3_CLOSING
     elif is_woman:
         p = V3_HEAD + ident + V3_FEMALE + V3_BUILD + V3_WOMAN_HAIR + visor + V3_STYLE + V3_CLOSING
     else:
         hair = (V3_BALD + (BALD_RETRY if attempt > 0 else "")) if is_bald else (V3_HAIR + (HAIR_RETRY if hair_retry else ""))
         p = V3_HEAD + ident + V3_BUILD + hair + V3_BEARD + visor + V3_STYLE + V3_CLOSING
     if is_woman or is_hijab:
-        p = _strip_facial_hair(p)
+        p = _strip_facial_hair(_v3_women_skin(p))
     return p
 
 
@@ -2039,6 +2060,17 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         while True:
             mult = settings.ID_LORA_SCHEDULE[k % len(settings.ID_LORA_SCHEDULE)]
             slot.set_lora(test_lora * mult)
+            if info.get("hijab") and settings.PROMPT_VARIANT == "v3" and "hijab_colour" not in info:
+                info["hijab_colour"] = None  # computed once; stays None if the sample is unreliable
+                try:
+                    from app.postprocess_hijab import user_hijab_colour
+                    ue = fut.result() if fut is not None else embed_user(face)
+                    ub0 = _face_box(ue, face.width, face.height) if ue else None
+                    if ub0:
+                        info["hijab_colour"] = user_hijab_colour(face, ub0)
+                    logger.info("hijab colour for prompt: %s", info["hijab_colour"])
+                except Exception as e:
+                    logger.warning("hijab colour sampling failed: %s", e)
             prompt = build_prompt(info, attempt=k, ref=visor_ref is not None, style_mode=style_mode, hair_retry=(prev_hair == "bald"))
 
             tg = time.time()
