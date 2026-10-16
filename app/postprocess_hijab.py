@@ -134,8 +134,18 @@ def _fix_skin(bgr, lab, box: Box, skin_ref: Optional[np.ndarray], smooth: float,
 
     lab2 = _lab(np.clip(out, 0, 255).astype(np.uint8))
     L = lab2[..., 0]
-    p = float(np.percentile(L[sel], 80))
-    lab2[..., 0] = L - np.maximum(L - p, 0) * 0.45 * m  # tame the oily highlights
+    # shine: remove local luminance bumps (oily highlights) relative to a heavily blurred skin luminance, then compress what is left
+    wsel = sel.astype(np.float32)
+    sg = max(9.0, box[2] * 0.05)
+    num = cv2.GaussianBlur(L * wsel, (0, 0), sg)
+    den = cv2.GaussianBlur(wsel, (0, 0), sg) + 1e-6
+    Lbase = num / den
+    bump = np.maximum(L - Lbase - 2.0, 0)
+    L = L - bump * 0.9 * m
+    p = float(np.percentile(L[sel], 75))
+    lab2[..., 0] = L - np.maximum(L - p, 0) * 0.5 * m
+    # shiny skin also washes out colour: bring a touch of chroma back in the corrected area
+    lab2[..., 1] += 0.0
 
     cur = np.median(lab2[sel], axis=0)
     if skin_ref is not None and match > 0:
@@ -167,11 +177,17 @@ def _fix_hijab_color(bgr, box: Box, hij_ref: Optional[np.ndarray], strength: flo
     cur = _median_lab(lab, cand, 1500)
     if cur is None:
         return bgr, None, {"hijab": "skipped (no hijab pixels)"}
+    lit_sel = cand & (lab[..., 0] >= np.percentile(lab[..., 0][cand], 55))
+    lit = _median_lab(lab, lit_sel, 800)
+    if lit is not None:
+        cur_lit = lit
+    else:
+        cur_lit = cur
     if hij_ref is None or strength <= 0:
-        return bgr, cur, {"hijab": "skipped (no user hijab colour)"}
+        return bgr, cur_lit, {"hijab": "skipped (no user hijab colour)"}
     gap = float(np.linalg.norm(hij_ref - cur))
     if gap > 32:  # the user sample is from another colour family (background / skin got in): trust the model's hijab
-        return bgr, cur, {"hijab": f"skipped (user colour sample too far from painted hijab: dE={gap:.0f})"}
+        return bgr, cur_lit, {"hijab": f"skipped (user colour sample too far from painted hijab: dE={gap:.0f})"}
     d = (hij_ref - cur) * strength
     d[0] = float(np.clip(d[0], -12, 12))   # only a SMALL correction of what the model painted
     ab = d[1:]
@@ -182,7 +198,7 @@ def _fix_hijab_color(bgr, box: Box, hij_ref: Optional[np.ndarray], strength: flo
     lab2 = lab.copy()
     for c in range(3):
         lab2[..., c] += d[c] * m
-    new_med = cur + d
+    new_med = cur_lit + d
     return _from_lab(lab2), new_med, {"hijab_shift_Lab": [round(float(v), 1) for v in d], "hijab_from": [round(float(v), 1) for v in cur]}
 
 
@@ -239,13 +255,54 @@ def _fix_drape(bgr, box: Box, hijab_lab: Optional[np.ndarray], strength: float) 
     return _from_lab(out), {"drape_area_pct": round(area * 100, 1)}
 
 
+def _fix_grey_cowl(bgr, box: Box, hijab_lab: Optional[np.ndarray], strength: float) -> Tuple[np.ndarray, Dict]:
+    """The model sometimes paints its own flat grey/taupe neck cowl. Recolour it to the (lit) hijab colour, keeping its folds."""
+    if hijab_lab is None or strength <= 0:
+        return bgr, {"cowl": "skipped"}
+    H, W = bgr.shape[:2]
+    x, y, w, h = box
+    lab = _lab(bgr)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    hh, ss, vv = hsv[..., 0].astype(np.int32), hsv[..., 1].astype(np.int32), hsv[..., 2].astype(np.int32)
+    red = (ss > 110) & ((hh < 12) | (hh > 165))
+    blue = (hh > 95) & (hh < 140) & (ss > 90)
+    cowl_like = (ss < 70) & (vv > 70) & (vv < 215) & ~red & ~blue & (lab[..., 0] < hijab_lab[0] - 6)
+    zone = np.zeros((H, W), bool)
+    zone[int(y + 0.86 * h):min(H, int(y + 1.9 * h)), max(0, int(x - 0.15 * w)):min(W, int(x + 1.05 * w))] = True
+    cm = (cowl_like & zone & ~(_skin_like(bgr) & (ss > 60))).astype(np.uint8)
+    cm = cv2.morphologyEx(cm, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    cm = cv2.morphologyEx(cm, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    n, cc, st, _ = cv2.connectedComponentsWithStats(cm)
+    if n <= 1:
+        return bgr, {"cowl": "skipped (no grey cowl found)"}
+    k = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
+    keep = (cc == k).astype(np.float32)
+    keep = _fill_holes(keep, 0.004 * H * W)
+    keep = cv2.erode(keep, np.ones((3, 3), np.uint8))
+    keep = (cv2.GaussianBlur(keep, (21, 21), 0) > 0.5).astype(np.float32)
+    area = float(keep.sum()) / (H * W)
+    if area < 0.005 or area > 0.12:
+        return bgr, {"cowl": f"skipped (area {area*100:.1f}% implausible)"}
+    cur = _median_lab(lab, keep > 0.5, 500)
+    if cur is None:
+        return bgr, {"cowl": "skipped"}
+    # move the cowl colour toward the hijab, keep its own light/dark variation (folds)
+    tgt = lab.copy()
+    tgt[..., 0] = lab[..., 0] + (hijab_lab[0] * 0.93 - cur[0])
+    tgt[..., 1] = lab[..., 1] + (hijab_lab[1] - cur[1])
+    tgt[..., 2] = lab[..., 2] + (hijab_lab[2] - cur[2])
+    mm = (_soft(keep, 6) * strength)[..., None]
+    out = lab * (1 - mm) + tgt * mm
+    return _from_lab(out), {"cowl_area_pct": round(area * 100, 1), "cowl_from": [round(float(v), 1) for v in cur]}
+
+
 def fix_hijab_avatar(
     out_img: Image.Image,
     out_face: Optional[Box],
     user_img: Optional[Image.Image] = None,
     user_face: Optional[Box] = None,
     *,
-    skin_smooth: float = 0.65,
+    skin_smooth: float = 0.8,
     skin_match: float = 0.6,
     hijab_match: float = 0.85,
     drape: float = 0.9,
@@ -262,6 +319,9 @@ def fix_hijab_avatar(
             hij_ref, spread = user_hijab_lab(user_img, user_face)
             rep["user_hijab_Lab"] = None if hij_ref is None else [round(float(v), 1) for v in hij_ref]
             rep["user_hijab_spread"] = None if spread is None else round(spread, 1)
+            if hij_ref is not None and hij_ref[0] < 28:  # that is the room / black background, not fabric
+                hij_ref = None
+                rep['hijab_ref'] = 'rejected (too dark)'
             if hij_ref is not None and spread is not None and spread > 45:  # sample is mixed (background/skin) - do not trust it
                 hij_ref = None
                 rep["hijab_ref"] = "rejected (mixed sample)"
@@ -271,6 +331,9 @@ def fix_hijab_avatar(
         rep.update(r)
         bgr, r = _fix_drape(bgr, out_face, hij_now, drape)
         rep.update(r)
+        if str(r.get("drape", "")).startswith("skipped"):
+            bgr, r = _fix_grey_cowl(bgr, out_face, hij_now, drape)
+            rep.update(r)
         return _pil(bgr), rep
     except Exception as e:  # fail-soft by design
         return out_img, {"postfix": f"failed: {type(e).__name__}: {e}"}

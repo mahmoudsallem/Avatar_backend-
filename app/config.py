@@ -148,7 +148,7 @@ class Settings(BaseSettings):
     FALLBACK_SCALE: float = 1.15
     HIJAB_SCALE: float = 1.25
     HIJAB_POSTFIX: bool = True  # pixel post-process for hijab avatars (skin smooth/tone match, neck-cowl recolour)
-    HIJAB_SKIN_SMOOTH: float = 0.65
+    HIJAB_SKIN_SMOOTH: float = 0.8
     HIJAB_SKIN_MATCH: float = 0.6
     HIJAB_COLOR_MATCH: float = 0.85
     HIJAB_DRAPE_FIX: float = 0.9
