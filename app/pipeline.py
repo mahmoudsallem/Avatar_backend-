@@ -1401,6 +1401,9 @@ WOMEN_VISOR_REF = (
 def _women_tune(p: str, info, ref: bool) -> str:
     hijab = bool(info.get("hijab", False))
     p = p.replace(WOMEN_SKIN_OLD, WOMEN_SKIN_NEW)
+    # id_focus wording "softly shaded skin" -> crisp, like the male avatars (women and hijab only)
+    p = p.replace("painted with softly shaded skin that keeps the visible skin texture",
+                  "painted with crisp, clearly defined skin shading that keeps the visible skin texture and strong contrast")
     # skin style: leave the shared style text exactly as the men get it (no softening) - only the wrinkle list goes
     p = (
         p.replace("keep the natural age, forehead lines, smile lines, under-eye detail and any grey in the hair of "
