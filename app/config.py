@@ -164,6 +164,9 @@ class Settings(BaseSettings):
     # Picture 3 cleanup: replace the template close-up (template eyes/brows/nose behind a dark-blue lens) with the
     # traced visor alone on black + a clear see-through lens. Stops template eyes / blue irises / oversized visor.
     VISOR_REF_CLEAN: List[str] = ["Woman", "Woman_Hijab"]
+    # Remove the blue lens tint from the TEMPLATE (Picture 1 = base image) for these avatars: its tinted lens made the
+    # user's eyes come out blue/purple. Only the lens area inside the traced visor outline is touched.
+    TEMPLATE_LENS_DETINT: List[str] = ["Woman", "Woman_Hijab"]
     # Women/hijab prompt tune (id_focus/tuned): user's own eyes block, smooth clean skin instead of "keep wrinkles/pores",
     # visor fitted to her face. false = exact previous prompt.
     WOMEN_PROMPT_TUNE: bool = True

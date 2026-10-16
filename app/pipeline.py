@@ -1380,14 +1380,15 @@ WOMEN_SKIN_OLD = (
     "true grey or white strands in the hair; do not airbrush them away. "
 )
 WOMEN_SKIN_NEW = (
-    "keep her real age and her natural skin tone, painted as smooth, clean, softly shaded skin with only the smile "
-    "lines that are clearly visible in Picture 2. "
+    "keep her real age exactly as in Picture 2 (not younger, not older), her full natural cheeks and face shape, her "
+    "natural skin tone and the expression lines of her smile, painted with soft, even, natural shading. "
 )
 
 WOMEN_VISOR_FIT = (
     "the visor is fitted to her face like real glasses: its width matches her face from temple to temple, the top "
     "edge sits just under her eyebrows, the lower edge rests on the top of her cheeks, and the outer corners end at "
-    "her temples, inside the outline of her face{hijab}. "
+    "her temples, inside the outline of her face{hijab}. on the side nearest the camera the corner block ends at the "
+    "edge of her cheek, so the visor does not stick out past her face. "
 )
 
 WOMEN_VISOR_REF = (
@@ -1400,9 +1401,9 @@ def _women_tune(p: str, info, ref: bool) -> str:
     p = p.replace(WOMEN_SKIN_OLD, WOMEN_SKIN_NEW)
     p = (
         p.replace("painted with softly shaded skin that keeps the visible skin texture",
-                  "painted with smooth, clean, softly shaded skin")
+                  "painted with soft, natural, evenly shaded skin")
         .replace("painted with smooth airbrushed skin and soft realistic shading",
-                 "painted with smooth, clean, softly shaded skin")
+                 "painted with soft, natural, evenly shaded skin")
         .replace("keep the natural age, forehead lines, smile lines, under-eye detail and any grey in the hair of "
                  "Picture 2;", "keep the natural age and smile of Picture 2;")
         .replace("the visor is exactly the large angular futuristic shield worn in Picture 1",
@@ -1733,7 +1734,12 @@ def load_avatar(key: str) -> Tuple[Image.Image, str]:
                 )
             chosen = fallback_path
         logger.info("Loaded avatar template for %s: %s", key, chosen.name)
-        _AV[key] = (avatar_on_black(chosen), chosen.name)
+        av_img = avatar_on_black(chosen)
+        if key in settings.TEMPLATE_LENS_DETINT and key in VISOR_REFS:
+            from app.visor_ref import detint_template_lens
+            av_img = detint_template_lens(av_img, key, VISOR_REFS[key]["box"])
+            logger.info("Template %s: lens tint removed (clear lens over the eyes)", key)
+        _AV[key] = (av_img, chosen.name)
     return _AV[key]
 
 def load_visor_ref(key: str) -> Optional[Image.Image]:
