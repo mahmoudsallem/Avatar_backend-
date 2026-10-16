@@ -497,8 +497,15 @@ def _log_versions() -> None:
 
 def _load_nunchaku_transformer():
     """Load one independent quantized transformer for a GPU slot."""
-    from nunchaku import NunchakuFlux2Transformer2DModel
-    from nunchaku.utils import get_precision
+    try:
+        from nunchaku import NunchakuFlux2Transformer2DModel
+        from nunchaku.utils import get_precision
+    except ImportError as exc:
+        raise RuntimeError(
+            "FLUX_BACKEND=nunchaku requires the Vitoom Nunchaku wheel in the same Python "
+            "environment that starts app.py. The published Linux x86_64 wheel is available "
+            "for Python 3.11 with Torch 2.11/cu130; see the README setup steps."
+        ) from exc
     name = "FLUX.2-klein-9B-Nunchaku"
     model = settings.NUNCHAKU_MODEL
     weights = f"{model}/svdq-{get_precision()}_r32-{name}.safetensors"

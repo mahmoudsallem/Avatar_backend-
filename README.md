@@ -50,6 +50,29 @@ Python 3.12. Use a Python 3.11 environment with a matching Torch build, followin
 [Vitoom wheel instructions](https://huggingface.co/tonera/vitoom-nunchaku). Do not install
 the DGX Spark `aarch64` wheel on EC2 x86_64.
 
+On that AMI, create a separate runtime and install the published Python 3.11 / Torch 2.11 /
+CUDA 13.0 wheel. Run the app with this environment's `python`, not `/usr/bin/python3.12`:
+
+```bash
+sudo dnf install -y python3.11 python3.11-pip
+python3.11 -m venv .venv-nunchaku
+source .venv-nunchaku/bin/activate
+python -m pip install --upgrade pip
+python -m pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu130
+python -m pip install -r requirements.txt
+python -m pip install 'huggingface-hub[cli]'
+hf download tonera/vitoom-nunchaku \
+  'nunchaku-1.3.0.dev20260622+cu13.0torch2.11-cp311-cp311-linux_x86_64.whl' \
+  --local-dir ./wheels
+python -m pip install ./wheels/nunchaku-1.3.0.dev20260622+cu13.0torch2.11-cp311-cp311-linux_x86_64.whl
+python -c 'import sys, torch, nunchaku; from nunchaku import NunchakuFlux2Transformer2DModel; print(sys.version); print(torch.__version__, torch.version.cuda); print(nunchaku.__version__)'
+python app.py
+```
+
+If your service manager starts the app, point its executable at
+`<checkout>/.venv-nunchaku/bin/python` as well. Installing into the new environment does not
+make `nunchaku` importable by the old Python 3.12 service.
+
 The quantized weights are loaded from `NUNCHAKU_MODEL` and the existing BFS LoRA is loaded
 into each quantized transformer. Startup fails if the LoRA cannot load or the LoRA self-test
 finds no effect. Keep `LORA_SELFTEST=true`. `FUSE_LORA` and `COMPILE_TRANSFORMER` must be false
