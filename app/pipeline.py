@@ -1417,6 +1417,10 @@ def _women_tune(p: str, info, ref: bool) -> str:
     if VISOR_FIT in p:
         p = p.replace(VISOR_FIT, VISOR_FIT + WOMEN_VISOR_FIT.format(
             hijab=" and inside the hijab opening" if hijab else ""), 1)
+    col = info.get("hijab_colour")
+    if hijab and col and HIJAB_USER in p:
+        p = p.replace(HIJAB_USER, f"HIJAB COLOUR: her hijab and the scarf over her neck and chest are {col}, exactly "
+                      f"as in Picture 1 and Picture 2. " + HIJAB_USER, 1)
     if ref and info.get("avatar") in settings.VISOR_REF_CLEAN and VISOR_REF_TEXT in p:
         p = p.replace(VISOR_REF_TEXT, WOMEN_VISOR_REF, 1)
     return p
@@ -1739,6 +1743,10 @@ def load_avatar(key: str) -> Tuple[Image.Image, str]:
             from app.visor_ref import detint_template_lens
             av_img = detint_template_lens(av_img, key, VISOR_REFS[key]["box"])
             logger.info("Template %s: lens tint removed (clear lens over the eyes)", key)
+        if key in settings.VISOR_TRIM_FAR_SIDE and key in VISOR_REFS:
+            from app.visor_ref import trim_template_overhang
+            av_img = trim_template_overhang(av_img, key, VISOR_REFS[key]["box"])
+            logger.info("Template %s: far-side visor overhang trimmed", key)
         _AV[key] = (av_img, chosen.name)
     return _AV[key]
 
@@ -1773,6 +1781,9 @@ def load_visor_ref(key: str) -> Optional[Image.Image]:
         if crop is not None and key in settings.VISOR_REF_CLEAN:
             from app.visor_ref import isolate_visor
             cleaned = isolate_visor(crop, key)
+            if cleaned is not None and key in settings.VISOR_TRIM_FAR_SIDE:
+                from app.visor_ref import trim_ref_overhang
+                cleaned = trim_ref_overhang(cleaned, key)
             if cleaned is not None:
                 crop = cleaned
                 logger.info("Visor reference for %s: cleaned (visor only, clear lens)", key)
@@ -1951,7 +1962,8 @@ def _face_box(emb_res, target_w: int, target_h: int):
         return None
 
 
-def _apply_hijab_postfix(out: Image.Image, face: Image.Image, user_emb, rec: dict, key_for_debug=None) -> Image.Image:
+def _apply_hijab_postfix(out: Image.Image, face: Image.Image, user_emb, rec: dict, key_for_debug=None,
+                         skin_only: bool = False) -> Image.Image:
     """Skin smoothing / tone match + neck-drape recolour for hijab avatars. Fail-soft: returns `out` on any problem."""
     try:
         from app.postprocess_hijab import fix_hijab_avatar
@@ -1966,10 +1978,10 @@ def _apply_hijab_postfix(out: Image.Image, face: Image.Image, user_emb, rec: dic
             return out
         fixed, report = fix_hijab_avatar(
             out, ob, face if ub else None, ub,
-            skin_smooth=settings.HIJAB_SKIN_SMOOTH,
-            skin_match=settings.HIJAB_SKIN_MATCH,
-            hijab_match=settings.HIJAB_COLOR_MATCH,
-            drape=settings.HIJAB_DRAPE_FIX,
+            skin_smooth=settings.SKIN_POSTFIX_SMOOTH if skin_only else settings.HIJAB_SKIN_SMOOTH,
+            skin_match=settings.SKIN_POSTFIX_MATCH if skin_only else settings.HIJAB_SKIN_MATCH,
+            hijab_match=0.0 if skin_only else settings.HIJAB_COLOR_MATCH,
+            drape=0.0 if skin_only else settings.HIJAB_DRAPE_FIX,
         )
         rec["postfix"] = {"applied": True, **{k: v for k, v in report.items() if isinstance(v, (int, float, str, bool, type(None)))}}
         if settings.DEBUG_DUMP and key_for_debug:
@@ -2122,6 +2134,22 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         # CPU embedding runs in thread while GPU generates try #1
         fut = _POOL.submit(embed_user, face) if settings.VALIDATE else None
 
+        if info.get("hijab") and settings.HIJAB_TEMPLATE_RECOLOR:
+            try:
+                from app.hijab_template import recolor_hijab_template, sample_user_hijab_lab, quantize_lab
+                from app.postprocess_hijab import hijab_colour_name
+                ue = fut.result() if fut is not None else embed_user(face)
+                ub = _face_box(ue, face.width, face.height) if ue else None
+                hlab = sample_user_hijab_lab(face, ub) if ub else None
+                if hlab is not None:
+                    avatar = recolor_hijab_template(avatar, quantize_lab(hlab))
+                    images[0] = avatar
+                    info["hijab_colour"] = hijab_colour_name(hlab)
+                logger.info("Hijab template recolour: colour=%s Lab=%s", info.get("hijab_colour"),
+                            None if hlab is None else [round(float(c), 1) for c in hlab])
+            except Exception as e:
+                logger.warning("hijab template recolour failed (kept black template): %s", e)
+
         best, k, gen_s, val_s, stopped = None, 0, 0.0, 0.0, "all tries"
         t_loop = time.time()
 
@@ -2251,6 +2279,8 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         out, v = best["out"], best["v"]
         if info.get("hijab") and settings.HIJAB_POSTFIX:
             out = _apply_hijab_postfix(out, face, user_emb, rec, key_for_debug=locals().get("dbg"))
+        elif info.get("avatar") in settings.SKIN_POSTFIX_AVATARS:
+            out = _apply_hijab_postfix(out, face, user_emb, rec, key_for_debug=locals().get("dbg"), skin_only=True)
         jpeg_bytes = encode_jpeg_capped(out, settings.OUTPUT_MAX_BYTES)
         rec.update(
             status="done",

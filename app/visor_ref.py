@@ -112,3 +112,65 @@ def detint_template_lens(img: Image.Image, key: str, box) -> Image.Image:
         return Image.fromarray(out)
     except Exception:
         return img
+
+
+# Far-side face outline at visor height, per template, in the same 800x420 trace units as VISOR_POLY: everything of
+# the visor LEFT of this line sticks out past the cheek / temple silhouette (physically it would be hidden behind the
+# head). The model copied that overhang onto every user, so it is removed from the template and the visor reference.
+VISOR_TRIM_LINE = {
+    "Woman": ((152, 150), (205, 400)),
+    "Woman_Hijab": ((122, 150), (172, 400)),
+}
+
+
+def _trim_mask(H: int, W: int, key: str, to_px) -> Optional[np.ndarray]:
+    poly, line = VISOR_POLY.get(key), VISOR_TRIM_LINE.get(key)
+    if not poly or not line:
+        return None
+    pts = np.array([to_px(x, y) for x, y in poly], np.int32)
+    vis = np.zeros((H, W), np.uint8)
+    cv2.fillPoly(vis, [pts], 1)
+    (ax, ay), (bx, by) = line
+    # half-plane left of the line (extended far up and down)
+    t = 10.0
+    p0 = to_px(ax - (bx - ax) * t, ay - (by - ay) * t)
+    p1 = to_px(bx + (bx - ax) * t, by + (by - ay) * t)
+    left = np.zeros((H, W), np.uint8)
+    cv2.fillPoly(left, [np.array([p0, p1, (-10 * W, p1[1]), (-10 * W, p0[1])], np.int32)], 1)
+    m = (vis & left).astype(np.uint8)
+    return m if m.sum() > 50 else None
+
+
+def trim_template_overhang(img: Image.Image, key: str, box) -> Image.Image:
+    """Inpaint away the part of the TEMPLATE visor that sticks out past the far cheek. Fail-soft."""
+    try:
+        rgb = np.asarray(img.convert("RGB"))
+        H, W = rgb.shape[:2]
+        x0, y0, x1, y1 = box
+        to_px = lambda x, y: (int((x0 + x / _TRACE_W * (x1 - x0)) * W), int((y0 + y / _TRACE_H * (y1 - y0)) * H))
+        m = _trim_mask(H, W, key, to_px)
+        if m is None:
+            return img
+        m = cv2.dilate(m, np.ones((5, 5), np.uint8))
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        out = cv2.inpaint(bgr, m * 255, max(5, int(0.01 * W)), cv2.INPAINT_TELEA)
+        return Image.fromarray(cv2.cvtColor(out, cv2.COLOR_BGR2RGB))
+    except Exception:
+        return img
+
+
+def trim_ref_overhang(ref_crop: Image.Image, key: str) -> Image.Image:
+    """Same cut on the cleaned visor reference crop (that crop is the VISOR_REFS box itself). Fail-soft."""
+    try:
+        rgb = np.array(ref_crop.convert("RGB"))
+        H, W = rgb.shape[:2]
+        to_px = lambda x, y: (int(x / _TRACE_W * W), int(y / _TRACE_H * H))
+        m = _trim_mask(H, W, key, to_px)
+        if m is None:
+            return ref_crop
+        # widen the cut a little so the redrawn outline of the removed part goes too, but only on the far side
+        m2 = cv2.dilate(m, np.ones((11, 11), np.uint8))
+        rgb[m2 > 0] = 0
+        return Image.fromarray(rgb)
+    except Exception:
+        return ref_crop

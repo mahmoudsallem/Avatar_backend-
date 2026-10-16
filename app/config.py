@@ -149,6 +149,14 @@ class Settings(BaseSettings):
 
     FALLBACK_SCALE: float = 1.15
     HIJAB_SCALE: float = 1.25
+    # Recolour the hijab template's black hijab + neck drape to the user's own hijab colour before generation
+    # (app/hijab_template.py). Fixes the black neck drape and the magenta drift at the source.
+    HIJAB_TEMPLATE_RECOLOR: bool = True
+    # Skin-only clean-up (light smoothing, shine removal, tone nudged toward the user's real skin) for these avatars.
+    # No hijab recolour / drape painting - that is HIJAB_POSTFIX, kept off.
+    SKIN_POSTFIX_AVATARS: List[str] = ["Woman", "Woman_Hijab"]
+    SKIN_POSTFIX_SMOOTH: float = 0.35
+    SKIN_POSTFIX_MATCH: float = 0.6
     HIJAB_POSTFIX: bool = True  # pixel post-process for hijab avatars (skin smooth/tone match, neck-cowl recolour)
     HIJAB_SKIN_SMOOTH: float = 0.8
     HIJAB_SKIN_MATCH: float = 0.6
@@ -163,10 +171,13 @@ class Settings(BaseSettings):
     USE_VISOR_REF: bool = True
     # Picture 3 cleanup: replace the template close-up (template eyes/brows/nose behind a dark-blue lens) with the
     # traced visor alone on black + a clear see-through lens. Stops template eyes / blue irises / oversized visor.
-    VISOR_REF_CLEAN: List[str] = ["Woman", "Woman_Hijab"]
+    VISOR_REF_CLEAN: List[str] = ["Woman", "Woman_Hijab", "Man"]
     # Remove the blue lens tint from the TEMPLATE (Picture 1 = base image) for these avatars: its tinted lens made the
     # user's eyes come out blue/purple. Only the lens area inside the traced visor outline is touched.
-    TEMPLATE_LENS_DETINT: List[str] = ["Woman", "Woman_Hijab"]
+    TEMPLATE_LENS_DETINT: List[str] = ["Woman", "Woman_Hijab", "Man"]
+    # OPT-IN (A/B first): cut the far-side part of the visor that sticks out past the cheek, in the template (inpainted)
+    # and in the visor reference. e.g. VISOR_TRIM_FAR_SIDE=["Woman","Woman_Hijab"]
+    VISOR_TRIM_FAR_SIDE: List[str] = []
     # Women/hijab prompt tune (id_focus/tuned): user's own eyes block, smooth clean skin instead of "keep wrinkles/pores",
     # visor fitted to her face. false = exact previous prompt.
     WOMEN_PROMPT_TUNE: bool = True
