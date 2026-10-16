@@ -1373,11 +1373,130 @@ def visor_block(info, attempt=0, ref=False):
         + (VISOR_RETRY if attempt > 0 else "")
     )
 
+# ----------------------------------------------------------------------------
+# "v3" prompt variant (settings.PROMPT_VARIANT=v3): short, positive-only, no contradictions.
+# Why (from the 14-photo concurrency run, test_results/run_20261016_224210):
+#   * the old prompts are ~1,300+ words. FLUX.2-klein is distilled (CFG ~1) so there is no negative guidance:
+#     every "never blue eyes / no stubble / no red highlights / double chin" sentence only puts that concept IN the
+#     prompt, and the 6+ repeated identity paragraphs dilute each other.
+#   * contradictions: "Picture 2 is the ONLY source of facial structure" vs "copy head rotation + micro expressions
+#     from Picture 1"; "do not airbrush" vs "smooth airbrushed skin" vs FACE_CLEAN "smooth, evenly painted skin";
+#     BUILD asks for "a soft double chin / thicker neck" (caricature).
+#   * VISOR_MANDATORY names "Picture 1 or 3" even when there is no Picture 3.
+#   * hijab: the template's black hijab and grey cowl bleed through (user's lilac/pink hijab came out black, flat
+#     grey patch on the chest). The hijab text must say the colour comes from Picture 2 and the drape is hijab fabric.
+# The old variants ("tuned", "id_focus") are untouched. Switch with PROMPT_VARIANT=v3 and A/B with send_10_images.py.
+# ----------------------------------------------------------------------------
+V3_HEAD = (
+    "head_swap: start with Picture 1 as the base image and keep its jacket, emblem, lighting and solid black "
+    "background. replace the head with the head of the real person in Picture 2. "
+)
+
+V3_IDENTITY = (
+    "the face is the exact person from Picture 2, recognisable at first glance, an honest unflattered likeness: same "
+    "face width and length, forehead, cheekbones, cheek fullness, jaw and chin, nose, lips, eyebrows, eye shape and "
+    "eye spacing, ears, skin tone, real age and skin texture (smile lines, pores, under-eye detail). the head "
+    "angle follows Picture 1, the smile and mouth {mouth}, and the eyes look straight at the viewer with the real "
+    "dark eye colour of Picture 2. "
+)
+
+V3_BUILD = (
+    "the face keeps the fullness of Picture 2: a full face stays full, a lean face stays lean. "
+)
+
+V3_STYLE = (
+    "style: semi-realistic digital painting like Picture 1, with softly shaded skin that keeps the real skin "
+    "texture, thin dark line work around the eyes, lips and hair, glossy individual hair strands, a red rim light "
+    "along the hair, forehead and cheek edge and a cool blue fill light on the shadow side, so the head blends into "
+    "the illustration with no swap seam. sharp detail, 4k. "
+)
+
+V3_VISOR_MAN = (
+    "the face wears the angular electric-blue wraparound visor from Picture 1{ref}: one continuous clear panel with "
+    "a straight top edge just under the eyebrows, chamfered lower corners, a thin electric-blue frame, a cyan corner "
+    "block at the outer end and a silver-blue arm to the ear. it spans temple to temple, sits level over both eyes "
+    "and follows the head tilt. the lens is clear glass, so the eyes and eyebrows of Picture 2 stay sharp and keep "
+    "their real colour behind it. any eyeglasses worn in Picture 2 are removed and replaced by this visor. "
+)
+
+V3_VISOR_DEFAULT = (
+    "the face wears the angular electric-blue wraparound visor from Picture 1{ref}: one continuous clear panel "
+    "covering both eyes, a straight thin blue upper rim just under the eyebrows, faceted outer corners, a shallow "
+    "V-shaped lower edge around the nose, cyan side blocks and slim arms to the temples. it spans temple to "
+    "temple, sits level over both eyes and follows the head tilt. the lens is clear glass, so the eyes and "
+    "eyebrows of Picture 2 stay sharp and keep their real colour behind it. any eyeglasses worn in Picture 2 are "
+    "removed and replaced by this visor. "
+)
+
+V3_HAIR = (
+    "hair: the exact hair of Picture 2 (colour, length, texture, volume, hairline and parting), with only a thin red "
+    "rim light added. "
+)
+
+V3_BALD = (
+    "the head is completely bald like Picture 2: a smooth bare shaved scalp in skin tone with only a thin red rim "
+    "light on its edge. "
+)
+
+V3_BEARD = (
+    "facial hair: the exact moustache, beard or stubble of Picture 2 with the same shape, coverage, length and grey "
+    "or black colour; a clean-shaven face stays clean-shaven. "
+)
+
+V3_WOMAN_HAIR = (
+    "her hair is styled like Picture 1: long dark hair with red and orange highlights in a high voluminous updo, "
+    "framing her face. "
+)
+
+V3_FEMALE = (
+    "her natural look from Picture 2: her eyebrows, eyelids, lashes, lips and smile, her natural makeup level and "
+    "lip colour, her dimples and cheek fullness, her face shape. "
+)
+
+V3_HIJAB = (
+    "she wears her own hijab from Picture 2, copied in its real colours (the hijab takes the colour of Picture 2's "
+    "hijab, not the black of the template), the same sheen and soft folds, wrapped snugly around the face with the "
+    "edge in the same place on the forehead, cheeks and under the chin, covering all hair, ears and neck. the "
+    "scarf then falls over the shoulders and chest in soft shaded folds of the same fabric and colour, lit by the "
+    "red and blue lights of the jacket, and tucks into the jacket collar of Picture 1. only her head and hijab "
+    "come from Picture 2; her clothes and background do not. the visor sits inside the hijab opening, no wider "
+    "than the face, with its arms resting at the temples, and the hijab edge above the eyebrows stays visible. "
+)
+
+V3_CLOSING = (
+    "final check: the same real person as Picture 2, one visor on the face, jacket, emblem and black background "
+    "of Picture 1 unchanged."
+)
+
+def _build_prompt_v3(info, attempt=0, ref=False, keep_user_expression=True, hair_retry=False):
+    is_woman = info.get("gender") == "Woman"
+    is_hijab = bool(info.get("hijab", False))
+    is_bald = bool(info.get("bald", False)) and not is_hijab and not is_woman
+    ident = V3_IDENTITY.format(mouth=("stay as in Picture 2" if keep_user_expression else "follow Picture 1"))
+    visor = (V3_VISOR_MAN if info.get("avatar") == "Man" else V3_VISOR_DEFAULT).format(
+        ref=" and the close-up in Picture 3" if ref else ""
+    )
+    if attempt > 0:
+        visor += VISOR_RETRY
+    if is_hijab:
+        p = V3_HEAD + ident + V3_FEMALE + V3_BUILD + V3_HIJAB + visor + V3_STYLE + V3_CLOSING
+    elif is_woman:
+        p = V3_HEAD + ident + V3_FEMALE + V3_BUILD + V3_WOMAN_HAIR + visor + V3_STYLE + V3_CLOSING
+    else:
+        hair = (V3_BALD + (BALD_RETRY if attempt > 0 else "")) if is_bald else (V3_HAIR + (HAIR_RETRY if hair_retry else ""))
+        p = V3_HEAD + ident + V3_BUILD + hair + V3_BEARD + visor + V3_STYLE + V3_CLOSING
+    if is_woman or is_hijab:
+        p = _strip_facial_hair(p)
+    return p
+
+
 def build_prompt(info, attempt=0, ref=False, style_mode=None, keep_user_expression=None, hair_retry=False):
     if style_mode is None:
         style_mode = settings.STYLE_MODE
     if keep_user_expression is None:
         keep_user_expression = settings.KEEP_USER_EXPRESSION
+    if settings.PROMPT_VARIANT == "v3":
+        return _build_prompt_v3(info, attempt, ref, keep_user_expression, hair_retry)
 
     # Only the MALE prompt has a bald branch; women / hijab prompts are untouched.
     is_bald = bool(info.get("bald", False)) and not info.get("hijab", False) and info.get("gender") != "Woman"

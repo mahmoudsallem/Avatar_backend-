@@ -156,7 +156,7 @@ class Settings(BaseSettings):
     HIJAB_DRAPE_FIX: float = 0.9
     REF_SIZE: int = 1024
     STYLE_MODE: str = "comic"  # "semi_real" | "comic" | "off"
-    PROMPT_VARIANT: str = "tuned"  # "tuned" = the notebook prompt (default) | "id_focus" = identity-first prompt (A/B test with bench_prompt_ab.py before switching)
+    PROMPT_VARIANT: str = "tuned"  # "tuned" = the notebook prompt (default) | "id_focus" = identity-first prompt | "v3" = short positive-only prompt (~380 words vs ~1300), A/B with send_10_images.py
     KEEP_USER_EXPRESSION: bool = True
 
     # ---------------- Visor & Similarity ----------------
