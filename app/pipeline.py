@@ -1362,6 +1362,64 @@ HAIR_RETRY = (
     "same receding hairline as Picture 2. the top of the head must be covered by hair, never a bare shiny scalp. "
 )
 
+# ---------------------------------------------------------------------------------------------------------------
+# Women / hijab prompt tune (settings.WOMEN_PROMPT_TUNE). From the 16-Oct runs: women came out with the template's
+# eyes and brows and bluish irises (the old Picture 3 was the template's face behind a blue lens), aged skin (the
+# id_focus text asks to keep forehead lines / crow's feet / pores - on women FLUX over-paints them) and a visor that
+# sticks out past the cheek / hijab edge. Applied as text edits on the finished prompt; men are untouched.
+# ---------------------------------------------------------------------------------------------------------------
+WOMEN_EYES = (
+    "EYES: her eyes come only from Picture 2: the same eye shape, size, eyelid fold, lash line and eye spacing, and "
+    "the same natural iris colour as Picture 2 (dark brown stays dark brown), with clear white eye whites and a "
+    "small catchlight, seen sharply through the clear, untinted lens. her eyebrows keep the exact shape, thickness "
+    "and arch of Picture 2. "
+)
+
+WOMEN_SKIN_OLD = (
+    "keep the real skin texture and age: forehead lines, smile lines, crow's feet, under-eye bags, pores and the "
+    "true grey or white strands in the hair; do not airbrush them away. "
+)
+WOMEN_SKIN_NEW = (
+    "keep her real age and her natural skin tone, painted as smooth, clean, softly shaded skin with only the smile "
+    "lines that are clearly visible in Picture 2. "
+)
+
+WOMEN_VISOR_FIT = (
+    "the visor is fitted to her face like real glasses: its width matches her face from temple to temple, the top "
+    "edge sits just under her eyebrows, the lower edge rests on the top of her cheeks, and the outer corners end at "
+    "her temples, inside the outline of her face{hijab}. "
+)
+
+WOMEN_VISOR_REF = (
+    "Picture 3 shows the exact visor on its own: copy its shape (straight top edge, angular faceted corners, thin "
+    "electric-blue frame, cyan corner blocks, clear see-through lens) and scale it to fit her face. "
+)
+
+def _women_tune(p: str, info, ref: bool) -> str:
+    hijab = bool(info.get("hijab", False))
+    p = p.replace(WOMEN_SKIN_OLD, WOMEN_SKIN_NEW)
+    p = (
+        p.replace("painted with softly shaded skin that keeps the visible skin texture",
+                  "painted with smooth, clean, softly shaded skin")
+        .replace("painted with smooth airbrushed skin and soft realistic shading",
+                 "painted with smooth, clean, softly shaded skin")
+        .replace("keep the natural age, forehead lines, smile lines, under-eye detail and any grey in the hair of "
+                 "Picture 2;", "keep the natural age and smile of Picture 2;")
+        .replace("the visor is exactly the large angular futuristic shield worn in Picture 1",
+                 "the visor is exactly the angular futuristic shield worn in Picture 1")
+        .replace("broad faceted outer corners", "compact faceted outer corners")
+    )
+    if "BUILD: match" in p:
+        p = p.replace("BUILD: match", WOMEN_EYES + "BUILD: match", 1)
+    else:
+        p = WOMEN_EYES + p
+    if VISOR_FIT in p:
+        p = p.replace(VISOR_FIT, VISOR_FIT + WOMEN_VISOR_FIT.format(
+            hijab=" and inside the hijab opening" if hijab else ""), 1)
+    if ref and info.get("avatar") in settings.VISOR_REF_CLEAN and VISOR_REF_TEXT in p:
+        p = p.replace(VISOR_REF_TEXT, WOMEN_VISOR_REF, 1)
+    return p
+
 def visor_block(info, attempt=0, ref=False):
     look = VISOR_LOOK_MAN if info.get("avatar") == "Man" else VISOR_LOOK_DEFAULT
     return (
@@ -1576,13 +1634,14 @@ def build_prompt(info, attempt=0, ref=False, style_mode=None, keep_user_expressi
             _strip_facial_hair(head), _strip_facial_hair(IDENTITY_TXT),
             _strip_facial_hair(style_text), _strip_facial_hair(closing),
         )
+    tune = (lambda t: _women_tune(t, info, ref)) if settings.WOMEN_PROMPT_TUNE else (lambda t: t)
     if info.get("hijab", False):
-        return (
+        return tune(
             f"{head}{IDENTITY_TXT}{BUILD}{V}{HIJAB_VISOR_NOTE}"
             f"{HIJAB_FACE}{HIJAB_USER}{FACE_CLEAN}{style_text} {closing} the visor is present and fits her face."
         )
     if info.get("gender") == "Woman":
-        return (
+        return tune(
             f"{head}{IDENTITY_TXT}{FEMALE_FACE}{BUILD}"
             "her hair is styled exactly like Picture 1: long black hair with red and orange highlights woven "
             "throughout, styled in a high voluminous bun or updo at the crown, sleek and professionally polished, "
@@ -1705,6 +1764,12 @@ def load_visor_ref(key: str) -> Optional[Image.Image]:
                     key,
                     cfg["file"],
                 )
+        if crop is not None and key in settings.VISOR_REF_CLEAN:
+            from app.visor_ref import isolate_visor
+            cleaned = isolate_visor(crop, key)
+            if cleaned is not None:
+                crop = cleaned
+                logger.info("Visor reference for %s: cleaned (visor only, clear lens)", key)
         if crop is not None:
             s = max(crop.size)
             canvas = Image.new("RGB", (s, s), "black")
