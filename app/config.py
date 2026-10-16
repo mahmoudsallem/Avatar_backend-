@@ -125,7 +125,8 @@ class Settings(BaseSettings):
     FUSE_LORA: bool = False            # merge the LoRA into the weights; needs a uniform ID_LORA_SCHEDULE (rounding-level change)
     ATTENTION_BACKEND: str = ""        # "" = diffusers default; try "_native_cudnn" or "native" (rounding-level change)
     COMPILE_TRANSFORMER: bool = False  # torch.compile the FLUX transformer (use together with FUSE_LORA; slow first start)
-    COMPILE_MODE: str = "default"      # "default" | "max-autotune-no-cudagraphs"
+    COMPILE_MODE: str = "default"      # "default" | "max-autotune-no-cudagraphs" (inductor only)
+    COMPILE_BACKEND: str = "inductor"  # "inductor" | "tensorrt" (torch-tensorrt; diffusers backend + FUSE_LORA only, NOT with nunchaku)
     WARMUP_AT_STARTUP: bool = True     # with COMPILE_TRANSFORMER: compile every template shape before serving
     CUDNN_ENABLED: bool = False        # the old code forced cuDNN off; True may speed up the VAE convolutions
     PERSISTENT_DETECT: bool = False    # keep DeepFace face-detection processes alive instead of spawning one per photo

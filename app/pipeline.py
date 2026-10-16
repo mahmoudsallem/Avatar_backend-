@@ -331,8 +331,19 @@ def apply_speed_options(slot: "GpuSlot") -> None:
         if not slot.fused:
             logger.warning("COMPILE_TRANSFORMER without a fused LoRA recompiles for every LoRA strength - "
                            "enable FUSE_LORA with a uniform ID_LORA_SCHEDULE.")
-        p.transformer.compile(mode=settings.COMPILE_MODE, dynamic=False)
-        logger.info("Slot %d: transformer compiled (mode=%s) - first calls per shape are slow", slot.idx, settings.COMPILE_MODE)
+        if settings.COMPILE_BACKEND == "tensorrt":
+            try:
+                import torch_tensorrt  # noqa: F401  (registers the "tensorrt" torch.compile backend)
+            except ImportError as exc:
+                raise RuntimeError("COMPILE_BACKEND=tensorrt needs: pip install torch-tensorrt (matching your torch/CUDA)") from exc
+            # mode and options are mutually exclusive in torch.compile; bf16 keeps the numerics of the plain path
+            p.transformer.compile(backend="tensorrt", dynamic=False,
+                                  options={"enabled_precisions": {torch.bfloat16}, "min_block_size": 5,
+                                           "truncate_double": True, "use_python_runtime": True})
+            logger.info("Slot %d: transformer compiled with TensorRT (bf16) - first call per shape builds the engine (slow)", slot.idx)
+        else:
+            p.transformer.compile(mode=settings.COMPILE_MODE, dynamic=False)
+            logger.info("Slot %d: transformer compiled (mode=%s) - first calls per shape are slow", slot.idx, settings.COMPILE_MODE)
 
 def warmup_slots() -> None:
     """Run each template through each slot once so torch.compile builds every shape before the first request."""
