@@ -39,6 +39,42 @@ app/
 
 ## 2. Hardware & License Requirements
 
+### Optional Nunchaku trial on g7e.2xlarge
+
+Set `FLUX_BACKEND=nunchaku` to use the quantized FLUX.2 Klein 9B transformer. The default
+`diffusers` backend remains the reference. Nunchaku is an optional dependency and must be
+installed in a separate Linux x86_64 environment with a wheel matching that environment's
+Python version, PyTorch version and `torch.version.cuda`. The Amazon Linux 2023 DLAMI
+20260929 has system Python 3.12; the published Vitoom Nunchaku x86_64 wheels do not list
+Python 3.12. Use a Python 3.11 environment with a matching Torch build, following the
+[Vitoom wheel instructions](https://huggingface.co/tonera/vitoom-nunchaku). Do not install
+the DGX Spark `aarch64` wheel on EC2 x86_64.
+
+The quantized weights are loaded from `NUNCHAKU_MODEL` and the existing BFS LoRA is loaded
+into each quantized transformer. Startup fails if the LoRA cannot load or the LoRA self-test
+finds no effect. Keep `LORA_SELFTEST=true`. `FUSE_LORA` and `COMPILE_TRANSFORMER` must be false
+with this backend. Set `GPU_SLOTS=2` initially, then benchmark 3 slots if VRAM permits.
+The model's quantization can alter images, so compare identity scores, visor success and
+retries before switching production traffic.
+
+On the running instance, check the environment with:
+
+```bash
+python -c 'import sys, torch; print(sys.version); print(torch.__version__, torch.version.cuda); print(torch.cuda.get_device_name(0))'
+```
+
+Run the existing concurrent test against both backend configurations, using the same photos
+and settings for each. At least 50 requests provides a more useful steady-load comparison
+than the default ten:
+
+```bash
+python send_10_images.py --url http://localhost:8000 --count 50
+```
+
+The `throughput` line reports completed JPEG avatars per minute. The target is at least 10
+avatars/minute with no increase in failed requests and acceptable identity and visor results.
+The DGX Spark benchmark is not a throughput guarantee for the g7e GPU or this full pipeline.
+
 ### Recommended Hardware
 - **EC2 Instance Type**: `g5.2xlarge`, `g5.4xlarge`, or `g6e.2xlarge` (NVIDIA A10G / L40S with >= 24GB VRAM).
 - **Disk Space**: At least 50 GB root volume for models and container cache.

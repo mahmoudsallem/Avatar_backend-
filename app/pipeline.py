@@ -85,6 +85,9 @@ class GpuSlot:
 
     def set_lora(self, weight: float) -> None:
         self.lora["scale"] = float(weight)
+        if settings.FLUX_BACKEND == "nunchaku":
+            self.pipe.transformer.set_lora_strength(float(weight))
+            return
         if self.fused:
             if abs(float(weight) - self.fused_scale) > 1e-6:
                 raise RuntimeError(
@@ -99,6 +102,8 @@ class GpuSlot:
             self.set_lora(settings.LORA_STRENGTH)
 
     def lora_kwargs(self):
+        if settings.FLUX_BACKEND == "nunchaku":
+            return None
         if self.fused:
             return None
         return {"scale": self.lora["scale"]} if self.lora["mode"] == "kwargs" else None
@@ -302,6 +307,8 @@ def _install_ref_cache(p) -> None:
 
 def apply_speed_options(slot: "GpuSlot") -> None:
     p = slot.pipe
+    if settings.FLUX_BACKEND == "nunchaku" and (settings.FUSE_LORA or settings.COMPILE_TRANSFORMER):
+        raise ValueError("FUSE_LORA and COMPILE_TRANSFORMER are unsupported with FLUX_BACKEND=nunchaku")
     if settings.FUSE_LORA:
         mults = [float(m) for m in settings.ID_LORA_SCHEDULE]
         if len(set(round(m, 6) for m in mults)) != 1:
@@ -488,11 +495,59 @@ def _log_versions() -> None:
     except Exception:
         pass
 
+def _load_nunchaku_transformer():
+    """Load one independent quantized transformer for a GPU slot."""
+    from nunchaku import NunchakuFlux2Transformer2DModel
+    from nunchaku.utils import get_precision
+    name = "FLUX.2-klein-9B-Nunchaku"
+    model = settings.NUNCHAKU_MODEL
+    weights = f"{model}/svdq-{get_precision()}_r32-{name}.safetensors"
+    transformer = NunchakuFlux2Transformer2DModel.from_pretrained(weights, torch_dtype=torch.bfloat16)
+    from huggingface_hub import hf_hub_download
+    lora_source = Path(settings.LORA)
+    lora_path = (lora_source / settings.LORA_FILE if lora_source.is_dir()
+                 else Path(hf_hub_download(repo_id=settings.LORA, filename=settings.LORA_FILE)))
+    if not lora_path.is_file():
+        raise FileNotFoundError(f"BFS LoRA file is missing: {lora_path}")
+    transformer.update_lora_params(str(lora_path))
+    transformer.set_lora_strength(settings.LORA_STRENGTH)
+    return transformer
+
+def _load_flux_pipeline(shared=None):
+    from diffusers import Flux2KleinPipeline
+    if settings.FLUX_BACKEND == "nunchaku":
+        return Flux2KleinPipeline.from_pretrained(
+            settings.NUNCHAKU_MODEL, torch_dtype=torch.bfloat16,
+            transformer=_load_nunchaku_transformer(), **(shared or {}))
+    return Flux2KleinPipeline.from_pretrained(
+        settings.FLUX_MODEL, dtype=torch.bfloat16, **(shared or {}))
+
 def _lora_selftest() -> None:
     """Generate the same tiny image with the LoRA off and on. If the output does not change, the face-swap LoRA is
     doing nothing (this is what makes avatars ignore the user's face). Tries the notebook's way (attention_kwargs
     scale) first, then pipe.set_adapters; raises if neither changes the output."""
     logger.info("LoRA self-test: generating 4 tiny images (a few seconds)...")
+    if settings.FLUX_BACKEND == "nunchaku":
+        av, _ = load_avatar("Man")
+        base = av.resize((512, 512), Image.LANCZOS)
+        face = pad_square(base.crop((140, 20, 400, 300)), 512)
+        def gen_nunchaku(strength):
+            pipe.transformer.set_lora_strength(strength)
+            with torch.no_grad():
+                im = pipe(prompt="head_swap: replace the head in Picture 1 with the head from Picture 2.",
+                          image=[base, face], width=512, height=512, num_inference_steps=4,
+                          guidance_scale=settings.CFG,
+                          generator=torch.Generator("cuda").manual_seed(1)).images[0]
+            return np.asarray(im.convert("RGB")).astype(np.int16)
+        try:
+            difference = float(np.abs(gen_nunchaku(0.0) - gen_nunchaku(1.1)).mean())
+        finally:
+            pipe.transformer.set_lora_strength(settings.LORA_STRENGTH)
+        if difference <= 1.0:
+            raise RuntimeError(f"Nunchaku BFS LoRA self-test failed: mean pixel difference {difference:.2f}")
+        _LORA["mode"] = "nunchaku"
+        logger.info("Nunchaku BFS LoRA self-test passed: mean pixel difference %.2f", difference)
+        return
     av, _ = load_avatar("Man")
     base = av.resize((512, 512), Image.LANCZOS)
     face = pad_square(base.crop((140, 20, 400, 300)), 512)
@@ -542,6 +597,13 @@ def _lora_selftest() -> None:
 def load_models() -> None:
     global clip, pipe
 
+    if settings.FLUX_BACKEND not in {"diffusers", "nunchaku"}:
+        raise ValueError("FLUX_BACKEND must be 'diffusers' or 'nunchaku'")
+    if settings.FLUX_BACKEND == "nunchaku":
+        if settings.FUSE_LORA or settings.COMPILE_TRANSFORMER:
+            raise ValueError("Nunchaku requires FUSE_LORA=false and COMPILE_TRANSFORMER=false")
+        _LORA["mode"] = "nunchaku"
+
     assert torch.cuda.is_available(), "PyTorch cannot see the GPU - FLUX needs CUDA."
     torch.backends.cudnn.enabled = bool(settings.CUDNN_ENABLED)
 
@@ -567,12 +629,12 @@ def load_models() -> None:
     )
     logger.info("CLIP loaded successfully.")
 
-    from diffusers import Flux2KleinPipeline, FlowMatchEulerDiscreteScheduler
+    from diffusers import FlowMatchEulerDiscreteScheduler
     from diffusers.utils import logging as df_logging
     df_logging.set_verbosity_error()
 
-    logger.info("Loading FLUX model: %s", settings.FLUX_MODEL)
-    pipe = Flux2KleinPipeline.from_pretrained(settings.FLUX_MODEL, dtype=torch.bfloat16)
+    logger.info("Loading FLUX backend %s", settings.FLUX_BACKEND)
+    pipe = _load_flux_pipeline()
     if low_vram:
         pipe.enable_model_cpu_offload()
     else:
@@ -584,15 +646,16 @@ def load_models() -> None:
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
 
-    logger.info("Loading LoRA weights: %s / %s", settings.LORA, settings.LORA_FILE)
-    pipe.load_lora_weights(settings.LORA, weight_name=settings.LORA_FILE, adapter_name="bfs")
+    if settings.FLUX_BACKEND == "diffusers":
+        logger.info("Loading LoRA weights: %s / %s", settings.LORA, settings.LORA_FILE)
+        pipe.load_lora_weights(settings.LORA, weight_name=settings.LORA_FILE, adapter_name="bfs")
     pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
         pipe.scheduler.config,
         shift=1.0,
         use_dynamic_shifting=False,
     )
     global lora_layers
-    lora_layers = _count_lora_layers()
+    lora_layers = _count_lora_layers() if settings.FLUX_BACKEND == "diffusers" else -1
     if settings.LORA_SELFTEST:
         _lora_selftest()
     _log_versions()
@@ -612,7 +675,8 @@ def load_models() -> None:
     if low_vram and settings.GPU_SLOTS > 1:
         logger.warning("Low free VRAM - running with 1 GPU slot (CPU-offload mode cannot run concurrent jobs).")
     try:
-        te_has_lora = any(hasattr(m, "lora_A") for m in pipe.text_encoder.modules())
+        te_has_lora = settings.FLUX_BACKEND == "diffusers" and any(
+            hasattr(m, "lora_A") for m in pipe.text_encoder.modules())
     except Exception:
         te_has_lora = True
     shared = {} if te_has_lora else dict(text_encoder=pipe.text_encoder, tokenizer=pipe.tokenizer, vae=pipe.vae)
@@ -635,9 +699,10 @@ def load_models() -> None:
                 break
             try:
                 logger.info("Loading GPU slot %d (%s)...", i, attempt)
-                sp = Flux2KleinPipeline.from_pretrained(settings.FLUX_MODEL, dtype=torch.bfloat16, **comps)
+                sp = _load_flux_pipeline(comps)
                 sp.to("cuda")
-                sp.load_lora_weights(settings.LORA, weight_name=settings.LORA_FILE, adapter_name="bfs")
+                if settings.FLUX_BACKEND == "diffusers":
+                    sp.load_lora_weights(settings.LORA, weight_name=settings.LORA_FILE, adapter_name="bfs")
                 sp.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
                     sp.scheduler.config, shift=1.0, use_dynamic_shifting=False)
                 st = GpuSlot(i, sp, {"scale": 1.0, "mode": _LORA["mode"]})
@@ -1863,7 +1928,11 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                     generator=torch.Generator("cuda").manual_seed(seed + k),
                 ).images[0]
             slot.stream.synchronize()
-            torch.cuda.empty_cache()
+            # Keeping the allocator cache avoids repeated CUDA allocations between
+            # candidates and between concurrent slots. Let the allocator retain
+            # memory for the next quantized generation.
+            if settings.FLUX_BACKEND == "diffusers":
+                torch.cuda.empty_cache()
             g = time.time() - tg
 
             tv = time.time()

@@ -117,6 +117,7 @@ async def health_check():
         "val_worker_running": worker_ready,
         "lora_layers_attached": pipeline.lora_layers,
         "lora_mode": pipeline._LORA["mode"],
+        "flux_backend": settings.FLUX_BACKEND,
         "gpu_slots": len(pipeline.slots),
         "gpu_slots_requested": settings.GPU_SLOTS,
         "settings": {"steps": settings.STEPS, "cfg": settings.CFG, "style_mode": settings.STYLE_MODE,
