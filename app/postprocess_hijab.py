@@ -380,3 +380,38 @@ def fix_hijab_avatar(
         return _pil(bgr), rep
     except Exception as e:  # fail-soft by design
         return out_img, {"postfix": f"failed: {type(e).__name__}: {e}"}
+
+
+def fix_hijab_colour_only(out_img: Image.Image, out_face: Optional[Box], target_lab, strength: float = 1.0,
+                          max_shift: float = 28.0) -> Tuple[Image.Image, Dict]:
+    """Colour-only hijab fix: moves the hue/chroma (a, b) of the hijab cloth the model painted towards the user's
+    hijab colour and keeps its light/shade (L), so folds and sheen stay. No smoothing, no painting of patches.
+    Never raises: returns the original image on any problem."""
+    try:
+        if target_lab is None or strength <= 0 or not out_face or out_face[2] < 60:
+            return out_img, {"hijab_colour": "skipped"}
+        bgr = _bgr(out_img)
+        lab = _lab(bgr)
+        cand = _hijab_mask(bgr, out_face)
+        a, b = lab[..., 1], lab[..., 2]
+        chroma = np.hypot(a, b)
+        # cloth = soft/low-chroma pixels; skin (warm, b clearly above a) and saturated jacket pixels are left alone
+        skin = (b > a + 6.0) & (chroma > 18.0)
+        cloth = cand & (chroma < 28.0) & ~skin & (lab[..., 0] > 40.0)
+        cur = _median_lab(lab, cloth, 1500)
+        if cur is None:
+            return out_img, {"hijab_colour": "skipped (no cloth pixels)"}
+        d_a, d_b = float(target_lab[1] - cur[1]), float(target_lab[2] - cur[2])
+        n = float(np.hypot(d_a, d_b))
+        if n > max_shift:
+            d_a, d_b = d_a * max_shift / n, d_b * max_shift / n
+        d_a, d_b = d_a * strength, d_b * strength
+        m = _soft(cloth.astype(np.float32), 4)
+        lab2 = lab.copy()
+        lab2[..., 1] = a + d_a * m
+        lab2[..., 2] = b + d_b * m
+        return _pil(_from_lab(lab2)), {"hijab_colour_shift_ab": [round(d_a, 1), round(d_b, 1)],
+                                       "hijab_cloth_from_Lab": [round(float(v), 1) for v in cur]}
+    except Exception as e:  # pragma: no cover - fail soft
+        return out_img, {"hijab_colour": f"failed: {e}"}
+

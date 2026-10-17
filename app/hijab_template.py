@@ -26,6 +26,17 @@ _FACE_1000 = ((440, 395), (115, 150))
 HIJAB_CHROMA_BOOST = 1.5
 
 
+def boosted_chroma_factor(lab) -> float:
+    """Pale cloth gets the full boost (FLUX washes it out); an already saturated colour gets none, so a strong
+    pink / blue is not pushed past what the photo shows. Linear between chroma 20 (full) and 40 (none)."""
+    try:
+        c = float(np.hypot(float(lab[1]), float(lab[2])))
+    except Exception:
+        return 1.0
+    t = min(max((40.0 - c) / 20.0, 0.0), 1.0)
+    return 1.0 + (HIJAB_CHROMA_BOOST - 1.0) * t
+
+
 def _lab(rgb: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(rgb.astype(np.float32) / 255.0, cv2.COLOR_RGB2LAB)
 
@@ -58,7 +69,8 @@ def recolor_hijab_template(img: Image.Image, hijab_lab: Optional[Sequence[float]
         t = np.clip((L0 - lo) / max(hi - lo, 1.0), 0, 1)                   # fold shading 0 (deep) .. 1 (lit)
         tL, ta, tb = [float(c) for c in hijab_lab]
         # FLUX washes pastel cloth out towards grey/beige, so push the target chroma up a little
-        ta, tb = ta * HIJAB_CHROMA_BOOST, tb * HIJAB_CHROMA_BOOST
+        _k = boosted_chroma_factor(hijab_lab)
+        ta, tb = ta * _k, tb * _k
         new = lab.copy()
         new[..., 0] = np.clip(tL * (0.55 + 0.55 * t), 0, 100)             # keep folds, centred on the user's L
         new[..., 1] = ta * (0.75 + 0.35 * t)

@@ -157,13 +157,15 @@ async def process_image_file(image_path: Path, overrides: Optional[dict] = None)
 # Persistent ArcFace embedding worker state
 _VW = {"p": None}
 _VLOCK = threading.RLock()
-_POOL = ThreadPoolExecutor(max_workers=1)
+_VW_ALL: list = []          # every scoring worker process
+_VW_FREE: "queue.Queue" = queue.Queue()   # idle workers
+_POOL = ThreadPoolExecutor(max_workers=max(1, int(getattr(settings, 'VAL_WORKERS', 1))))
 
-def close_val_worker() -> None:
-    with _VLOCK:
-        p = _VW.get("p")
-        _VW["p"] = None
-        if p is not None and p.poll() is None:
+def _kill_worker(p) -> None:
+    if p is None:
+        return
+    try:
+        if p.poll() is None:
             try:
                 p.stdin.close()
             except Exception:
@@ -176,15 +178,26 @@ def close_val_worker() -> None:
                     p.kill()
                 except Exception:
                     pass
+    except Exception:
+        pass
+
+def close_val_worker() -> None:
+    with _VLOCK:
+        procs = list(_VW_ALL)
+        _VW_ALL.clear()
+        _VW["p"] = None
+        while True:
+            try:
+                _VW_FREE.get_nowait()
+            except Exception:
+                break
+    for p in procs:
+        _kill_worker(p)
 
 atexit.register(close_val_worker)
 
-def get_val_worker() -> subprocess.Popen:
-    with _VLOCK:
-        p = _VW.get("p")
-        if p is not None and p.poll() is None:
-            return p
-
+def _start_val_worker() -> subprocess.Popen:
+    if True:
         env = {
             **os.environ,
             "CUDA_VISIBLE_DEVICES": "-1",
@@ -229,14 +242,31 @@ def get_val_worker() -> subprocess.Popen:
                 break
 
         if not ready or p.poll() is not None:
-            close_val_worker()
+            _kill_worker(p)
             raise RuntimeError(
                 f"DeepFace embedding worker failed to start - see {settings.WORKER_LOG}"
             )
 
-        _VW["p"] = p
         logger.info("DeepFace embedding worker ready.")
         return p
+
+
+def get_val_worker() -> subprocess.Popen:
+    """Starts the scoring worker pool (VAL_WORKERS processes) on first use; returns one live worker."""
+    with _VLOCK:
+        alive = [p for p in _VW_ALL if p.poll() is None]
+        if alive and len(alive) == len(_VW_ALL):
+            return alive[0]
+        close_val_worker()
+        n = max(1, int(getattr(settings, "VAL_WORKERS", 1)))
+        for _ in range(n):
+            p = _start_val_worker()
+            _VW_ALL.append(p)
+            _VW_FREE.put(p)
+        _VW["p"] = _VW_ALL[0]
+        if n > 1:
+            logger.info("DeepFace scoring pool: %d workers", n)
+        return _VW_ALL[0]
 
 # ============================================================================
 # Speed options (all controlled from .env, default OFF)
@@ -577,8 +607,7 @@ def get_cuda_device_name() -> Optional[str]:
     return None
 
 def is_val_worker_alive() -> bool:
-    p = _VW.get("p")
-    return p is not None and p.poll() is None
+    return any(p.poll() is None for p in list(_VW_ALL))
 
 lora_layers = 0
 
@@ -2087,22 +2116,42 @@ def embed(img: Image.Image, enforce: bool = True, name: str = "out") -> Optional
     )
     im.save(temp_path)
     try:
-        with _VLOCK:
-            try:
-                p = get_val_worker()
-                p.stdin.write(json.dumps({"img": str(temp_path), "enforce": bool(enforce)}) + "\n")
-                p.stdin.flush()
-                while True:
-                    line = p.stdout.readline()
-                    if not line:
-                        close_val_worker()
-                        return None
-                    if line.startswith("__JSON__"):
-                        r = json.loads(line[len("__JSON__"):])
-                        break
-            except BaseException:
-                close_val_worker()
-                raise
+        if not _VW_ALL:
+            get_val_worker()                # starts the pool on first use
+        p = _VW_FREE.get()                  # wait for an idle scoring worker (each handles one request at a time)
+        broken = False
+        try:
+            p.stdin.write(json.dumps({"img": str(temp_path), "enforce": bool(enforce)}) + "\n")
+            p.stdin.flush()
+            while True:
+                line = p.stdout.readline()
+                if not line:
+                    broken = True
+                    r = None
+                    break
+                if line.startswith("__JSON__"):
+                    r = json.loads(line[len("__JSON__"):])
+                    break
+        except BaseException:
+            broken = True
+            raise
+        finally:
+            if broken:
+                with _VLOCK:
+                    if p in _VW_ALL:
+                        _VW_ALL.remove(p)
+                _kill_worker(p)
+                try:                        # replace the dead worker so the pool keeps its size
+                    np_ = _start_val_worker()
+                    with _VLOCK:
+                        _VW_ALL.append(np_)
+                    _VW_FREE.put(np_)
+                except Exception as _exc:
+                    logger.warning("could not restart a scoring worker: %s", _exc)
+            else:
+                _VW_FREE.put(p)
+        if r is None:
+            return None
         if "error" in r or not r.get("faces"):
             return None
         return {"faces": r["faces"], "width": im.width, "height": im.height}
@@ -2125,6 +2174,29 @@ def _face_box(emb_res, target_w: int, target_h: int):
         return (int(f["x"] * sx), int(f["y"] * sy), int(f["w"] * sx), int(f["h"] * sy))
     except Exception:
         return None
+
+
+def _apply_hijab_colour_only(out: Image.Image, face: Image.Image, user_emb, rec: dict) -> Image.Image:
+    """Moves only the hue/chroma of the painted hijab cloth to the user's hijab colour. Fail-soft."""
+    try:
+        from app.postprocess_hijab import fix_hijab_colour_only
+        from app.hijab_template import sample_user_hijab_lab, boosted_chroma_factor
+        ub = _face_box(user_emb, face.width, face.height) if user_emb else None
+        hlab = sample_user_hijab_lab(face, ub) if ub else None
+        if hlab is None:
+            rec["hijab_colour_post"] = "skipped (no user hijab colour)"
+            return out
+        o = embed(out, True, "fix") or embed(out, False, "fix")
+        ob = _face_box(o, out.width, out.height) if o else None
+        _k = boosted_chroma_factor(hlab)
+        target = [float(hlab[0]), float(hlab[1]) * _k, float(hlab[2]) * _k]
+        fixed, rep = fix_hijab_colour_only(out, ob, target, settings.HIJAB_COLOR_POST_STRENGTH)
+        rec["hijab_colour_post"] = {k: v for k, v in rep.items() if isinstance(v, (int, float, str, bool, list))}
+        logger.info("Hijab colour post-fix: %s", rep)
+        return fixed
+    except Exception as e:
+        logger.warning("hijab colour post-fix failed (kept original): %s", e)
+        return out
 
 
 def _apply_hijab_postfix(out: Image.Image, face: Image.Image, user_emb, rec: dict, key_for_debug=None,
@@ -2456,6 +2528,8 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                 break
 
         out, v = best["out"], best["v"]
+        if info.get("hijab") and settings.HIJAB_COLOR_POST and not settings.HIJAB_POSTFIX:
+            out = _apply_hijab_colour_only(out, face, user_emb, rec)
         if info.get("hijab") and settings.HIJAB_POSTFIX:
             out = _apply_hijab_postfix(out, face, user_emb, rec, key_for_debug=locals().get("dbg"))
         elif info.get("avatar") in settings.SKIN_POSTFIX_AVATARS:

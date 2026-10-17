@@ -118,6 +118,7 @@ class Settings(BaseSettings):
     # FLUX transformer (~18 GB bf16); the text encoder + VAE are shared between slots.
     SLOT_PEAK_GB: float = 19.0       # activation memory one running job can peak at; after loading, slots are trimmed until free VRAM >= slots x this (OOM guard)
     OOM_RETRY: bool = True           # on a CUDA out-of-memory error during generation: free the cache, wait, retry that candidate once
+    VAL_WORKERS: int = 1             # persistent DeepFace/ArcFace scoring processes (CPU). 1 = old behaviour; with GPU_SLOTS=3 use 3 so slots do not queue for scoring
     SCHED_SHIFT: float = 1.0         # FlowMatch scheduler shift. 1.0 = unchanged; 1.5-2.0 spends more of the few steps on face structure (identity)
     VAE_COMPILE: bool = False        # torch.compile the VAE decoder (falls back to the normal decode if compile fails)
     GPU_SLOTS: int = 2               # 0 = AUTO: keep adding slots while at least SLOT_MIN_FREE_GB VRAM stays free (max 8)
@@ -170,6 +171,8 @@ class Settings(BaseSettings):
     SKIN_POSTFIX_SMOOTH: float = 0.35
     SKIN_POSTFIX_MATCH: float = 0.6
     HIJAB_POSTFIX: bool = True  # pixel post-process for hijab avatars (skin smooth/tone match, neck-cowl recolour)
+    HIJAB_COLOR_POST: bool = True    # colour-only fix of the hijab cloth after generation (keeps shading, no smoothing/painting)
+    HIJAB_COLOR_POST_STRENGTH: float = 1.0
     HIJAB_SKIN_SMOOTH: float = 0.8
     HIJAB_SKIN_MATCH: float = 0.6
     HIJAB_COLOR_MATCH: float = 0.85
