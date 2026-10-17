@@ -410,13 +410,25 @@ def _hijab_patch_mask(bgr, lab, box: Box, cloth: np.ndarray) -> np.ndarray:
     zone[:max(0, min(H, int(y + 1.0 * h))), :] = True
     face = _ellipse(bgr.shape, box, 1.12, 1.1) > 0.5
     # red rim reaches ~16 px beyond the cloth edge; black only counts INSIDE the cloth outline (outside it is the real background)
-    cand_px = ((red & near) | (dark & closed)) & zone & ~face & ~blue_near
+    # a wider closing rounds off the ragged outline: black bites / notches cut into the cloth edge are filled, while the
+    # open background outside the hijab (far wider than the kernel) is left alone
+    k2 = max(25, int(0.30 * w)) | 1
+    closed2 = cv2.morphologyEx(main.astype(np.uint8), cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k2, k2))) > 0
+    # red: inside the cloth outline always; in the ~16 px ring outside it only for small blobs. A big red component is the
+    # emblem frame, which may touch the hijab - for those only a thin ~6 px rim (the red rim light) is taken.
+    n_r, lbl_r, st_r, _ = cv2.connectedComponentsWithStats((red & zone).astype(np.uint8), connectivity=8)
+    big_r = np.zeros(n_r, bool)
+    big_r[1:] = st_r[1:, cv2.CC_STAT_AREA] >= 0.025 * w * h
+    r6 = max(5, int(0.04 * w)) | 1
+    near6 = cv2.dilate(main.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r6, r6))) > 0
+    red_ok = red & np.where(big_r[lbl_r], near6, closed | near)
+    cand_px = (red_ok | (dark & closed2)) & zone & ~face & ~blue_near
     n1, lbl1, st1, _ = cv2.connectedComponentsWithStats(cand_px.astype(np.uint8), connectivity=8)
     keep1 = np.zeros(n1, bool)
     keep1[1:] = st1[1:, cv2.CC_STAT_AREA] >= 12
     patch = keep1[lbl1] & cand_px
     patch = cv2.dilate(patch.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))) > 0
-    return patch & (near | closed) & zone & ~face & ~blue_near
+    return patch & (near | closed2) & zone & ~face & ~blue_near
 
 
 def _fill_cloth_L(lab: np.ndarray, known: np.ndarray) -> np.ndarray:
