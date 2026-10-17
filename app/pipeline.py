@@ -2202,7 +2202,7 @@ def _apply_hijab_colour_only(out: Image.Image, face: Image.Image, user_emb, rec:
             return out
         o = embed(out, True, "fix") or embed(out, False, "fix")
         ob = _face_box(o, out.width, out.height) if o else None
-        _k = boosted_chroma_factor(hlab)   # pale cloth is sampled greyer than it looks: lift it a little
+        _k = float(settings.HIJAB_CHROMA_SCALE)   # 1.0 = the user's exact colour
         target = [float(hlab[0]), float(hlab[1]) * _k, float(hlab[2]) * _k]
         # the model paints the template's BLACK hijab: recolour that dark cloth (face / glasses / jacket untouched),
         # then let the colour-only fix handle any hijab that was painted in a light colour already
@@ -2402,7 +2402,7 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                         avatar = recolor_hijab_template(avatar, quantize_lab(hlab))
                         images[0] = avatar
                     # name the colour from the same (pale-corrected) target the post-fix paints, so prompt and pixels agree
-                    _kc = boosted_chroma_factor(hlab)
+                    _kc = float(settings.HIJAB_CHROMA_SCALE)
                     info["hijab_colour"] = hijab_colour_name([float(hlab[0]), float(hlab[1]) * _kc, float(hlab[2]) * _kc])
                 logger.info("Hijab template recolour: colour=%s Lab=%s", info.get("hijab_colour"),
                             None if hlab is None else [round(float(c), 1) for c in hlab])

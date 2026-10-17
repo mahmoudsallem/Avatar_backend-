@@ -164,6 +164,7 @@ class Settings(BaseSettings):
     # Recolour the hijab template's black hijab + neck drape to the user's own hijab colour before generation
     # (app/hijab_template.py). Fixes the black neck drape and the magenta drift at the source.
     HIJAB_TEMPLATE_RECOLOR: bool = True
+    HIJAB_CHROMA_SCALE: float = 1.0   # 1.0 = exactly the user's sampled hijab colour; >1 = more vivid, <1 = paler
     HIJAB_COLOR_PROMPT: bool = True   # tell the model the user's hijab colour in the prompt (template stays black)
     # Skin-only clean-up (light smoothing, shine removal, tone nudged toward the user's real skin) for these avatars.
     # No hijab recolour / drape painting - that is HIJAB_POSTFIX, kept off.
