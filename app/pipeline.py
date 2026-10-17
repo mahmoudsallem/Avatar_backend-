@@ -362,9 +362,19 @@ def apply_speed_options(slot: "GpuSlot") -> None:
                 enabled = {torch.float16}
             else:
                 enabled = {torch.bfloat16}
-            p.transformer.compile(backend="tensorrt", dynamic=False,
-                                  options={"enabled_precisions": enabled, "min_block_size": 5,
-                                           "truncate_double": True, "use_python_runtime": True})
+            trt_opts = {"enabled_precisions": enabled, "min_block_size": 5,
+                        "truncate_double": True, "use_python_runtime": True}
+            if settings.TRT_ENGINE_CACHE_DIR:
+                cache_dir = str(Path(settings.TRT_ENGINE_CACHE_DIR).resolve() / f"{prec}")
+                Path(cache_dir).mkdir(parents=True, exist_ok=True)
+                trt_opts.update({"cache_built_engines": True, "reuse_cached_engines": True, "engine_cache_dir": cache_dir})
+            try:
+                p.transformer.compile(backend="tensorrt", dynamic=False, options=trt_opts)
+            except Exception as exc:
+                logger.warning("TensorRT engine-cache options not accepted (%s) - compiling without the cache", exc)
+                for k in ("cache_built_engines", "reuse_cached_engines", "engine_cache_dir"):
+                    trt_opts.pop(k, None)
+                p.transformer.compile(backend="tensorrt", dynamic=False, options=trt_opts)
             logger.info("Slot %d: transformer compiled with TensorRT (%s) - first call per shape builds the engine (slow)", slot.idx, prec)
         else:
             p.transformer.compile(mode=settings.COMPILE_MODE, dynamic=False)
@@ -560,12 +570,20 @@ def _load_nunchaku_transformer():
     transformer.set_lora_strength(settings.LORA_STRENGTH)
     return transformer
 
+_DIRECT_GPU_OK = False   # set in load_models(): True only when there is enough free VRAM (not CPU-offload mode)
+
 def _load_flux_pipeline(shared=None):
     from diffusers import Flux2KleinPipeline
     if settings.FLUX_BACKEND == "nunchaku":
         return Flux2KleinPipeline.from_pretrained(
             settings.NUNCHAKU_MODEL, torch_dtype=torch.bfloat16,
             transformer=_load_nunchaku_transformer(), **(shared or {}))
+    if settings.LOAD_DIRECT_TO_GPU and _DIRECT_GPU_OK:
+        try:
+            return Flux2KleinPipeline.from_pretrained(
+                settings.FLUX_MODEL, dtype=torch.bfloat16, device_map="cuda", **(shared or {}))
+        except Exception as exc:
+            logger.warning("Direct-to-GPU load failed (%s) - falling back to CPU RAM load + .to('cuda')", exc)
     return Flux2KleinPipeline.from_pretrained(
         settings.FLUX_MODEL, dtype=torch.bfloat16, **(shared or {}))
 
@@ -657,6 +675,8 @@ def load_models() -> None:
     free_gb, total_gb = get_gpu_memory_info()
     free_gb_val = free_gb if free_gb is not None else 0.0
     low_vram = free_gb_val < 45.0
+    global _DIRECT_GPU_OK
+    _DIRECT_GPU_OK = not low_vram
     logger.info(
         "GPU free VRAM: %s / %s GB -> %s",
         f"{free_gb_val:.1f}",
@@ -684,7 +704,7 @@ def load_models() -> None:
     pipe = _load_flux_pipeline()
     if low_vram:
         pipe.enable_model_cpu_offload()
-    else:
+    elif getattr(pipe, "hf_device_map", None) is None:   # loaded with device_map="cuda" -> already on the GPU (diffusers rejects .to() then)
         pipe.to("cuda")
 
     # Decode the final image in tiles instead of one giant allocation - this is what was
@@ -747,7 +767,8 @@ def load_models() -> None:
             try:
                 logger.info("Loading GPU slot %d (%s)...", i, attempt)
                 sp = _load_flux_pipeline(comps)
-                sp.to("cuda")
+                if getattr(sp, "hf_device_map", None) is None:
+                    sp.to("cuda")
                 if settings.FLUX_BACKEND == "diffusers":
                     sp.load_lora_weights(settings.LORA, weight_name=settings.LORA_FILE, adapter_name="bfs")
                 sp.scheduler = FlowMatchEulerDiscreteScheduler.from_config(

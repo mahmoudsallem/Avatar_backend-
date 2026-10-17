@@ -129,6 +129,8 @@ class Settings(BaseSettings):
     COMPILE_TRANSFORMER: bool = False  # torch.compile the FLUX transformer (use together with FUSE_LORA; slow first start)
     COMPILE_MODE: str = "default"      # "default" | "max-autotune-no-cudagraphs" (inductor only)
     COMPILE_BACKEND: str = "inductor"  # "inductor" | "tensorrt" (torch-tensorrt; diffusers backend + FUSE_LORA only, NOT with nunchaku)
+    LOAD_DIRECT_TO_GPU: bool = True   # diffusers backend: load the FLUX weights straight onto the GPU (device_map="cuda") instead of into CPU RAM first, then .to("cuda")
+    TRT_ENGINE_CACHE_DIR: str = "trt_cache"  # TensorRT engines are saved here and reused on the next start (first start builds them: slow)
     TRT_PRECISION: str = "bf16"        # COMPILE_BACKEND=tensorrt only: "bf16" (default) | "fp16" (transformer cast to fp16; checked for NaN/black output at warm-up)
     WARMUP_AT_STARTUP: bool = True     # with COMPILE_TRANSFORMER: compile every template shape before serving
     CUDNN_ENABLED: bool = False        # the old code forced cuDNN off; True may speed up the VAE convolutions
