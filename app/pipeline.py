@@ -71,6 +71,19 @@ pipe = None
 # mode "adapters" : strength set with pipe.set_adapters(["bfs"], [w])            (fallback if the kwarg has no effect)
 _LORA = {"scale": 1.0, "mode": "kwargs"}
 
+def looks_corrupted(img) -> bool:
+    """True for a failed generation (static / half-denoised noise). The avatar template's four corners are pure black
+    (measured on 69 good outputs: corner mean <= 0.3); a broken denoise leaves them grey and grainy (mean ~50)."""
+    try:
+        a = np.asarray(img.convert("L"), dtype=np.float32)
+        H, W = a.shape
+        k = max(8, int(0.08 * min(H, W)))
+        c = np.concatenate([a[:k, :k].ravel(), a[:k, -k:].ravel(), a[-k:, :k].ravel(), a[-k:, -k:].ravel()])
+        return bool(c.mean() > 8.0 or c.std() > 6.0)
+    except Exception:
+        return False
+
+
 class GpuSlot:
     """One independent FLUX pipeline (own transformer + LoRA state + scheduler + CUDA stream).
     A request owns a slot for the whole of Step 2, so several avatars generate at once."""
@@ -2397,6 +2410,7 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                 logger.warning("hijab template recolour failed (kept black template): %s", e)
 
         best, k, gen_s, val_s, stopped = None, 0, 0.0, 0.0, "all tries"
+        bad_tries = 0   # corrupted (noise) generations thrown away so far
         t_loop = time.time()
 
         progress = tqdm(total=max_k, desc=f"Generating avatar ({user_path.name})", unit="try")
@@ -2428,7 +2442,7 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                             height=h,
                             num_inference_steps=steps,
                             guidance_scale=cfg,
-                            generator=torch.Generator("cuda").manual_seed(seed + k),
+                            generator=torch.Generator("cuda").manual_seed(seed + k + 1000 * bad_tries),
                         ).images[0]
                     break
                 except Exception as _gen_exc:
@@ -2449,6 +2463,15 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
             if settings.FLUX_BACKEND == "diffusers":
                 torch.cuda.empty_cache()
             g = time.time() - tg
+
+            if looks_corrupted(out) and bad_tries < 2:
+                bad_tries += 1
+                gen_s += g
+                logger.warning("Try %d on slot %d came out as noise (corrupted generation) - discarded, regenerating "
+                               "with a new seed (%d/2)", k + 1, slot.idx, bad_tries)
+                if dbg is not None:
+                    out.save(dbg / f"corrupt{bad_tries}_try{k + 1}.png")
+                continue
 
             tv = time.time()
             user_emb = fut.result() if fut is not None else None
