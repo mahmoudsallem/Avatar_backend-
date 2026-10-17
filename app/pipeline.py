@@ -1604,9 +1604,10 @@ def _women_tune(p: str, info, ref: bool) -> str:
             hijab=" and inside the hijab opening" if hijab else ""), 1)
     col = info.get("hijab_colour")
     if hijab and col and HIJAB_USER in p:
-        p = p.replace(HIJAB_USER, f"HIJAB COLOUR: her hijab and the scarf over her neck and chest are {col}, exactly "
-                      f"as in Picture 1 and Picture 2, with the same colour saturation - clearly {col}, not washed out, "
-                      f"not grey and not beige. " + HIJAB_USER, 1)
+        p = p.replace(HIJAB_USER, f"HIJAB COLOUR (important): her whole hijab - the head covering AND the scarf over her neck and "
+                      f"chest - is {col}, the exact colour of the hijab in Picture 2. It is NOT black and NOT the dark "
+                      f"colour of Picture 1's hijab: repaint it fully in {col}, light and soft, same saturation as in "
+                      f"Picture 2, not washed out, not grey and not beige. " + HIJAB_USER, 1)
     if ref and info.get("avatar") in settings.VISOR_REF_CLEAN and VISOR_REF_TEXT in p:
         p = p.replace(VISOR_REF_TEXT, WOMEN_VISOR_REF, 1)
     return p
@@ -2375,17 +2376,21 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         # CPU embedding runs in thread while GPU generates try #1
         fut = _POOL.submit(embed_user, face) if settings.VALIDATE else None
 
-        if info.get("hijab") and settings.HIJAB_TEMPLATE_RECOLOR:
+        if info.get("hijab") and (settings.HIJAB_TEMPLATE_RECOLOR or settings.HIJAB_COLOR_PROMPT):
             try:
-                from app.hijab_template import recolor_hijab_template, sample_user_hijab_lab, quantize_lab
+                from app.hijab_template import (recolor_hijab_template, sample_user_hijab_lab, quantize_lab,
+                                                boosted_chroma_factor)
                 from app.postprocess_hijab import hijab_colour_name
                 ue = fut.result() if fut is not None else embed_user(face)
                 ub = _face_box(ue, face.width, face.height) if ue else None
                 hlab = sample_user_hijab_lab(face, ub) if ub else None
                 if hlab is not None:
-                    avatar = recolor_hijab_template(avatar, quantize_lab(hlab))
-                    images[0] = avatar
-                    info["hijab_colour"] = hijab_colour_name(hlab)
+                    if settings.HIJAB_TEMPLATE_RECOLOR:
+                        avatar = recolor_hijab_template(avatar, quantize_lab(hlab))
+                        images[0] = avatar
+                    # name the colour from the same (pale-corrected) target the post-fix paints, so prompt and pixels agree
+                    _kc = boosted_chroma_factor(hlab)
+                    info["hijab_colour"] = hijab_colour_name([float(hlab[0]), float(hlab[1]) * _kc, float(hlab[2]) * _kc])
                 logger.info("Hijab template recolour: colour=%s Lab=%s", info.get("hijab_colour"),
                             None if hlab is None else [round(float(c), 1) for c in hlab])
             except Exception as e:
