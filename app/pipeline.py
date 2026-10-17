@@ -1504,6 +1504,18 @@ HIJAB_VISOR_NOTE = (
     "visor MUST be clearly visible on her face. "
 )
 
+def hijab_colour_phrase(info) -> Optional[str]:
+    """The user's hijab colour for the prompt: the colour word PLUS its exact hex / RGB and a lightness word, so the model
+    gets a precise target and not just 'pink'. None when there is no sampled colour."""
+    col = info.get("hijab_colour")
+    if not col:
+        return None
+    hx, rgb, light = info.get("hijab_hex"), info.get("hijab_rgb"), info.get("hijab_light")
+    if not hx:
+        return col
+    return f"{col} ({light + ', ' if light else ''}hex {hx}, RGB {rgb[0]} {rgb[1]} {rgb[2]})"
+
+
 HIJAB_USER = (
     "she wears her own hijab from Picture 2, copied exactly: the same fabric colors (including any two-tone or "
     "lighter under-scarf), the same sheen and soft folds, wrapped the same way tightly around the face with the "
@@ -1615,12 +1627,13 @@ def _women_tune(p: str, info, ref: bool) -> str:
     if VISOR_FIT in p:
         p = p.replace(VISOR_FIT, VISOR_FIT + WOMEN_VISOR_FIT.format(
             hijab=" and inside the hijab opening" if hijab else ""), 1)
-    col = info.get("hijab_colour")
+    col = hijab_colour_phrase(info)
     if hijab and col and HIJAB_USER in p:
-        p = p.replace(HIJAB_USER, f"HIJAB COLOUR (important): her whole hijab - the head covering AND the scarf over her neck and "
-                      f"chest - is {col}, the exact colour of the hijab in Picture 2. It is NOT black and NOT the dark "
-                      f"colour of Picture 1's hijab: repaint it fully in {col}, light and soft, same saturation as in "
-                      f"Picture 2, not washed out, not grey and not beige. " + HIJAB_USER, 1)
+        p = p.replace(HIJAB_USER, f"HIJAB COLOUR (mandatory): her whole hijab - the head covering AND the scarf over her neck and "
+                      f"chest - is {col}, the exact colour of the hijab in Picture 2. Use exactly this colour on every part "
+                      f"of the hijab, light and shade it naturally. It is NOT black, NOT the dark hijab of Picture 1, and NOT "
+                      f"grey, beige or brown: repaint the template's black hijab fully in this colour, with the same "
+                      f"saturation as Picture 2. " + HIJAB_USER, 1)
     if ref and info.get("avatar") in settings.VISOR_REF_CLEAN and VISOR_REF_TEXT in p:
         p = p.replace(VISOR_REF_TEXT, WOMEN_VISOR_REF, 1)
     return p
@@ -1758,7 +1771,7 @@ def _build_prompt_v3(info, attempt=0, ref=False, keep_user_expression=True, hair
     if attempt > 0:
         visor += VISOR_RETRY
     if is_hijab:
-        col = info.get("hijab_colour")
+        col = hijab_colour_phrase(info)
         hij = V3_HIJAB.format(
             colour=(col + " " if col else ""),
             colour_rule=(f"the hijab is {col}, not black" if col else "the hijab takes the colour of Picture 2's hijab, not the black of the template"),
@@ -1852,6 +1865,8 @@ def _build_prompt_core(info, attempt=0, ref=False, style_mode=None, keep_user_ex
         return tune(
             f"{head}{IDENTITY_TXT}{BUILD}{V}{HIJAB_VISOR_NOTE}"
             f"{HIJAB_FACE}{HIJAB_USER}{FACE_CLEAN}{style_text} {closing} the visor is present and fits her face."
+            + (f" final colour check: her hijab and the scarf on her neck and chest are {_hc}, exactly the hijab colour of "
+               f"Picture 2, on every part of the fabric, never black." if (_hc := hijab_colour_phrase(info)) else "")
         )
     if info.get("gender") == "Woman":
         return tune(
@@ -2403,7 +2418,17 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                         images[0] = avatar
                     # name the colour from the same (pale-corrected) target the post-fix paints, so prompt and pixels agree
                     _kc = float(settings.HIJAB_CHROMA_SCALE)
-                    info["hijab_colour"] = hijab_colour_name([float(hlab[0]), float(hlab[1]) * _kc, float(hlab[2]) * _kc])
+                    _tl = [float(hlab[0]), float(hlab[1]) * _kc, float(hlab[2]) * _kc]
+                    info["hijab_colour"] = hijab_colour_name(_tl)
+                    try:
+                        _rgb = cv2.cvtColor(np.array([[_tl]], np.float32), cv2.COLOR_LAB2RGB)[0, 0]
+                        _rgb = [int(round(float(np.clip(c, 0, 1)) * 255)) for c in _rgb]
+                        info["hijab_rgb"] = _rgb
+                        info["hijab_hex"] = "#%02X%02X%02X" % tuple(_rgb)
+                        info["hijab_light"] = ("very light" if _tl[0] >= 78 else "light" if _tl[0] >= 62 else
+                                               "medium" if _tl[0] >= 45 else "dark")
+                    except Exception:
+                        pass
                 logger.info("Hijab template recolour: colour=%s Lab=%s", info.get("hijab_colour"),
                             None if hlab is None else [round(float(c), 1) for c in hlab])
             except Exception as e:
