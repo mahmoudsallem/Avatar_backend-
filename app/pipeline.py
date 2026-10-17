@@ -1504,21 +1504,9 @@ HIJAB_VISOR_NOTE = (
     "visor MUST be clearly visible on her face. "
 )
 
-def hijab_colour_phrase(info) -> Optional[str]:
-    """The user's hijab colour for the prompt: the colour word PLUS its exact hex / RGB and a lightness word, so the model
-    gets a precise target and not just 'pink'. None when there is no sampled colour."""
-    col = info.get("hijab_colour")
-    if not col:
-        return None
-    hx, rgb, light = info.get("hijab_hex"), info.get("hijab_rgb"), info.get("hijab_light")
-    if not hx:
-        return col
-    return f"{col} ({light + ', ' if light else ''}hex {hx}, RGB {rgb[0]} {rgb[1]} {rgb[2]})"
-
-
 HIJAB_USER = (
-    "she wears her own hijab from Picture 2, copied exactly: the same single solid fabric colour on the whole hijab "
-    "(one uniform colour, never two-tone, never patchy), the same sheen and soft folds, wrapped the same way tightly around the face with the "
+    "she wears her own hijab from Picture 2, copied exactly: the same fabric colors (including any two-tone or "
+    "lighter under-scarf), the same sheen and soft folds, wrapped the same way tightly around the face with the "
     "edge sitting at the same place on the forehead, cheeks and under the chin, covering all hair, both ears and the "
     "neck, then falling in soft drapes onto the shoulders and chest and flowing into the jacket collar of Picture 1. "
     "no hair visible, no pins, brooches or patterns added, the fabric is not changed to another color. only her head "
@@ -1601,6 +1589,18 @@ WOMEN_VISOR_FIT = (
     "edge of her cheek, so the visor does not stick out past her face. "
 )
 
+# Hijab avatars keep the EXACT wording of the good hijab run (run_20261016_233752): soft clean skin, no red-rim-light line,
+# original visor-fit text. Non-hijab women keep the newer crisp wording above.
+WOMEN_SKIN_HIJAB = (
+    "keep her real age and her natural skin tone, painted as smooth, clean, softly shaded skin with only the smile "
+    "lines that are clearly visible in Picture 2. "
+)
+WOMEN_VISOR_FIT_HIJAB = (
+    "the visor is fitted to her face like real glasses: its width matches her face from temple to temple, the top "
+    "edge sits just under her eyebrows, the lower edge rests on the top of her cheeks, and the outer corners end at "
+    "her temples, inside the outline of her face{hijab}. "
+)
+
 WOMEN_VISOR_REF = (
     "Picture 3 shows the exact visor on its own: copy its shape (straight top edge, angular faceted corners, thin "
     "electric-blue frame, cyan corner blocks, clear see-through lens) and scale it to fit her face. "
@@ -1608,29 +1608,39 @@ WOMEN_VISOR_REF = (
 
 def _women_tune(p: str, info, ref: bool) -> str:
     hijab = bool(info.get("hijab", False))
-    p = p.replace(WOMEN_SKIN_OLD, WOMEN_SKIN_NEW)
-    # id_focus wording "softly shaded skin" -> crisp, like the male avatars (women and hijab only)
-    p = p.replace("painted with softly shaded skin that keeps the visible skin texture",
-                  "painted with crisp, clearly defined skin shading that keeps the visible skin texture and strong contrast")
-    # skin style: leave the shared style text exactly as the men get it (no softening) - only the wrinkle list goes
-    p = (
-        p.replace("keep the natural age, forehead lines, smile lines, under-eye detail and any grey in the hair of "
-                  "Picture 2;", "keep the natural age and smile of Picture 2;")
-        .replace("the visor is exactly the large angular futuristic shield worn in Picture 1",
-                 "the visor is exactly the angular futuristic shield worn in Picture 1")
-        .replace("broad faceted outer corners", "compact faceted outer corners")
-    )
+    if hijab:
+        p = p.replace(WOMEN_SKIN_OLD, WOMEN_SKIN_HIJAB)
+        p = (
+            p.replace("painted with softly shaded skin that keeps the visible skin texture",
+                      "painted with smooth, clean, softly shaded skin")
+            .replace("painted with smooth airbrushed skin and soft realistic shading",
+                     "painted with smooth, clean, softly shaded skin")
+            .replace("keep the natural age, forehead lines, smile lines, under-eye detail and any grey in the hair of "
+                     "Picture 2;", "keep the natural age and smile of Picture 2;")
+            .replace("the visor is exactly the large angular futuristic shield worn in Picture 1",
+                     "the visor is exactly the angular futuristic shield worn in Picture 1")
+            .replace("broad faceted outer corners", "compact faceted outer corners")
+        )
+    else:
+        p = p.replace(WOMEN_SKIN_OLD, WOMEN_SKIN_NEW)
+        # id_focus wording "softly shaded skin" -> crisp, like the male avatars
+        p = p.replace("painted with softly shaded skin that keeps the visible skin texture",
+                      "painted with crisp, clearly defined skin shading that keeps the visible skin texture and strong contrast")
+        # skin style: leave the shared style text exactly as the men get it (no softening) - only the wrinkle list goes
+        p = (
+            p.replace("keep the natural age, forehead lines, smile lines, under-eye detail and any grey in the hair of "
+                      "Picture 2;", "keep the natural age and smile of Picture 2;")
+            .replace("the visor is exactly the large angular futuristic shield worn in Picture 1",
+                     "the visor is exactly the angular futuristic shield worn in Picture 1")
+            .replace("broad faceted outer corners", "compact faceted outer corners")
+        )
     if "BUILD: match" in p:
         p = p.replace("BUILD: match", WOMEN_EYES + "BUILD: match", 1)
     else:
         p = WOMEN_EYES + p
     if VISOR_FIT in p:
-        p = p.replace(VISOR_FIT, VISOR_FIT + WOMEN_VISOR_FIT.format(
-            hijab=" and inside the hijab opening" if hijab else ""), 1)
-    col = hijab_colour_phrase(info)
-    if hijab and col and HIJAB_USER in p:
-        p = p.replace(HIJAB_USER, f"The whole hijab is {col}, from its forehead border to its chest drape, "
-                      f"with natural folds shaded in that same hue. " + HIJAB_USER, 1)
+        _fit = WOMEN_VISOR_FIT_HIJAB if hijab else WOMEN_VISOR_FIT
+        p = p.replace(VISOR_FIT, VISOR_FIT + _fit.format(hijab=" and inside the hijab opening" if hijab else ""), 1)
     if ref and info.get("avatar") in settings.VISOR_REF_CLEAN and VISOR_REF_TEXT in p:
         p = p.replace(VISOR_REF_TEXT, WOMEN_VISOR_REF, 1)
     return p
@@ -1731,7 +1741,7 @@ V3_HIJAB = (
     "soft folds, wrapped snugly around the face with the "
     "edge in the same place on the forehead, cheeks and under the chin, covering all hair, ears and neck. the "
     "scarf then falls over the shoulders and chest in soft shaded folds of the same fabric and colour as the "
-    "head covering, shaded only with lighter and darker tones of that same colour, and tucks into the jacket collar of Picture 1 "
+    "head covering, lit by the red and blue lights of the jacket, and tucks into the jacket collar of Picture 1 "
     "with no flat patches. only her head and hijab "
     "come from Picture 2; her clothes and background do not. the visor sits inside the hijab opening, no wider "
     "than the face, with its arms resting at the temples, and the hijab edge above the eyebrows stays visible. "
@@ -1768,10 +1778,10 @@ def _build_prompt_v3(info, attempt=0, ref=False, keep_user_expression=True, hair
     if attempt > 0:
         visor += VISOR_RETRY
     if is_hijab:
-        col = hijab_colour_phrase(info)
+        col = info.get("hijab_colour")
         hij = V3_HIJAB.format(
             colour=(col + " " if col else ""),
-            colour_rule=(f"the hijab is {col} throughout" if col else "the hijab takes the fabric colour of Picture 2's hijab throughout"),
+            colour_rule=(f"the hijab is {col}, not black" if col else "the hijab takes the colour of Picture 2's hijab, not the black of the template"),
         )
         p = V3_HEAD + ident + V3_FEMALE + V3_BUILD + hij + visor + V3_STYLE + V3_CLOSING
     elif is_woman:
@@ -1789,28 +1799,8 @@ def lora_prompt(text: str) -> str:
     t = (settings.LORA_TRIGGER or "").strip()
     return f"{t}, {text}" if t and not text.lstrip().startswith(t) else text
 
-def _hijab_lock(p: str, info) -> str:
-    """Put one concrete fabric-colour instruction before the long identity/style prompt."""
-    for old in ("a strong red rim light along the hair, forehead and cheek edge",
-                "a strong red rim light along the hair, forehead, cheek and jaw edge",
-                "a red rim light along the hair"):
-        p = p.replace(old, "a strong red rim light along the skin edge of the forehead and cheek only (never on the hijab cloth)")
-    p = p.replace("lit by the red rim light and cool blue fill light", "the skin lit by the red rim light and cool blue fill light")
-    p = p.replace("lit by the red and blue lights of the jacket", "shaded only with tones of its own colour")
-    colour = hijab_colour_phrase(info) or "the fabric colour of the hijab in Picture 2"
-    colour_rule = (
-        f"HIJAB FABRIC: use {colour} across every visible section of the same scarf: crown, forehead border, "
-        "temple folds, sides, under-chin wrap, neck and chest drape. Keep one continuous fabric hue throughout; "
-        "show folds with lighter and darker values of that hue. Keep the fabric border clean and the hair covered. "
-        "The red and blue lighting belongs to the face, visor, jacket and emblem. "
-    )
-    return colour_rule + p
-
 def build_prompt(info, attempt=0, ref=False, style_mode=None, keep_user_expression=None, hair_retry=False):
-    p = _build_prompt_core(info, attempt, ref, style_mode, keep_user_expression, hair_retry)
-    if info.get("hijab", False):
-        p = _hijab_lock(p, info)
-    return lora_prompt(p)
+    return lora_prompt(_build_prompt_core(info, attempt, ref, style_mode, keep_user_expression, hair_retry))
 
 def _build_prompt_core(info, attempt=0, ref=False, style_mode=None, keep_user_expression=None, hair_retry=False):
     if style_mode is None:
@@ -1882,8 +1872,6 @@ def _build_prompt_core(info, attempt=0, ref=False, style_mode=None, keep_user_ex
         return tune(
             f"{head}{IDENTITY_TXT}{BUILD}{V}{HIJAB_VISOR_NOTE}"
             f"{HIJAB_FACE}{HIJAB_USER}{FACE_CLEAN}{style_text} {closing} the visor is present and fits her face."
-            + (f" final colour check: her hijab and the scarf on her neck and chest are {_hc}, exactly the hijab colour of "
-               f"Picture 2, on every part of the fabric, never black." if (_hc := hijab_colour_phrase(info)) else "")
         )
     if info.get("gender") == "Woman":
         return tune(
@@ -2222,37 +2210,6 @@ def _face_box(emb_res, target_w: int, target_h: int):
         return None
 
 
-def _apply_hijab_colour_only(out: Image.Image, face: Image.Image, user_emb, rec: dict) -> Image.Image:
-    """Moves only the hue/chroma of the painted hijab cloth to the user's hijab colour. Fail-soft."""
-    try:
-        from app.postprocess_hijab import fix_hijab_colour_only
-        from app.hijab_template import sample_user_hijab_lab, boosted_chroma_factor
-        ub = _face_box(user_emb, face.width, face.height) if user_emb else None
-        hlab = sample_user_hijab_lab(face, ub) if ub else None
-        o = embed(out, True, "fix") or embed(out, False, "fix")
-        ob = _face_box(o, out.width, out.height) if o else None
-        if ob is None:
-            # face box not found on the output: the template's face sits in the same place in every avatar
-            W_, H_ = out.size
-            ob = (int(0.333 * W_), int(0.208 * H_), int(0.224 * W_), int(0.337 * H_))
-            rec["hijab_colour_post_box"] = "template fallback"
-        _k = float(settings.HIJAB_CHROMA_SCALE)   # 1.0 = the user's exact colour
-        # no user hijab colour: keep the colour the model painted (target=None) but still repaint red / black patches on the cloth
-        target = [float(hlab[0]), float(hlab[1]) * _k, float(hlab[2]) * _k] if hlab is not None else None
-        # the model paints the template's BLACK hijab: recolour that dark cloth (face / glasses / jacket untouched),
-        # then let the colour-only fix handle any hijab that was painted in a light colour already
-        from app.hijab_template import recolor_hijab_template
-        if target is not None:
-            out = recolor_hijab_template(out, target)
-        fixed, rep = fix_hijab_colour_only(out, ob, target, settings.HIJAB_COLOR_POST_STRENGTH)
-        rec["hijab_colour_post"] = {k: v for k, v in rep.items() if isinstance(v, (int, float, str, bool, list))}
-        logger.info("Hijab colour post-fix: %s", rep)
-        return fixed
-    except Exception as e:
-        logger.warning("hijab colour post-fix failed (kept original): %s", e)
-        return out
-
-
 def _apply_hijab_postfix(out: Image.Image, face: Image.Image, user_emb, rec: dict, key_for_debug=None,
                          skin_only: bool = False) -> Image.Image:
     """Skin smoothing / tone match + neck-drape recolour for hijab avatars. Fail-soft: returns `out` on any problem."""
@@ -2425,36 +2382,6 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         # CPU embedding runs in thread while GPU generates try #1
         fut = _POOL.submit(embed_user, face) if settings.VALIDATE else None
 
-        if info.get("hijab") and (settings.HIJAB_TEMPLATE_RECOLOR or settings.HIJAB_COLOR_PROMPT):
-            try:
-                from app.hijab_template import (recolor_hijab_template, sample_user_hijab_lab, quantize_lab,
-                                                boosted_chroma_factor)
-                from app.postprocess_hijab import hijab_colour_name
-                ue = fut.result() if fut is not None else embed_user(face)
-                ub = _face_box(ue, face.width, face.height) if ue else None
-                hlab = sample_user_hijab_lab(face, ub) if ub else None
-                if hlab is not None:
-                    if settings.HIJAB_TEMPLATE_RECOLOR:
-                        avatar = recolor_hijab_template(avatar, quantize_lab(hlab))
-                        images[0] = avatar
-                    # name the colour from the same (pale-corrected) target the post-fix paints, so prompt and pixels agree
-                    _kc = float(settings.HIJAB_CHROMA_SCALE)
-                    _tl = [float(hlab[0]), float(hlab[1]) * _kc, float(hlab[2]) * _kc]
-                    info["hijab_colour"] = hijab_colour_name(_tl)
-                    try:
-                        _rgb = cv2.cvtColor(np.array([[_tl]], np.float32), cv2.COLOR_LAB2RGB)[0, 0]
-                        _rgb = [int(round(float(np.clip(c, 0, 1)) * 255)) for c in _rgb]
-                        info["hijab_rgb"] = _rgb
-                        info["hijab_hex"] = "#%02X%02X%02X" % tuple(_rgb)
-                        info["hijab_light"] = ("very light" if _tl[0] >= 78 else "light" if _tl[0] >= 62 else
-                                               "medium" if _tl[0] >= 45 else "dark")
-                    except Exception:
-                        pass
-                logger.info("Hijab template recolour: colour=%s Lab=%s", info.get("hijab_colour"),
-                            None if hlab is None else [round(float(c), 1) for c in hlab])
-            except Exception as e:
-                logger.warning("hijab template recolour failed (kept black template): %s", e)
-
         best, k, gen_s, val_s, stopped = None, 0, 0.0, 0.0, "all tries"
         bad_tries = 0   # corrupted (noise) generations thrown away so far
         t_loop = time.time()
@@ -2606,8 +2533,6 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                 break
 
         out, v = best["out"], best["v"]
-        if info.get("hijab") and settings.HIJAB_COLOR_POST and not settings.HIJAB_POSTFIX:
-            out = _apply_hijab_colour_only(out, face, user_emb, rec)
         if info.get("hijab") and settings.HIJAB_POSTFIX:
             out = _apply_hijab_postfix(out, face, user_emb, rec, key_for_debug=locals().get("dbg"))
         elif info.get("avatar") in settings.SKIN_POSTFIX_AVATARS:
