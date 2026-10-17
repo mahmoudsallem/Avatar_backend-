@@ -115,6 +115,9 @@ _COLOUR_NAMES = [  # (name, sRGB) - nearest in Lab; used to tell the text prompt
     ("olive green", (110, 120, 60)), ("green", (50, 140, 80)), ("mint green", (170, 220, 195)), ("teal", (40, 130, 135)),
     ("light blue", (160, 200, 235)), ("blue", (50, 90, 190)), ("navy blue", (30, 40, 90)),
     ("lilac", (190, 160, 215)), ("purple", (110, 60, 150)), ("plum", (95, 40, 85)),
+    # soft pinks the plain list missed (a pale rosy hijab was being called "beige" and came out grey)
+    ("blush pink", (222, 175, 168)), ("pale rose pink", (228, 190, 196)), ("peach pink", (238, 190, 165)),
+    ("salmon pink", (232, 150, 140)), ("rose pink", (205, 115, 130)),
 ]
 
 

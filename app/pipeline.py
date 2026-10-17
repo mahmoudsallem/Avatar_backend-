@@ -1576,7 +1576,8 @@ def _women_tune(p: str, info, ref: bool) -> str:
     col = info.get("hijab_colour")
     if hijab and col and HIJAB_USER in p:
         p = p.replace(HIJAB_USER, f"HIJAB COLOUR: her hijab and the scarf over her neck and chest are {col}, exactly "
-                      f"as in Picture 1 and Picture 2. " + HIJAB_USER, 1)
+                      f"as in Picture 1 and Picture 2, with the same colour saturation - clearly {col}, not washed out, "
+                      f"not grey and not beige. " + HIJAB_USER, 1)
     if ref and info.get("avatar") in settings.VISOR_REF_CLEAN and VISOR_REF_TEXT in p:
         p = p.replace(VISOR_REF_TEXT, WOMEN_VISOR_REF, 1)
     return p

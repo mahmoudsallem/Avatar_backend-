@@ -23,6 +23,9 @@ _POLY_1000 = [
 _FACE_1000 = ((440, 395), (115, 150))
 
 
+HIJAB_CHROMA_BOOST = 1.5
+
+
 def _lab(rgb: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(rgb.astype(np.float32) / 255.0, cv2.COLOR_RGB2LAB)
 
@@ -54,6 +57,8 @@ def recolor_hijab_template(img: Image.Image, hijab_lab: Optional[Sequence[float]
         lo, hi = np.percentile(L0[fabric > 0], [5, 97]) if fabric.sum() > 1000 else (0.0, 40.0)
         t = np.clip((L0 - lo) / max(hi - lo, 1.0), 0, 1)                   # fold shading 0 (deep) .. 1 (lit)
         tL, ta, tb = [float(c) for c in hijab_lab]
+        # FLUX washes pastel cloth out towards grey/beige, so push the target chroma up a little
+        ta, tb = ta * HIJAB_CHROMA_BOOST, tb * HIJAB_CHROMA_BOOST
         new = lab.copy()
         new[..., 0] = np.clip(tL * (0.55 + 0.55 * t), 0, 100)             # keep folds, centred on the user's L
         new[..., 1] = ta * (0.75 + 0.35 * t)
@@ -116,6 +121,11 @@ def sample_user_hijab_lab(user: Image.Image, box) -> Optional[np.ndarray]:
                     break
         if counts[k] < 0.25 * len(lab):        # no dominant colour -> do not guess
             return None
-        return centers[k]
+        c = centers[k].copy()
+        # warm indoor light makes pale pink cloth read tan: when the cloth is a soft, rosy colour (a > 0) whose yellow
+        # (b) is stronger than its red (a), pull b back towards a so it stays pink instead of turning beige
+        if c[1] > 6.0 and c[2] > 0.6 * c[1] and np.hypot(c[1], c[2]) < 35.0:
+            c[2] = 0.6 * c[1]
+        return c
     except Exception:
         return None
