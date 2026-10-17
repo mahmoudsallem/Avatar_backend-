@@ -1,3 +1,6 @@
+import os
+# Less allocator fragmentation = fewer CUDA OOMs with several concurrent GPU slots. Must be set before torch is imported.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import sys
 import uuid
 import base64

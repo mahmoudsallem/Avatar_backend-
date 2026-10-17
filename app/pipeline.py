@@ -324,6 +324,37 @@ def _make_transformer_fp16(tr) -> None:
     tr.register_forward_hook(lambda m, a, kw, out: _to_dtype(out, torch.bfloat16), with_kwargs=True)
     tr._fp16_wrapped = True
 
+_COMPILE_DISABLED = False   # set when TensorRT fails to import; skips the compile warm-up
+
+def _prepare_tensorrt_libs() -> None:
+    """The pip TensorRT wheels keep their .so files in site-packages/tensorrt_libs, which is usually NOT on
+    LD_LIBRARY_PATH, so torch_tensorrt cannot find libnvinfer / libnvonnxparser. Preload them (global symbols) first."""
+    import ctypes, glob, importlib.util
+    dirs = []
+    for mod in ("tensorrt_libs",):
+        try:
+            spec = importlib.util.find_spec(mod)
+        except Exception:
+            spec = None
+        if spec is not None and spec.submodule_search_locations:
+            dirs += [str(d) for d in spec.submodule_search_locations]
+    if dirs:   # torch_tensorrt searches the directories listed in LD_LIBRARY_PATH (read when it is imported)
+        cur = os.environ.get("LD_LIBRARY_PATH", "")
+        add = [d for d in dirs if d not in cur.split(":")]
+        if add:
+            os.environ["LD_LIBRARY_PATH"] = ":".join(add + ([cur] if cur else []))
+    pending = sorted(n for d in dirs for n in glob.glob(os.path.join(d, "libnv*.so*")))
+    for _ in range(3):   # a few passes: a library may need another one that is loaded later in the list
+        failed = []
+        for name in pending:
+            try:
+                ctypes.CDLL(name, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                failed.append(name)
+        pending = failed
+        if not pending:
+            break
+
 def apply_speed_options(slot: "GpuSlot") -> None:
     p = slot.pipe
     if settings.FLUX_BACKEND == "nunchaku" and (settings.FUSE_LORA or settings.COMPILE_TRANSFORMER):
@@ -351,10 +382,18 @@ def apply_speed_options(slot: "GpuSlot") -> None:
             logger.warning("COMPILE_TRANSFORMER without a fused LoRA recompiles for every LoRA strength - "
                            "enable FUSE_LORA with a uniform ID_LORA_SCHEDULE.")
         if settings.COMPILE_BACKEND == "tensorrt":
+            global _COMPILE_DISABLED
             try:
+                _prepare_tensorrt_libs()
                 import torch_tensorrt  # noqa: F401  (registers the "tensorrt" torch.compile backend)
-            except ImportError as exc:
-                raise RuntimeError("COMPILE_BACKEND=tensorrt needs: pip install torch-tensorrt (matching your torch/CUDA)") from exc
+            except Exception as exc:
+                # A missing/mismatched TensorRT install must not take the whole service down: run uncompiled instead.
+                _COMPILE_DISABLED = True
+                logger.error(
+                    "TensorRT could not be loaded (%s: %s). Continuing WITHOUT TensorRT - the transformer is NOT compiled. "
+                    "Fix: make the TensorRT .so files visible (see tensorrt_libs in site-packages / LD_LIBRARY_PATH) or set "
+                    "COMPILE_TRANSFORMER=false.", type(exc).__name__, str(exc).splitlines()[0][:200])
+                return
             # mode and options are mutually exclusive in torch.compile; bf16 keeps the numerics of the plain path
             prec = (settings.TRT_PRECISION or "bf16").lower()
             if prec == "fp16":
@@ -382,7 +421,7 @@ def apply_speed_options(slot: "GpuSlot") -> None:
 
 def warmup_slots() -> None:
     """Run each template through each slot once so torch.compile builds every shape before the first request."""
-    if not (settings.COMPILE_TRANSFORMER and settings.WARMUP_AT_STARTUP):
+    if not (settings.COMPILE_TRANSFORMER and settings.WARMUP_AT_STARTUP) or _COMPILE_DISABLED:
         return
     for slot in slots:
         for key in ("Man", "Woman", "Woman_Hijab"):
@@ -659,6 +698,24 @@ def _lora_selftest() -> None:
         "ignore the user's photo. Check diffusers / peft / transformers versions (see env_report.py)."
     )
 
+def _trim_slots_for_headroom() -> None:
+    """OOM guard: every running job needs ~SLOT_PEAK_GB of activation memory on top of the loaded weights.
+    Drop the last slot(s) until the free VRAM left after loading covers all concurrent jobs."""
+    import gc as _gc
+    while len(slots) > 1:
+        free_now, _t = get_gpu_memory_info()
+        need = len(slots) * float(settings.SLOT_PEAK_GB)
+        if free_now is None or free_now >= need:
+            break
+        dropped = slots.pop()
+        msg = (f"slot {dropped.idx} dropped to avoid CUDA OOM: {free_now:.1f} GB free < {len(slots) + 1} slots x "
+               f"SLOT_PEAK_GB={settings.SLOT_PEAK_GB} GB")
+        logger.warning(msg)
+        slot_errors.append(msg)
+        del dropped
+        _gc.collect()
+        torch.cuda.empty_cache()
+
 def load_models() -> None:
     global clip, pipe
 
@@ -786,6 +843,8 @@ def load_models() -> None:
         if sp is None:
             logger.warning("Could not load GPU slot %d - continuing with %d slot(s).", i, len(slots))
             break
+    sp = st = None  # drop the loop references so a trimmed slot's memory can really be freed
+    _trim_slots_for_headroom()
     for s in slots:
         apply_speed_options(s)
     _slot_q = asyncio.Queue()
@@ -2242,17 +2301,29 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
             prompt = build_prompt(info, attempt=k, ref=visor_ref is not None, style_mode=style_mode, hair_retry=(prev_hair == "bald"))
 
             tg = time.time()
-            with torch.no_grad(), torch.cuda.stream(slot.stream):
-                out = slot.pipe(
-                    **prompt_inputs(slot, prompt),
-                    image=images,
-                    attention_kwargs=slot.lora_kwargs(),
-                    width=w,
-                    height=h,
-                    num_inference_steps=steps,
-                    guidance_scale=cfg,
-                    generator=torch.Generator("cuda").manual_seed(seed + k),
-                ).images[0]
+            for _oom_try in (0, 1):
+                try:
+                    with torch.no_grad(), torch.cuda.stream(slot.stream):
+                        out = slot.pipe(
+                            **prompt_inputs(slot, prompt),
+                            image=images,
+                            attention_kwargs=slot.lora_kwargs(),
+                            width=w,
+                            height=h,
+                            num_inference_steps=steps,
+                            guidance_scale=cfg,
+                            generator=torch.Generator("cuda").manual_seed(seed + k),
+                        ).images[0]
+                    break
+                except torch.cuda.OutOfMemoryError:
+                    if _oom_try or not settings.OOM_RETRY:
+                        raise
+                    logger.warning("CUDA out of memory on slot %d (try %d) - freeing the cache and retrying once", slot.idx, k + 1)
+                    slot.stream.synchronize()
+                    import gc as _gc
+                    _gc.collect()
+                    torch.cuda.empty_cache()
+                    time.sleep(2)
             slot.stream.synchronize()
             # Keeping the allocator cache avoids repeated CUDA allocations between
             # candidates and between concurrent slots. Let the allocator retain
