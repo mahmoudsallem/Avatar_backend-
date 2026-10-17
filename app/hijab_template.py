@@ -27,16 +27,9 @@ HIJAB_CHROMA_BOOST = 1.5
 
 
 def boosted_chroma_factor(lab) -> float:
-    """Pale cloth is sampled from shaded strips next to the face and reads much greyer than it looks in the photo
-    (and FLUX washes it out further). Lift a pale colour's chroma towards ~20; a colour that is already saturated
-    (chroma >= 20) is left as it is. Capped at x2.2 so a grey / white hijab is not tinted."""
-    try:
-        c = float(np.hypot(float(lab[1]), float(lab[2])))
-    except Exception:
-        return 1.0
-    if c >= 20.0:
-        return 1.0
-    return float(min(2.2, 20.0 / max(c, 6.0)))
+    """Kept for compatibility. NO boost any more: measured against the photos, the boost made a pale blush scarf about
+    twice as pink as the user's (a 18 vs 3-10), so the target is exactly the colour sampled from the photo."""
+    return 1.0
 
 
 def _lab(rgb: np.ndarray) -> np.ndarray:
@@ -136,10 +129,16 @@ def sample_user_hijab_lab(user: Image.Image, box) -> Optional[np.ndarray]:
         if counts[k] < 0.25 * len(lab):        # no dominant colour -> do not guess
             return None
         c = centers[k].copy()
+        # the strips hug the face and are partly shaded: take lightness from the lit part of the same-coloured pixels
+        same = np.hypot(lab[:, 1] - c[1], lab[:, 2] - c[2]) < 12.0
+        if int(same.sum()) >= 200:
+            c[0] = float(np.percentile(lab[same, 0], 70))
+            c[1] = float(np.median(lab[same, 1]))
+            c[2] = float(np.median(lab[same, 2]))
         # warm indoor light makes pale pink cloth read tan: when the cloth is a soft, rosy colour (a > 0) whose yellow
         # (b) is stronger than its red (a), pull b back towards a so it stays pink instead of turning beige
-        if c[1] > 6.0 and c[2] > 0.42 * c[1] and np.hypot(c[1], c[2]) < 35.0:
-            c[2] = 0.42 * c[1]
+        if c[1] > 6.0 and c[2] > 0.6 * c[1] and np.hypot(c[1], c[2]) < 35.0:
+            c[2] = 0.6 * c[1]
         return c
     except Exception:
         return None
