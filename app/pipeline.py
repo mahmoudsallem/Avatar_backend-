@@ -305,6 +305,25 @@ def _install_ref_cache(p) -> None:
 
     p._encode_vae_image = cached
 
+def _to_dtype(obj, dtype):
+    if torch.is_tensor(obj) and obj.is_floating_point():
+        return obj.to(dtype)
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_to_dtype(o, dtype) for o in obj)
+    if isinstance(obj, dict):
+        return {k: _to_dtype(v, dtype) for k, v in obj.items()}
+    return obj
+
+def _make_transformer_fp16(tr) -> None:
+    """Run the FLUX transformer in fp16 (for a TensorRT fp16 engine) while the rest of the pipeline stays bf16:
+    weights -> fp16, float inputs cast to fp16 on entry, outputs cast back to bf16. Needs the LoRA fused first."""
+    if getattr(tr, "_fp16_wrapped", False):
+        return
+    tr.to(torch.float16)
+    tr.register_forward_pre_hook(lambda m, a, kw: (_to_dtype(a, torch.float16), _to_dtype(kw, torch.float16)), with_kwargs=True)
+    tr.register_forward_hook(lambda m, a, kw, out: _to_dtype(out, torch.bfloat16), with_kwargs=True)
+    tr._fp16_wrapped = True
+
 def apply_speed_options(slot: "GpuSlot") -> None:
     p = slot.pipe
     if settings.FLUX_BACKEND == "nunchaku" and (settings.FUSE_LORA or settings.COMPILE_TRANSFORMER):
@@ -337,10 +356,16 @@ def apply_speed_options(slot: "GpuSlot") -> None:
             except ImportError as exc:
                 raise RuntimeError("COMPILE_BACKEND=tensorrt needs: pip install torch-tensorrt (matching your torch/CUDA)") from exc
             # mode and options are mutually exclusive in torch.compile; bf16 keeps the numerics of the plain path
+            prec = (settings.TRT_PRECISION or "bf16").lower()
+            if prec == "fp16":
+                _make_transformer_fp16(p.transformer)
+                enabled = {torch.float16}
+            else:
+                enabled = {torch.bfloat16}
             p.transformer.compile(backend="tensorrt", dynamic=False,
-                                  options={"enabled_precisions": {torch.bfloat16}, "min_block_size": 5,
+                                  options={"enabled_precisions": enabled, "min_block_size": 5,
                                            "truncate_double": True, "use_python_runtime": True})
-            logger.info("Slot %d: transformer compiled with TensorRT (bf16) - first call per shape builds the engine (slow)", slot.idx)
+            logger.info("Slot %d: transformer compiled with TensorRT (%s) - first call per shape builds the engine (slow)", slot.idx, prec)
         else:
             p.transformer.compile(mode=settings.COMPILE_MODE, dynamic=False)
             logger.info("Slot %d: transformer compiled (mode=%s) - first calls per shape are slow", slot.idx, settings.COMPILE_MODE)
@@ -359,10 +384,14 @@ def warmup_slots() -> None:
                 images = [avatar, face] + ([visor] if visor is not None else [])
                 slot.set_lora(settings.LORA_STRENGTH * settings.ID_LORA_MULT * settings.ID_LORA_SCHEDULE[0])
                 with torch.no_grad(), torch.cuda.stream(slot.stream):
-                    slot.pipe(prompt="warmup", image=images, attention_kwargs=slot.lora_kwargs(),
-                              width=avatar.size[0], height=avatar.size[1], num_inference_steps=2,
-                              guidance_scale=settings.CFG, generator=torch.Generator("cuda").manual_seed(0))
+                    wimg = slot.pipe(prompt="warmup", image=images, attention_kwargs=slot.lora_kwargs(),
+                                     width=avatar.size[0], height=avatar.size[1], num_inference_steps=2,
+                                     guidance_scale=settings.CFG, generator=torch.Generator("cuda").manual_seed(0)).images[0]
                 slot.stream.synchronize()
+                if settings.COMPILE_BACKEND == "tensorrt" and (settings.TRT_PRECISION or "").lower() == "fp16":
+                    if float(np.asarray(wimg.convert("L"), dtype=np.float32).std()) < 1.0:
+                        logger.error("TensorRT fp16 warm-up image for %s is flat/black - FLUX overflowed in fp16. "
+                                     "Set TRT_PRECISION=bf16.", key)
                 logger.info("Warm-up slot %d / %s done in %.1fs", slot.idx, key, time.time() - t0)
             except Exception:
                 logger.exception("Warm-up slot %d / %s failed (continuing)", slot.idx, key)
