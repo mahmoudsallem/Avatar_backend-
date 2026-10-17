@@ -67,6 +67,8 @@ class Settings(BaseSettings):
     NUNCHAKU_MODEL: str = "tonera/FLUX.2-klein-9B-Nunchaku"
     LORA: str = "sisniha/BFS-Best-Face-Swap"
     LORA_FILE: str = "bfs_head_v1_flux-klein_9b_step3500_rank128.safetensors"
+    # Trigger word put at the START of every prompt (empty = none). The SmartCharacterSwap LoRA needs "jhuangswap".
+    LORA_TRIGGER: str = ""
 
     # ---------------- Face Detection Rules ----------------
     FACE_DETECTOR: str = "retinaface"

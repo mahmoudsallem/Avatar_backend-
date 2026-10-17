@@ -552,7 +552,7 @@ def _lora_selftest() -> None:
         def gen_nunchaku(strength):
             pipe.transformer.set_lora_strength(strength)
             with torch.no_grad():
-                im = pipe(prompt="head_swap: replace the head in Picture 1 with the head from Picture 2.",
+                im = pipe(prompt=lora_prompt("head_swap: replace the head in Picture 1 with the head from Picture 2."),
                           image=[base, face], width=512, height=512, num_inference_steps=4,
                           guidance_scale=settings.CFG,
                           generator=torch.Generator("cuda").manual_seed(1)).images[0]
@@ -578,7 +578,7 @@ def _lora_selftest() -> None:
             pipe.set_adapters(["bfs"], adapter_weights=[1.0])
         with torch.no_grad():
             im = pipe(
-                prompt="head_swap: start with Picture 1 as the base image, replace the head with the head from Picture 2.",
+                prompt=lora_prompt("head_swap: start with Picture 1 as the base image, replace the head with the head from Picture 2."),
                 image=[base, face],
                 attention_kwargs={"scale": float(weight)} if kwargs_mode else None,
                 width=512, height=512, num_inference_steps=4, guidance_scale=settings.CFG,
@@ -1587,7 +1587,15 @@ def _build_prompt_v3(info, attempt=0, ref=False, keep_user_expression=True, hair
     return p
 
 
+def lora_prompt(text: str) -> str:
+    """Prepend the LoRA trigger word (settings.LORA_TRIGGER, e.g. "jhuangswap") when one is configured."""
+    t = (settings.LORA_TRIGGER or "").strip()
+    return f"{t}, {text}" if t and not text.lstrip().startswith(t) else text
+
 def build_prompt(info, attempt=0, ref=False, style_mode=None, keep_user_expression=None, hair_retry=False):
+    return lora_prompt(_build_prompt_core(info, attempt, ref, style_mode, keep_user_expression, hair_retry))
+
+def _build_prompt_core(info, attempt=0, ref=False, style_mode=None, keep_user_expression=None, hair_retry=False):
     if style_mode is None:
         style_mode = settings.STYLE_MODE
     if keep_user_expression is None:
