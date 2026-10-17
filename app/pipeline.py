@@ -1632,8 +1632,8 @@ def _women_tune(p: str, info, ref: bool) -> str:
         p = p.replace(HIJAB_USER, f"HIJAB COLOUR (mandatory): her whole hijab - the head covering AND the scarf over her neck and "
                       f"chest - is {col}, the exact colour of the hijab in Picture 2. Use exactly this colour on every part "
                       f"of the hijab, light and shade it naturally. It is NOT black, NOT the dark hijab of Picture 1, and NOT "
-                      f"grey, beige or brown: repaint the template's black hijab fully in this colour, with the same "
-                      f"saturation as Picture 2. " + HIJAB_USER, 1)
+                      f"grey, beige or brown: repaint the template's black hijab fully in this colour, including its red-lit "
+                      f"edges and folds, with the same saturation as Picture 2. " + HIJAB_USER, 1)
     if ref and info.get("avatar") in settings.VISOR_REF_CLEAN and VISOR_REF_TEXT in p:
         p = p.replace(VISOR_REF_TEXT, WOMEN_VISOR_REF, 1)
     return p
@@ -1793,10 +1793,13 @@ def lora_prompt(text: str) -> str:
     return f"{t}, {text}" if t and not text.lstrip().startswith(t) else text
 
 HIJAB_COLOUR_LOCK = (
-    " HIJAB COLOUR LOCK: the hijab is ONE uniform colour from the top of the head to the end of the scarf on the chest. "
-    "Shade its folds only with lighter and darker tones of that same colour. NO red, orange, blue, black or two-tone "
-    "patches, streaks, edges or spots on the hijab, and no rim light, neon glow or colour spill from the jacket, emblem "
-    "or background on the cloth - the rim and fill lights touch only the skin, never the hijab fabric."
+    " HIJAB COLOUR LOCK: the hijab of Picture 1 is black with RED edge lighting along its top edge, down its right side "
+    "and along the edge next to the face. Repaint all of it, the red-lit edges and red-lit folds included, in the user's "
+    "hijab colour: the hijab is ONE uniform colour from the top of the head to the end of the scarf on the chest. "
+    "Its edge highlight is a lighter tint of that same colour, never red. Shade the folds only with lighter and darker "
+    "tones of that colour. NO red, orange, blue, black or two-tone patches, streaks, edges or spots on the hijab, and no "
+    "rim light, neon glow or colour spill from the jacket, emblem or background on the cloth. The rim and fill lights "
+    "touch only the skin. The outline of the hijab is smooth and clean against the black background."
 )
 
 def _hijab_lock(p: str) -> str:
