@@ -397,18 +397,17 @@ def fix_hijab_colour_only(out_img: Image.Image, out_face: Optional[Box], target_
         chroma = np.hypot(a, b)
         # cloth = soft/low-chroma pixels; skin (warm, b clearly above a) and saturated jacket pixels are left alone
         skin = (b > a + 6.0) & (chroma > 18.0)
-        cloth = cand & (chroma < 36.0) & ~skin & (lab[..., 0] > 40.0)
+        tch = float(np.hypot(target_lab[1], target_lab[2]))
+        cloth = cand & (chroma < max(36.0, 1.6 * tch + 12.0)) & ~skin & (lab[..., 0] > 22.0)
         cur = _median_lab(lab, cloth, 1500)
         if cur is None:
             return out_img, {"hijab_colour": "skipped (no cloth pixels)"}
         # pink, not taupe: taupe = dark + yellow-ish. Keep the hue on the pink side (b clearly below a)
         t_a = float(target_lab[1])
         t_b = float(target_lab[2])
-        if t_a > 4.0:
-            t_b = min(t_b, 0.55 * t_a)
         # lighter cloth: the model paints the scarf darker than the real one, which is what reads as grey/taupe
-        d_L = float(np.clip((float(target_lab[0]) - cur[0]) * 0.6, -6.0, 14.0)) * strength
-        w = float(np.clip(0.75 * strength, 0.0, 1.0))
+        d_L = float(np.clip(float(target_lab[0]) - cur[0], -22.0, 22.0)) * strength
+        w = float(np.clip(strength, 0.0, 1.0))
         m = _soft(cloth.astype(np.float32), 4)
         lab2 = lab.copy()
         # per-pixel pull towards the target hue (flattens orange/brown patches too), L keeps the folds and sheen

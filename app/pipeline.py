@@ -2188,7 +2188,7 @@ def _apply_hijab_colour_only(out: Image.Image, face: Image.Image, user_emb, rec:
             return out
         o = embed(out, True, "fix") or embed(out, False, "fix")
         ob = _face_box(o, out.width, out.height) if o else None
-        _k = boosted_chroma_factor(hlab)
+        _k = 1.0   # exact user colour (the boost was only a guess for pale samples)
         target = [float(hlab[0]), float(hlab[1]) * _k, float(hlab[2]) * _k]
         fixed, rep = fix_hijab_colour_only(out, ob, target, settings.HIJAB_COLOR_POST_STRENGTH)
         rec["hijab_colour_post"] = {k: v for k, v in rep.items() if isinstance(v, (int, float, str, bool, list))}
