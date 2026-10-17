@@ -377,6 +377,24 @@ def apply_speed_options(slot: "GpuSlot") -> None:
                            slot.idx, settings.ATTENTION_BACKEND, exc)
     if settings.CACHE_REF_LATENTS:
         _install_ref_cache(p)
+    if settings.VAE_COMPILE:
+        try:
+            _orig_decode = p.vae.decode
+            _fast_decode = torch.compile(_orig_decode)
+            _state = {"ok": True}
+
+            def _safe_decode(*a, **k):
+                if _state["ok"]:
+                    try:
+                        return _fast_decode(*a, **k)
+                    except Exception as exc:
+                        _state["ok"] = False
+                        logger.warning("VAE compile failed (%s) - using the normal VAE decode", exc)
+                return _orig_decode(*a, **k)
+            p.vae.decode = _safe_decode
+            logger.info("Slot %d: VAE decode compiled", slot.idx)
+        except Exception as exc:
+            logger.warning("Slot %d: VAE_COMPILE skipped (%s)", slot.idx, exc)
     if settings.COMPILE_TRANSFORMER:
         if not slot.fused:
             logger.warning("COMPILE_TRANSFORMER without a fused LoRA recompiles for every LoRA strength - "
@@ -779,7 +797,7 @@ def load_models() -> None:
         pipe.load_lora_weights(settings.LORA, weight_name=settings.LORA_FILE, adapter_name="bfs")
     pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
         pipe.scheduler.config,
-        shift=1.0,
+        shift=settings.SCHED_SHIFT,
         use_dynamic_shifting=False,
     )
     global lora_layers
@@ -835,7 +853,7 @@ def load_models() -> None:
                 if settings.FLUX_BACKEND == "diffusers":
                     sp.load_lora_weights(settings.LORA, weight_name=settings.LORA_FILE, adapter_name="bfs")
                 sp.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
-                    sp.scheduler.config, shift=1.0, use_dynamic_shifting=False)
+                    sp.scheduler.config, shift=settings.SCHED_SHIFT, use_dynamic_shifting=False)
                 st = GpuSlot(i, sp, {"scale": 1.0, "mode": _LORA["mode"]})
                 if st.lora["mode"] == "adapters":
                     sp.set_adapters(["bfs"], adapter_weights=[1.0])

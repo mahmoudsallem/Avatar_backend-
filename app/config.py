@@ -118,6 +118,8 @@ class Settings(BaseSettings):
     # FLUX transformer (~18 GB bf16); the text encoder + VAE are shared between slots.
     SLOT_PEAK_GB: float = 19.0       # activation memory one running job can peak at; after loading, slots are trimmed until free VRAM >= slots x this (OOM guard)
     OOM_RETRY: bool = True           # on a CUDA out-of-memory error during generation: free the cache, wait, retry that candidate once
+    SCHED_SHIFT: float = 1.0         # FlowMatch scheduler shift. 1.0 = unchanged; 1.5-2.0 spends more of the few steps on face structure (identity)
+    VAE_COMPILE: bool = False        # torch.compile the VAE decoder (falls back to the normal decode if compile fails)
     GPU_SLOTS: int = 2               # 0 = AUTO: keep adding slots while at least SLOT_MIN_FREE_GB VRAM stays free (max 8)
     SLOT_MIN_FREE_GB: float = 44.0   # don't load another slot unless this much VRAM is still free (each running job peaks at ~19 GB of activations)
     ANALYSIS_CONCURRENCY: int = 4    # Step 1 (CPU subprocesses) running at once, outside the GPU slots
