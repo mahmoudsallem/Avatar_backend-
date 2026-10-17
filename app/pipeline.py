@@ -1802,6 +1802,14 @@ HIJAB_COLOUR_LOCK = (
     "touch only the skin. The outline of the hijab is smooth and clean against the black background."
 )
 
+# Short and first on purpose: the prompt is ~1300 words and the encoder weights early tokens most, so a rule that only sits at
+# the very end lost to the template's red-lit black hijab.
+HIJAB_COLOUR_HEAD = (
+    "HIJAB COLOUR (second priority after the face): the whole hijab is ONE flat uniform colour, the user's hijab colour, "
+    "with soft lighter and darker folds of that same colour only. No red, no black, no second colour anywhere on the "
+    "hijab, not even on its edges: the red edge light of Picture 1 never touches the hijab. "
+)
+
 def _hijab_lock(p: str) -> str:
     """Hijab avatars: the template style asks for a strong red rim light along the hair / forehead edge. On a hijab that red
     landed on the cloth as red patches and a mixed colour. Keep the rim light on the skin only and lock one hijab colour."""
@@ -1811,7 +1819,7 @@ def _hijab_lock(p: str) -> str:
         p = p.replace(old, "a strong red rim light along the skin edge of the forehead and cheek only (never on the hijab cloth)")
     p = p.replace("lit by the red rim light and cool blue fill light", "the skin lit by the red rim light and cool blue fill light")
     p = p.replace("lit by the red and blue lights of the jacket", "shaded only with tones of its own colour")
-    return p + HIJAB_COLOUR_LOCK
+    return HIJAB_COLOUR_HEAD + p + HIJAB_COLOUR_LOCK
 
 def build_prompt(info, attempt=0, ref=False, style_mode=None, keep_user_expression=None, hair_retry=False):
     p = _build_prompt_core(info, attempt, ref, style_mode, keep_user_expression, hair_retry)
