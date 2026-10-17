@@ -382,6 +382,59 @@ def fix_hijab_avatar(
         return out_img, {"postfix": f"failed: {type(e).__name__}: {e}"}
 
 
+def _hijab_patch_mask(bgr, lab, box: Box, cloth: np.ndarray) -> np.ndarray:
+    """Red / black patches that sit ON the hijab cloth (the template's red rim light and dark specks painted over the edge).
+    _hijab_mask() drops every red pixel as 'jacket', so those patches were never recoloured. A red/dark pixel counts as a
+    hijab patch only if it lies inside the closed outline of the cloth around the head, above the chin, outside the face and
+    visor: the red jacket, the emblem frame and the visor stay untouched."""
+    H, W = bgr.shape[:2]
+    x, y, w, h = box
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    hh, ss, vv = hsv[..., 0].astype(np.int32), hsv[..., 1].astype(np.int32), hsv[..., 2].astype(np.int32)
+    red = (ss > 130) & ((hh < 10) | (hh > 170)) & (vv > 60)
+    blue = (hh > 95) & (hh < 135) & (ss > 80) & (vv > 60)
+    blue_near = cv2.dilate(blue.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))) > 0
+    dark = (lab[..., 0] < 20.0) & ~blue_near
+    # only the main body of cloth (the head covering + drape), not stray pale lines of the emblem frame
+    se5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    core = cv2.morphologyEx(cloth.astype(np.uint8), cv2.MORPH_OPEN, se5)
+    n0, lbl0, st0, _ = cv2.connectedComponentsWithStats(core, connectivity=8)
+    if n0 <= 1:
+        return np.zeros((H, W), bool)
+    main = lbl0 == (1 + int(np.argmax(st0[1:, cv2.CC_STAT_AREA])))
+    k = max(15, int(0.14 * w)) | 1
+    closed = cv2.morphologyEx(main.astype(np.uint8), cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))) > 0
+    r = max(9, int(0.12 * w)) | 1   # ~16 px reach beyond the cloth edge: catches the red rim, stops short of the frame
+    near = cv2.dilate(closed.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r, r))) > 0
+    zone = np.zeros((H, W), bool)
+    zone[:max(0, min(H, int(y + 1.0 * h))), :] = True
+    face = _ellipse(bgr.shape, box, 1.12, 1.1) > 0.5
+    # red rim reaches ~16 px beyond the cloth edge; black only counts INSIDE the cloth outline (outside it is the real background)
+    cand_px = ((red & near) | (dark & closed)) & zone & ~face & ~blue_near
+    n1, lbl1, st1, _ = cv2.connectedComponentsWithStats(cand_px.astype(np.uint8), connectivity=8)
+    keep1 = np.zeros(n1, bool)
+    keep1[1:] = st1[1:, cv2.CC_STAT_AREA] >= 12
+    patch = keep1[lbl1] & cand_px
+    patch = cv2.dilate(patch.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))) > 0
+    return patch & (near | closed) & zone & ~face & ~blue_near
+
+
+def _fill_cloth_L(lab: np.ndarray, known: np.ndarray) -> np.ndarray:
+    """Smooth lightness of the surrounding cloth (normalised blur, widening until every patch pixel has a value)."""
+    L = lab[..., 0].astype(np.float32)
+    kn = known.astype(np.float32)
+    out = np.zeros_like(L)
+    done = np.zeros(L.shape, bool)
+    for sg in (5, 12, 28, 60):
+        num = cv2.GaussianBlur(L * kn, (0, 0), sg)
+        den = cv2.GaussianBlur(kn, (0, 0), sg)
+        ok = (den > 0.02) & ~done
+        out[ok] = num[ok] / den[ok]
+        done |= ok
+    out[~done] = L[~done]
+    return out
+
+
 def fix_hijab_colour_only(out_img: Image.Image, out_face: Optional[Box], target_lab, strength: float = 1.0,
                           max_shift: float = 28.0) -> Tuple[Image.Image, Dict]:
     """Colour-only hijab fix: moves the hue/chroma (a, b) of the hijab cloth the model painted towards the user's
@@ -408,15 +461,25 @@ def fix_hijab_colour_only(out_img: Image.Image, out_face: Optional[Box], target_
         # lighter cloth: the model paints the scarf darker than the real one, which is what reads as grey/taupe
         d_L = float(np.clip(float(target_lab[0]) - cur[0], -22.0, 22.0)) * strength
         w = float(np.clip(strength, 0.0, 1.0))
-        m = _soft(cloth.astype(np.float32), 4)
+        # red / black patches ON the hijab (red rim light, dark specks): repaint as cloth - lightness from the nearby cloth,
+        # hue/chroma straight to the user's hijab colour
+        patch = _hijab_patch_mask(bgr, lab, out_face, cloth)
+        patch_px = int(patch.sum())
+        L_base = lab[..., 0].copy()
+        mp = _soft(patch.astype(np.float32), 3)
+        if patch_px:
+            L_fill = _fill_cloth_L(lab, cloth & ~patch)
+            L_base = L_base * (1.0 - mp) + L_fill * mp
+        m = _soft((cloth | patch).astype(np.float32), 4)
         lab2 = lab.copy()
         # per-pixel pull towards the target hue (flattens orange/brown patches too), L keeps the folds and sheen
-        lab2[..., 1] = a + (t_a - a) * w * m
-        lab2[..., 2] = b + (t_b - b) * w * m
-        lab2[..., 0] = np.clip(lab[..., 0] + d_L * m, 0.0, 98.0)
+        wm = np.maximum(w * m, mp)   # patches always go fully to the user's colour
+        lab2[..., 1] = a + (t_a - a) * wm
+        lab2[..., 2] = b + (t_b - b) * wm
+        lab2[..., 0] = np.clip(L_base + d_L * m, 0.0, 98.0)
         return _pil(_from_lab(lab2)), {"hijab_colour_target_Lab": [round(float(target_lab[0]), 1), round(t_a, 1), round(t_b, 1)],
                                        "hijab_cloth_from_Lab": [round(float(v), 1) for v in cur],
-                                       "hijab_dL": round(d_L, 1), "hijab_w": round(w, 2)}
+                                       "hijab_dL": round(d_L, 1), "hijab_w": round(w, 2), "hijab_patch_px": patch_px}
     except Exception as e:  # pragma: no cover - fail soft
         return out_img, {"hijab_colour": f"failed: {e}"}
 
