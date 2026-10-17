@@ -27,14 +27,16 @@ HIJAB_CHROMA_BOOST = 1.5
 
 
 def boosted_chroma_factor(lab) -> float:
-    """Pale cloth gets the full boost (FLUX washes it out); an already saturated colour gets none, so a strong
-    pink / blue is not pushed past what the photo shows. Linear between chroma 20 (full) and 40 (none)."""
+    """Pale cloth is sampled from shaded strips next to the face and reads much greyer than it looks in the photo
+    (and FLUX washes it out further). Lift a pale colour's chroma towards ~20; a colour that is already saturated
+    (chroma >= 20) is left as it is. Capped at x2.2 so a grey / white hijab is not tinted."""
     try:
         c = float(np.hypot(float(lab[1]), float(lab[2])))
     except Exception:
         return 1.0
-    t = min(max((40.0 - c) / 20.0, 0.0), 1.0)
-    return 1.0 + (HIJAB_CHROMA_BOOST - 1.0) * t
+    if c >= 20.0:
+        return 1.0
+    return float(min(2.2, 20.0 / max(c, 6.0)))
 
 
 def _lab(rgb: np.ndarray) -> np.ndarray:

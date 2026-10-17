@@ -397,21 +397,27 @@ def fix_hijab_colour_only(out_img: Image.Image, out_face: Optional[Box], target_
         chroma = np.hypot(a, b)
         # cloth = soft/low-chroma pixels; skin (warm, b clearly above a) and saturated jacket pixels are left alone
         skin = (b > a + 6.0) & (chroma > 18.0)
-        cloth = cand & (chroma < 28.0) & ~skin & (lab[..., 0] > 40.0)
+        cloth = cand & (chroma < 36.0) & ~skin & (lab[..., 0] > 40.0)
         cur = _median_lab(lab, cloth, 1500)
         if cur is None:
             return out_img, {"hijab_colour": "skipped (no cloth pixels)"}
-        d_a, d_b = float(target_lab[1] - cur[1]), float(target_lab[2] - cur[2])
-        n = float(np.hypot(d_a, d_b))
-        if n > max_shift:
-            d_a, d_b = d_a * max_shift / n, d_b * max_shift / n
-        d_a, d_b = d_a * strength, d_b * strength
+        # pink, not taupe: taupe = dark + yellow-ish. Keep the hue on the pink side (b clearly below a)
+        t_a = float(target_lab[1])
+        t_b = float(target_lab[2])
+        if t_a > 4.0:
+            t_b = min(t_b, 0.55 * t_a)
+        # lighter cloth: the model paints the scarf darker than the real one, which is what reads as grey/taupe
+        d_L = float(np.clip((float(target_lab[0]) - cur[0]) * 0.6, -6.0, 14.0)) * strength
+        w = float(np.clip(0.75 * strength, 0.0, 1.0))
         m = _soft(cloth.astype(np.float32), 4)
         lab2 = lab.copy()
-        lab2[..., 1] = a + d_a * m
-        lab2[..., 2] = b + d_b * m
-        return _pil(_from_lab(lab2)), {"hijab_colour_shift_ab": [round(d_a, 1), round(d_b, 1)],
-                                       "hijab_cloth_from_Lab": [round(float(v), 1) for v in cur]}
+        # per-pixel pull towards the target hue (flattens orange/brown patches too), L keeps the folds and sheen
+        lab2[..., 1] = a + (t_a - a) * w * m
+        lab2[..., 2] = b + (t_b - b) * w * m
+        lab2[..., 0] = np.clip(lab[..., 0] + d_L * m, 0.0, 98.0)
+        return _pil(_from_lab(lab2)), {"hijab_colour_target_Lab": [round(float(target_lab[0]), 1), round(t_a, 1), round(t_b, 1)],
+                                       "hijab_cloth_from_Lab": [round(float(v), 1) for v in cur],
+                                       "hijab_dL": round(d_L, 1), "hijab_w": round(w, 2)}
     except Exception as e:  # pragma: no cover - fail soft
         return out_img, {"hijab_colour": f"failed: {e}"}
 
