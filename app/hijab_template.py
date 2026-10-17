@@ -54,10 +54,18 @@ def recolor_hijab_template(img: Image.Image, hijab_lab: Optional[Sequence[float]
         hh, s, v = hsv[..., 0].astype(np.int32), hsv[..., 1].astype(np.int32), hsv[..., 2].astype(np.int32)
         red_rim = ((hh < 10) | (hh > 165)) & (s > 120) & (v > 60)        # the red rim light on the cloth stays
         # black cloth: dark and not the red rim. Very dark pixels have noisy saturation, so accept any s below v<50.
-        fabric = (inside > 0) & (face == 0) & ~red_rim & (((v < 95) & (s < 140)) | (v < 50))
+        dark = ((v < 95) & (s < 140)) | (v < 50)
+        navy = (hh > 95) & (hh < 135) & (s > 110) & (v > 25)            # the navy panel / visor frame are never cloth
+        # the outline is hand-traced, so the model's scarf pokes out of it at the hairline / top: take a thin ring
+        # round the HEAD part too (dark pixels only; the pure-black background v<16 and the navy panel stay out)
+        kk = max(3, int(0.015 * W)) * 2 + 1
+        ring = cv2.dilate(inside, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kk, kk))) > 0
+        head = np.zeros((H, W), bool)
+        head[: int(0.52 * H), :] = True
+        fabric = ((inside > 0) & (face == 0) & ~red_rim & dark) | (ring & head & (face == 0) & ~red_rim & ~navy & dark & (v >= 16))
         fabric = cv2.morphologyEx(fabric.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
         fabric = cv2.morphologyEx(fabric, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        fabric &= (inside > 0).astype(np.uint8) & (face == 0).astype(np.uint8)
+        fabric &= (ring & (face == 0)).astype(np.uint8)
         lab = _lab(rgb)
         L0 = lab[..., 0]
         lo, hi = np.percentile(L0[fabric > 0], [5, 97]) if fabric.sum() > 1000 else (0.0, 40.0)
