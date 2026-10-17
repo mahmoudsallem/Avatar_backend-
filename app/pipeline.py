@@ -1629,11 +1629,8 @@ def _women_tune(p: str, info, ref: bool) -> str:
             hijab=" and inside the hijab opening" if hijab else ""), 1)
     col = hijab_colour_phrase(info)
     if hijab and col and HIJAB_USER in p:
-        p = p.replace(HIJAB_USER, f"HIJAB COLOUR (mandatory): her whole hijab - the head covering AND the scarf over her neck and "
-                      f"chest - is {col}, the exact colour of the hijab in Picture 2. Use exactly this colour on every part "
-                      f"of the hijab, light and shade it naturally. It is NOT black, NOT the dark hijab of Picture 1, and NOT "
-                      f"grey, beige or brown: repaint the template's black hijab fully in this colour, including its red-lit "
-                      f"edges and folds, with the same saturation as Picture 2. " + HIJAB_USER, 1)
+        p = p.replace(HIJAB_USER, f"The whole hijab is {col}, from its forehead border to its chest drape, "
+                      f"with natural folds shaded in that same hue. " + HIJAB_USER, 1)
     if ref and info.get("avatar") in settings.VISOR_REF_CLEAN and VISOR_REF_TEXT in p:
         p = p.replace(VISOR_REF_TEXT, WOMEN_VISOR_REF, 1)
     return p
@@ -1774,7 +1771,7 @@ def _build_prompt_v3(info, attempt=0, ref=False, keep_user_expression=True, hair
         col = hijab_colour_phrase(info)
         hij = V3_HIJAB.format(
             colour=(col + " " if col else ""),
-            colour_rule=(f"the hijab is {col}, not black" if col else "the hijab takes the colour of Picture 2's hijab, not the black of the template"),
+            colour_rule=(f"the hijab is {col} throughout" if col else "the hijab takes the fabric colour of Picture 2's hijab throughout"),
         )
         p = V3_HEAD + ident + V3_FEMALE + V3_BUILD + hij + visor + V3_STYLE + V3_CLOSING
     elif is_woman:
@@ -1792,39 +1789,27 @@ def lora_prompt(text: str) -> str:
     t = (settings.LORA_TRIGGER or "").strip()
     return f"{t}, {text}" if t and not text.lstrip().startswith(t) else text
 
-HIJAB_COLOUR_LOCK = (
-    " HIJAB COLOUR LOCK: the hijab of Picture 1 is black with RED edge lighting along its top edge, down its right side "
-    "and along the edge next to the face. Repaint all of it, the red-lit edges and red-lit folds included, in the user's "
-    "hijab colour: the hijab is ONE uniform colour from the top of the head to the end of the scarf on the chest. "
-    "Its edge highlight is a lighter tint of that same colour, never red. Shade the folds only with lighter and darker "
-    "tones of that colour. NO red, orange, blue, black or two-tone patches, streaks, edges or spots on the hijab, and no "
-    "rim light, neon glow or colour spill from the jacket, emblem or background on the cloth. The rim and fill lights "
-    "touch only the skin. The outline of the hijab is smooth and clean against the black background."
-)
-
-# Short and first on purpose: the prompt is ~1300 words and the encoder weights early tokens most, so a rule that only sits at
-# the very end lost to the template's red-lit black hijab.
-HIJAB_COLOUR_HEAD = (
-    "HIJAB COLOUR (second priority after the face): the whole hijab is ONE flat uniform colour, the user's hijab colour, "
-    "with soft lighter and darker folds of that same colour only. No red, no black, no second colour anywhere on the "
-    "hijab, not even on its edges: the red edge light of Picture 1 never touches the hijab. "
-)
-
-def _hijab_lock(p: str) -> str:
-    """Hijab avatars: the template style asks for a strong red rim light along the hair / forehead edge. On a hijab that red
-    landed on the cloth as red patches and a mixed colour. Keep the rim light on the skin only and lock one hijab colour."""
+def _hijab_lock(p: str, info) -> str:
+    """Put one concrete fabric-colour instruction before the long identity/style prompt."""
     for old in ("a strong red rim light along the hair, forehead and cheek edge",
                 "a strong red rim light along the hair, forehead, cheek and jaw edge",
                 "a red rim light along the hair"):
         p = p.replace(old, "a strong red rim light along the skin edge of the forehead and cheek only (never on the hijab cloth)")
     p = p.replace("lit by the red rim light and cool blue fill light", "the skin lit by the red rim light and cool blue fill light")
     p = p.replace("lit by the red and blue lights of the jacket", "shaded only with tones of its own colour")
-    return HIJAB_COLOUR_HEAD + p + HIJAB_COLOUR_LOCK
+    colour = hijab_colour_phrase(info) or "the fabric colour of the hijab in Picture 2"
+    colour_rule = (
+        f"HIJAB FABRIC: use {colour} across every visible section of the same scarf: crown, forehead border, "
+        "temple folds, sides, under-chin wrap, neck and chest drape. Keep one continuous fabric hue throughout; "
+        "show folds with lighter and darker values of that hue. Keep the fabric border clean and the hair covered. "
+        "The red and blue lighting belongs to the face, visor, jacket and emblem. "
+    )
+    return colour_rule + p
 
 def build_prompt(info, attempt=0, ref=False, style_mode=None, keep_user_expression=None, hair_retry=False):
     p = _build_prompt_core(info, attempt, ref, style_mode, keep_user_expression, hair_retry)
     if info.get("hijab", False):
-        p = _hijab_lock(p)
+        p = _hijab_lock(p, info)
     return lora_prompt(p)
 
 def _build_prompt_core(info, attempt=0, ref=False, style_mode=None, keep_user_expression=None, hair_retry=False):
