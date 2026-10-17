@@ -355,6 +355,10 @@ def _prepare_tensorrt_libs() -> None:
         if not pending:
             break
 
+import threading as _threading
+_VAE_COMPILE_LOCK = _threading.Lock()
+
+
 def apply_speed_options(slot: "GpuSlot") -> None:
     p = slot.pipe
     if settings.FLUX_BACKEND == "nunchaku" and (settings.FUSE_LORA or settings.COMPILE_TRANSFORMER):
@@ -381,12 +385,18 @@ def apply_speed_options(slot: "GpuSlot") -> None:
         try:
             _orig_decode = p.vae.decode
             _fast_decode = torch.compile(_orig_decode)
-            _state = {"ok": True}
+            _state = {"ok": True, "warm": False}
 
             def _safe_decode(*a, **k):
                 if _state["ok"]:
                     try:
-                        return _fast_decode(*a, **k)
+                        if _state["warm"]:
+                            return _fast_decode(*a, **k)
+                        # torch.compile is not thread-safe: the first (compiling) call of every slot runs alone
+                        with _VAE_COMPILE_LOCK:
+                            r = _fast_decode(*a, **k)
+                        _state["warm"] = True
+                        return r
                     except Exception as exc:
                         _state["ok"] = False
                         logger.warning("VAE compile failed (%s) - using the normal VAE decode", exc)
@@ -2339,10 +2349,12 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                             generator=torch.Generator("cuda").manual_seed(seed + k),
                         ).images[0]
                     break
-                except torch.cuda.OutOfMemoryError:
+                except Exception as _gen_exc:
                     if _oom_try or not settings.OOM_RETRY:
                         raise
-                    logger.warning("CUDA out of memory on slot %d (try %d) - freeing the cache and retrying once", slot.idx, k + 1)
+                    if not isinstance(_gen_exc, torch.cuda.OutOfMemoryError):
+                        logger.exception("Generation error on slot %d (try %d) - retrying once", slot.idx, k + 1)
+                    logger.warning("Freeing the cache and retrying once on slot %d (try %d)", slot.idx, k + 1)
                     slot.stream.synchronize()
                     import gc as _gc
                     _gc.collect()
