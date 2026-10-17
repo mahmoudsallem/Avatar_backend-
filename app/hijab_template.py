@@ -74,9 +74,9 @@ def recolor_hijab_template(img: Image.Image, hijab_lab: Optional[Sequence[float]
         _k = boosted_chroma_factor(hijab_lab)
         ta, tb = ta * _k, tb * _k
         new = lab.copy()
-        new[..., 0] = np.clip(tL * (0.55 + 0.55 * t), 0, 100)             # keep folds, centred on the user's L
-        new[..., 1] = ta * (0.75 + 0.35 * t)
-        new[..., 2] = tb * (0.75 + 0.35 * t)
+        new[..., 0] = np.clip(tL * (0.85 + 0.30 * t), 0, 100)             # keep folds, centred on the user's L
+        new[..., 1] = ta * (0.95 + 0.10 * t)
+        new[..., 2] = tb * (0.95 + 0.10 * t)
         m = cv2.GaussianBlur(fabric.astype(np.float32), (7, 7), 0)[..., None]
         out = lab * (1 - m) + new * m
         out = np.clip(cv2.cvtColor(out.astype(np.float32), cv2.COLOR_LAB2RGB) * 255.0, 0, 255).astype(np.uint8)
@@ -138,8 +138,8 @@ def sample_user_hijab_lab(user: Image.Image, box) -> Optional[np.ndarray]:
         c = centers[k].copy()
         # warm indoor light makes pale pink cloth read tan: when the cloth is a soft, rosy colour (a > 0) whose yellow
         # (b) is stronger than its red (a), pull b back towards a so it stays pink instead of turning beige
-        if c[1] > 6.0 and c[2] > 0.6 * c[1] and np.hypot(c[1], c[2]) < 35.0:
-            c[2] = 0.6 * c[1]
+        if c[1] > 6.0 and c[2] > 0.42 * c[1] and np.hypot(c[1], c[2]) < 35.0:
+            c[2] = 0.42 * c[1]
         return c
     except Exception:
         return None
