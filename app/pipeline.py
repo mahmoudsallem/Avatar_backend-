@@ -609,6 +609,10 @@ def _load_nunchaku_transformer():
     transformer.set_lora_strength(settings.LORA_STRENGTH)
     return transformer
 
+def model_dtype():
+    """dtype of the diffusers FLUX pipeline (MODEL_DTYPE). fp16 is not quantization, but FLUX can overflow in fp16."""
+    return torch.float16 if (settings.MODEL_DTYPE or "bf16").lower() in ("fp16", "float16", "half") else torch.bfloat16
+
 _DIRECT_GPU_OK = False   # set in load_models(): True only when there is enough free VRAM (not CPU-offload mode)
 
 def _load_flux_pipeline(shared=None):
@@ -620,11 +624,11 @@ def _load_flux_pipeline(shared=None):
     if settings.LOAD_DIRECT_TO_GPU and _DIRECT_GPU_OK:
         try:
             return Flux2KleinPipeline.from_pretrained(
-                settings.FLUX_MODEL, dtype=torch.bfloat16, device_map="cuda", **(shared or {}))
+                settings.FLUX_MODEL, dtype=model_dtype(), device_map="cuda", **(shared or {}))
         except Exception as exc:
             logger.warning("Direct-to-GPU load failed (%s) - falling back to CPU RAM load + .to('cuda')", exc)
     return Flux2KleinPipeline.from_pretrained(
-        settings.FLUX_MODEL, dtype=torch.bfloat16, **(shared or {}))
+        settings.FLUX_MODEL, dtype=model_dtype(), **(shared or {}))
 
 def _lora_selftest() -> None:
     """Generate the same tiny image with the LoRA off and on. If the output does not change, the face-swap LoRA is
@@ -782,6 +786,8 @@ def load_models() -> None:
     lora_layers = _count_lora_layers() if settings.FLUX_BACKEND == "diffusers" else -1
     if settings.LORA_SELFTEST:
         _lora_selftest()
+    if settings.FLUX_BACKEND == "diffusers" and model_dtype() == torch.float16:
+        logger.info("MODEL_DTYPE=fp16: FLUX runs in half precision. If avatars come out black/noisy, set MODEL_DTYPE=bf16.")
     _log_versions()
     logger.info("Active adapters: %s | LoRA layers attached to transformer: %d", _adapters(), lora_layers)
     if lora_layers == 0:
