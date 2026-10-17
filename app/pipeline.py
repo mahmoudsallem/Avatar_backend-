@@ -2244,17 +2244,21 @@ def _apply_hijab_colour_only(out: Image.Image, face: Image.Image, user_emb, rec:
         from app.hijab_template import sample_user_hijab_lab, boosted_chroma_factor
         ub = _face_box(user_emb, face.width, face.height) if user_emb else None
         hlab = sample_user_hijab_lab(face, ub) if ub else None
-        if hlab is None:
-            rec["hijab_colour_post"] = "skipped (no user hijab colour)"
-            return out
         o = embed(out, True, "fix") or embed(out, False, "fix")
         ob = _face_box(o, out.width, out.height) if o else None
+        if ob is None:
+            # face box not found on the output: the template's face sits in the same place in every avatar
+            W_, H_ = out.size
+            ob = (int(0.333 * W_), int(0.208 * H_), int(0.224 * W_), int(0.337 * H_))
+            rec["hijab_colour_post_box"] = "template fallback"
         _k = float(settings.HIJAB_CHROMA_SCALE)   # 1.0 = the user's exact colour
-        target = [float(hlab[0]), float(hlab[1]) * _k, float(hlab[2]) * _k]
+        # no user hijab colour: keep the colour the model painted (target=None) but still repaint red / black patches on the cloth
+        target = [float(hlab[0]), float(hlab[1]) * _k, float(hlab[2]) * _k] if hlab is not None else None
         # the model paints the template's BLACK hijab: recolour that dark cloth (face / glasses / jacket untouched),
         # then let the colour-only fix handle any hijab that was painted in a light colour already
         from app.hijab_template import recolor_hijab_template
-        out = recolor_hijab_template(out, target)
+        if target is not None:
+            out = recolor_hijab_template(out, target)
         fixed, rep = fix_hijab_colour_only(out, ob, target, settings.HIJAB_COLOR_POST_STRENGTH)
         rec["hijab_colour_post"] = {k: v for k, v in rep.items() if isinstance(v, (int, float, str, bool, list))}
         logger.info("Hijab colour post-fix: %s", rep)
