@@ -221,6 +221,15 @@ def close_val_worker() -> None:
 
 atexit.register(close_val_worker)
 
+def _cpu_thread_env() -> dict:
+    """Env vars that cap the CPU threads of a DeepFace/TensorFlow worker process (WORKER_CPU_THREADS, 0 = no cap)."""
+    n = int(getattr(settings, "WORKER_CPU_THREADS", 0) or 0)
+    if n <= 0:
+        return {}
+    v = str(n)
+    return {"WORKER_CPU_THREADS": v, "OMP_NUM_THREADS": v, "MKL_NUM_THREADS": v, "OPENBLAS_NUM_THREADS": v,
+            "NUMEXPR_NUM_THREADS": v, "TF_NUM_INTRAOP_THREADS": v, "TF_NUM_INTEROP_THREADS": v}
+
 def _start_val_worker() -> subprocess.Popen:
     if True:
         env = {
@@ -229,6 +238,7 @@ def _start_val_worker() -> subprocess.Popen:
             "TF_CPP_MIN_LOG_LEVEL": "3",
             "TF_USE_LEGACY_KERAS": "1",
             "TF_ENABLE_ONEDNN_OPTS": "0",
+            **_cpu_thread_env(),
         }
         logger.info(
             "Starting persistent DeepFace embedding worker (%s, %s)...",
@@ -596,7 +606,8 @@ _DETECT_ALL: List[subprocess.Popen] = []
 
 def _spawn_detect_worker() -> subprocess.Popen:
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": "-1", "TF_USE_LEGACY_KERAS": "1",
-           "TF_CPP_MIN_LOG_LEVEL": "3", "TF_ENABLE_ONEDNN_OPTS": "0"}
+           "TF_CPP_MIN_LOG_LEVEL": "3", "TF_ENABLE_ONEDNN_OPTS": "0",
+           **_cpu_thread_env()}
     log_file = open(settings.WORKER_LOG, "a", encoding="utf-8")
     p = subprocess.Popen([sys.executable, str(settings.WORKER_PATH), "detect_server"],
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log_file,
@@ -1052,6 +1063,7 @@ def run_deepface_worker(image_path: Path, timeout: int = None) -> dict:
         "CUDA_VISIBLE_DEVICES": "-1",
         "TF_USE_LEGACY_KERAS": "1",
         "TF_CPP_MIN_LOG_LEVEL": "3",
+        **_cpu_thread_env(),
     }
     process = subprocess.run(
         [

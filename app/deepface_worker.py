@@ -27,6 +27,13 @@ warnings.filterwarnings("ignore")
 
 import cv2
 
+try:  # OpenCV has its own thread pool; cap it like the OMP/TF ones (set by the parent via WORKER_CPU_THREADS)
+    _t = int(os.environ.get("WORKER_CPU_THREADS", "0") or 0)
+    if _t > 0:
+        cv2.setNumThreads(_t)
+except Exception:
+    pass
+
 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
     from deepface import DeepFace
 

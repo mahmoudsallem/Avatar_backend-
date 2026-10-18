@@ -143,6 +143,7 @@ class Settings(BaseSettings):
     CUDNN_ENABLED: bool = False        # the old code forced cuDNN off; True may speed up the VAE convolutions
     PERSISTENT_DETECT: bool = False    # keep DeepFace face-detection processes alive instead of spawning one per photo
     DETECT_WORKERS: int = 2            # how many persistent detection processes (each ~2 GB RAM)
+    WORKER_CPU_THREADS: int = 1        # CPU threads each DeepFace/TensorFlow worker process may use (OMP/MKL/TF/OpenCV). 0 = no limit (old behaviour). Stops 5 workers x all-cores thrashing a small vCPU box.
 
     # ---------------- Generation Settings ----------------
     STEPS: int = 20
