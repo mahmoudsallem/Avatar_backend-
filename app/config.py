@@ -111,8 +111,6 @@ class Settings(BaseSettings):
     VERIFY_HAIR_VOLUME: bool = True
     HAIR_VOLUME_MISMATCH: float = 0.35   # |candidate short-hair score - user short-hair score| at/above this = mismatch
     W_HAIR_VOLUME: float = 2.0           # score penalty for a hair-volume mismatch
-    ID_EXTRA_TRIES: int = 1              # extra generations (beyond BEST_OF_N) when no candidate reached ID_EXTRA_BELOW; 0 = off
-    ID_EXTRA_BELOW: float = 0.40         # identity (id_sim) a result should reach before the search stops; same bar as STOP_ID
     HAIR_VOLUME_EXTRA_TRIES: int = 1     # extra generations (beyond BEST_OF_N) when every candidate still mismatches
 
     # ---------------- GPU Concurrency ----------------
@@ -123,7 +121,6 @@ class Settings(BaseSettings):
     VAL_WORKERS: int = 1             # persistent DeepFace/ArcFace scoring processes (CPU). 1 = old behaviour; with GPU_SLOTS=3 use 3 so slots do not queue for scoring
     SCHED_SHIFT: float = 1.0         # FlowMatch scheduler shift. 1.0 = unchanged; 1.5-2.0 spends more of the few steps on face structure (identity)
     VAE_COMPILE: bool = False        # torch.compile the VAE decoder (falls back to the normal decode if compile fails)
-    SCORE_OVERLAP: bool = False      # TEST: hand the GPU slot back while a try is being scored (CPU) and re-acquire it for the next try, so another request can use the GPU meanwhile. Same seeds/prompts/selection -> same outputs; only scheduling changes.
     GPU_SLOTS: int = 2               # 0 = AUTO: keep adding slots while at least SLOT_MIN_FREE_GB VRAM stays free (max 8)
     SLOT_MIN_FREE_GB: float = 44.0   # don't load another slot unless this much VRAM is still free (each running job peaks at ~19 GB of activations)
     ANALYSIS_CONCURRENCY: int = 4    # Step 1 (CPU subprocesses) running at once, outside the GPU slots
@@ -131,7 +128,6 @@ class Settings(BaseSettings):
     # ---------------- Speed options (all OFF by default = identical behaviour to before) ----------------
     # Exact / near-exact: they must not change the picture (check with bench_speed.py before enabling).
     CACHE_PROMPT_EMBEDS: bool = False  # cache the text-encoder output per distinct prompt (bit-identical)
-    CACHE_USER_LATENTS: bool = False   # TEST (off = exact previous behaviour): also keep the user's photo latents for the next try
     CACHE_REF_LATENTS: bool = False    # cache VAE latents of repeated reference images, e.g. the templates (bit-identical)
     FUSE_LORA: bool = False            # merge the LoRA into the weights; needs a uniform ID_LORA_SCHEDULE (rounding-level change)
     ATTENTION_BACKEND: str = ""        # "" = diffusers default; try "_native_cudnn" or "native" (rounding-level change)
@@ -147,7 +143,6 @@ class Settings(BaseSettings):
     CUDNN_ENABLED: bool = False        # the old code forced cuDNN off; True may speed up the VAE convolutions
     PERSISTENT_DETECT: bool = False    # keep DeepFace face-detection processes alive instead of spawning one per photo
     DETECT_WORKERS: int = 2            # how many persistent detection processes (each ~2 GB RAM)
-    WORKER_CPU_THREADS: int = 1        # CPU threads each DeepFace/TensorFlow worker process may use (OMP/MKL/TF/OpenCV). 0 = no limit (old behaviour). Stops 5 workers x all-cores thrashing a small vCPU box.
 
     # ---------------- Generation Settings ----------------
     STEPS: int = 20

@@ -144,37 +144,6 @@ def set_lora(weight: float) -> None:  # slot 0 helper, kept for older callers/te
 def lora_kwargs():
     return slots[0].lora_kwargs()
 
-class SlotLease:
-    """SCORE_OVERLAP: lets generate_avatar (a worker thread) give its GPU slot back while a try is scored on the CPU and
-    take a slot again for the next try. The slot queue lives on the event loop, so hand-offs go through it thread-safely."""
-    def __init__(self, slot: "GpuSlot", loop):
-        self.slot, self.loop = slot, loop
-        self.held, self.closed, self.wait_s = True, False, 0.0
-
-    def release(self) -> None:
-        if self.held and not self.closed:
-            self.held = False
-            self.loop.call_soon_threadsafe(release_slot, self.slot)
-
-    def reacquire(self) -> "GpuSlot":
-        if self.held:
-            return self.slot
-        if self.closed:
-            raise RuntimeError("request was cancelled")
-        t = time.time()
-        self.slot = asyncio.run_coroutine_threadsafe(acquire_slot(), self.loop).result()
-        self.wait_s += time.time() - t
-        self.held = True
-        if self.closed:                       # request cancelled while we waited: give the slot straight back
-            self.held = False
-            self.loop.call_soon_threadsafe(release_slot, self.slot)
-            raise RuntimeError("request was cancelled")
-        return self.slot
-
-# generate_avatar threads for SCORE_OVERLAP: more requests can be "between tries" than there are slots, so they get their
-# own pool instead of asyncio's small default executor (which also runs Step 1).
-_GEN_EXEC = ThreadPoolExecutor(max_workers=48, thread_name_prefix="gen")
-
 # Step 1 (CPU: RetinaFace/DeepFace subprocess + CLIP) runs outside the GPU slots, this many at a time
 analysis_sem = asyncio.Semaphore(settings.ANALYSIS_CONCURRENCY)
 _CLIP_LOCK = threading.Lock()
@@ -198,14 +167,8 @@ async def process_image_file(image_path: Path, overrides: Optional[dict] = None)
     slot = await acquire_slot()
     t_slot_wait = time.time() - t_s0             # waiting for a free GPU slot
     t0 = time.time() - t_analysis
-    lease = SlotLease(slot, asyncio.get_running_loop()) if settings.SCORE_OVERLAP else None
     try:
-        if lease is None:
-            jpeg_bytes, rec = await asyncio.to_thread(generate_avatar, image_path, info, t0, slot, overrides)
-        else:
-            jpeg_bytes, rec = await asyncio.get_running_loop().run_in_executor(
-                _GEN_EXEC, lambda: generate_avatar(image_path, info, t0, slot, overrides, lease))
-            t_slot_wait += lease.wait_s
+        jpeg_bytes, rec = await asyncio.to_thread(generate_avatar, image_path, info, t0, slot, overrides)
         rec["analysis_wait_s"] = round(t_analysis_wait, 1)
         rec["analysis_s"] = round(t_analysis, 1)
         rec["slot_wait_s"] = round(t_slot_wait, 1)
@@ -214,13 +177,7 @@ async def process_image_file(image_path: Path, overrides: Optional[dict] = None)
                     rec.get("tries"), time.time() - t_req)
         return jpeg_bytes, rec
     finally:
-        if lease is None:
-            release_slot(slot)
-        else:
-            lease.closed = True
-            if lease.held:
-                release_slot(lease.slot)
-                lease.held = False
+        release_slot(slot)
 
 # Persistent ArcFace embedding worker state
 _VW = {"p": None}
@@ -264,15 +221,6 @@ def close_val_worker() -> None:
 
 atexit.register(close_val_worker)
 
-def _cpu_thread_env() -> dict:
-    """Env vars that cap the CPU threads of a DeepFace/TensorFlow worker process (WORKER_CPU_THREADS, 0 = no cap)."""
-    n = int(getattr(settings, "WORKER_CPU_THREADS", 0) or 0)
-    if n <= 0:
-        return {}
-    v = str(n)
-    return {"WORKER_CPU_THREADS": v, "OMP_NUM_THREADS": v, "MKL_NUM_THREADS": v, "OPENBLAS_NUM_THREADS": v,
-            "NUMEXPR_NUM_THREADS": v, "TF_NUM_INTRAOP_THREADS": v, "TF_NUM_INTEROP_THREADS": v}
-
 def _start_val_worker() -> subprocess.Popen:
     if True:
         env = {
@@ -281,7 +229,6 @@ def _start_val_worker() -> subprocess.Popen:
             "TF_CPP_MIN_LOG_LEVEL": "3",
             "TF_USE_LEGACY_KERAS": "1",
             "TF_ENABLE_ONEDNN_OPTS": "0",
-            **_cpu_thread_env(),
         }
         logger.info(
             "Starting persistent DeepFace embedding worker (%s, %s)...",
@@ -354,7 +301,6 @@ _PROMPT_CACHE: "OrderedDict[str, torch.Tensor]" = OrderedDict()
 _PROMPT_LOCK = threading.Lock()
 _REF_CACHE: "OrderedDict[str, torch.Tensor]" = OrderedDict()
 _REF_SEEN: set = set()
-_RECENT_REF: "OrderedDict[str, list]" = OrderedDict()   # [latent_cpu, hits] - a user's photo is encoded once, reused by the next try
 _REF_LOCK = threading.Lock()
 _CACHE_STATS = {"prompt_hit": 0, "prompt_miss": 0, "ref_hit": 0, "ref_miss": 0}
 
@@ -396,26 +342,12 @@ def _install_ref_cache(p) -> None:
             hit = _REF_CACHE.get(key)
             if hit is not None:
                 _REF_CACHE.move_to_end(key)
-            elif settings.CACHE_USER_LATENTS:
-                rec = _RECENT_REF.get(key)
-                if rec is not None:                    # seen in a recent try (e.g. the user's photo on try 2)
-                    _RECENT_REF.move_to_end(key)
-                    rec[1] += 1
-                    hit = rec[0]
-                    if rec[1] >= 2:                    # 3rd sighting -> a template/visor ref, keep it long-term
-                        _REF_CACHE[key] = rec[0]
-                        while len(_REF_CACHE) > 64:
-                            _REF_CACHE.popitem(last=False)
         if hit is not None:
             _CACHE_STATS["ref_hit"] += 1
             return hit.to(image.device)
         _CACHE_STATS["ref_miss"] += 1
         out = orig(image=image, generator=generator)
         with _REF_LOCK:
-            if settings.CACHE_USER_LATENTS:
-                _RECENT_REF[key] = [out.detach().to("cpu"), 0]   # first sighting: keep briefly so the next try skips the encode
-                while len(_RECENT_REF) > 48:
-                    _RECENT_REF.popitem(last=False)
             if key in _REF_SEEN:                       # second sighting -> worth keeping
                 _REF_CACHE[key] = out.detach().to("cpu")
                 while len(_REF_CACHE) > 64:
@@ -504,11 +436,8 @@ def apply_speed_options(slot: "GpuSlot") -> None:
                            slot.idx, settings.ATTENTION_BACKEND, exc)
     if settings.CACHE_REF_LATENTS:
         _install_ref_cache(p)
-    if settings.VAE_COMPILE and getattr(p.vae, "_saytara_vae_compiled", False):
-        logger.info("Slot %d: VAE decode already compiled (shared VAE)", slot.idx)
-    elif settings.VAE_COMPILE:
+    if settings.VAE_COMPILE:
         try:
-            p.vae._saytara_vae_compiled = True      # the VAE is shared between slots: wrap/compile it once, not once per slot
             _orig_decode = p.vae.decode
             _fast_decode = torch.compile(_orig_decode)
             _state = {"ok": True, "warm": False}
@@ -667,8 +596,7 @@ _DETECT_ALL: List[subprocess.Popen] = []
 
 def _spawn_detect_worker() -> subprocess.Popen:
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": "-1", "TF_USE_LEGACY_KERAS": "1",
-           "TF_CPP_MIN_LOG_LEVEL": "3", "TF_ENABLE_ONEDNN_OPTS": "0",
-           **_cpu_thread_env()}
+           "TF_CPP_MIN_LOG_LEVEL": "3", "TF_ENABLE_ONEDNN_OPTS": "0"}
     log_file = open(settings.WORKER_LOG, "a", encoding="utf-8")
     p = subprocess.Popen([sys.executable, str(settings.WORKER_PATH), "detect_server"],
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log_file,
@@ -1073,8 +1001,6 @@ def load_models() -> None:
         _slot_q.put_nowait(s)
     free_after, _t = get_gpu_memory_info()
     logger.info("GPU slots ready: %d concurrent avatar generations (free VRAM now %s GB).", len(slots), free_after)
-    logger.info("ACTIVE SETTINGS: SCORE_OVERLAP=%s GPU_SLOTS(req)=%s slots(actual)=%d VAE_COMPILE=%s VAL_WORKERS=%s DETECT_WORKERS=%s ANALYSIS_CONCURRENCY=%s CUDNN=%s WORKER_CPU_THREADS=%s WARMUP_RUNTIME=%s BACKEND=%s",
-                settings.SCORE_OVERLAP, settings.GPU_SLOTS, len(slots), settings.VAE_COMPILE, settings.VAL_WORKERS, settings.DETECT_WORKERS, settings.ANALYSIS_CONCURRENCY, settings.CUDNN_ENABLED, settings.WORKER_CPU_THREADS, settings.WARMUP_RUNTIME, settings.FLUX_BACKEND)
 
     # Start persistent ArcFace identity verification worker
     get_val_worker()
@@ -1126,7 +1052,6 @@ def run_deepface_worker(image_path: Path, timeout: int = None) -> dict:
         "CUDA_VISIBLE_DEVICES": "-1",
         "TF_USE_LEGACY_KERAS": "1",
         "TF_CPP_MIN_LOG_LEVEL": "3",
-        **_cpu_thread_env(),
     }
     process = subprocess.run(
         [
@@ -2485,8 +2410,7 @@ def encode_jpeg_capped(img: Image.Image, max_bytes: int = None) -> bytes:
     return smallest
 
 def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = None,
-                    slot: Optional[GpuSlot] = None, overrides: Optional[dict] = None,
-                    lease: Optional["SlotLease"] = None) -> Tuple[bytes, dict]:
+                    slot: Optional[GpuSlot] = None, overrides: Optional[dict] = None) -> Tuple[bytes, dict]:
     # t0 defaults to "now" (generation-only budget) but callers should pass the
     # timestamp from before Step 1 analysis so TIME_BUDGET covers the whole
     # image end-to-end, matching the notebook.
@@ -2515,7 +2439,6 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         extras = 0
         hair_extras = 0
         hair_vol_extras = 0
-        id_extras = 0
         prev_hair = "ok"
 
         dbg = None
@@ -2540,8 +2463,6 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         progress = tqdm(total=max_k, desc=f"Generating avatar ({user_path.name})", unit="try")
         while True:
             mult = settings.ID_LORA_SCHEDULE[k % len(settings.ID_LORA_SCHEDULE)]
-            if lease is not None and not lease.held:
-                slot = lease.reacquire()          # SCORE_OVERLAP: the slot was handed back while the last try was scored
             slot.set_lora(test_lora * mult)
             if info.get("hijab") and settings.PROMPT_VARIANT == "v3" and "hijab_colour" not in info:
                 info["hijab_colour"] = None  # computed once; stays None if the sample is unreliable
@@ -2599,8 +2520,6 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                     out.save(dbg / f"corrupt{bad_tries}_try{k + 1}.png")
                 continue
 
-            if lease is not None:
-                lease.release()                   # SCORE_OVERLAP: scoring is CPU work - let another request use this slot now
             tv = time.time()
             user_emb = fut.result() if fut is not None else None
             v = score_output(user_emb, out, info)
@@ -2674,14 +2593,6 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                     progress.total = max_k
                     progress.refresh()
                     logger.info("Hair volume mismatch in every candidate (diff=%s) - adding extra try (if budget permits)", best["v"].get("hair_vol_diff"))
-                elif (settings.VALIDATE and id_extras < settings.ID_EXTRA_TRIES
-                      and (best["v"]["id_sim"] or 0) < settings.ID_EXTRA_BELOW):
-                    id_extras += 1
-                    max_k += 1
-                    progress.total = max_k
-                    progress.refresh()
-                    logger.info("Identity low in every candidate (best id_sim=%s < %.2f) - adding extra try (if budget permits)",
-                                best["v"]["id_sim"], settings.ID_EXTRA_BELOW)
                 else:
                     break
 
@@ -2746,5 +2657,4 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
     finally:
         if progress is not None:
             progress.close()
-        if lease is None or lease.held:
-            slot.reset_lora()
+        slot.reset_lora()
