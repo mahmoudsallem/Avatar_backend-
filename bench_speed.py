@@ -48,6 +48,9 @@ CONFIGS = [
     ("baseline_uniform", None,               {"ID_LORA_SCHEDULE": UNIFORM}),
     ("fuse",             "baseline_uniform", {"ID_LORA_SCHEDULE": UNIFORM, "FUSE_LORA": "true"}),
     ("fuse_compile",     "baseline_uniform", {"ID_LORA_SCHEDULE": UNIFORM, "FUSE_LORA": "true", "COMPILE_TRANSFORMER": "true"}),
+    # TensorRT: needs FLUX_BACKEND=diffusers (nunchaku kernels cannot be compiled by TensorRT) and torch-tensorrt installed
+    ("fuse_trt",         "baseline_uniform", {"FLUX_BACKEND": "diffusers", "ID_LORA_SCHEDULE": UNIFORM, "FUSE_LORA": "true",
+                                              "COMPILE_TRANSFORMER": "true", "COMPILE_BACKEND": "tensorrt"}),
     ("all_in",           "baseline_uniform", {"ID_LORA_SCHEDULE": UNIFORM, "FUSE_LORA": "true", "COMPILE_TRANSFORMER": "true",
                                               "CACHE_PROMPT_EMBEDS": "true", "CACHE_REF_LATENTS": "true",
                                               "PERSISTENT_DETECT": "true"}),

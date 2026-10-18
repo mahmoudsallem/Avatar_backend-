@@ -107,6 +107,38 @@ def user_hijab_lab(user: Image.Image, box: Box) -> Tuple[Optional[np.ndarray], O
     return med, spread
 
 
+_COLOUR_NAMES = [  # (name, sRGB) - nearest in Lab; used to tell the text prompt what colour the user's hijab is
+    ("white", (240, 240, 238)), ("cream", (236, 224, 200)), ("beige", (214, 190, 160)), ("light grey", (190, 190, 192)),
+    ("grey", (128, 128, 130)), ("charcoal", (60, 60, 64)), ("black", (20, 20, 22)), ("brown", (110, 75, 55)),
+    ("light pink", (240, 200, 210)), ("dusty pink", (205, 150, 165)), ("hot pink", (215, 70, 130)), ("red", (190, 30, 40)),
+    ("burgundy", (110, 25, 50)), ("orange", (225, 130, 50)), ("mustard", (205, 160, 50)), ("yellow", (240, 220, 90)),
+    ("olive green", (110, 120, 60)), ("green", (50, 140, 80)), ("mint green", (170, 220, 195)), ("teal", (40, 130, 135)),
+    ("light blue", (160, 200, 235)), ("blue", (50, 90, 190)), ("navy blue", (30, 40, 90)),
+    ("lilac", (190, 160, 215)), ("purple", (110, 60, 150)), ("plum", (95, 40, 85)),
+]
+
+
+def hijab_colour_name(lab_med) -> Optional[str]:
+    """Nearest plain colour word for a median Lab colour (None if no colour)."""
+    if lab_med is None:
+        return None
+    try:
+        pal = np.array([c for _, c in _COLOUR_NAMES], np.uint8).reshape(-1, 1, 3)
+        pal_lab = cv2.cvtColor(pal.astype(np.float32) / 255.0, cv2.COLOR_RGB2LAB).reshape(-1, 3)
+        i = int(np.argmin(np.linalg.norm(pal_lab - np.asarray(lab_med, np.float32), axis=1)))
+        return _COLOUR_NAMES[i][0]
+    except Exception:
+        return None
+
+
+def user_hijab_colour(user: Image.Image, box: Box) -> Optional[str]:
+    """Colour word of the user's own hijab (None when the sample is missing, mixed or looks like the room)."""
+    med, spread = user_hijab_lab(user, box)
+    if med is None or (spread is not None and spread > 45):
+        return None
+    return hijab_colour_name(med)
+
+
 # --------------------------------------------------------------------------------------------- the three fixes
 def _fix_skin(bgr, lab, box: Box, skin_ref: Optional[np.ndarray], smooth: float, match: float) -> Tuple[np.ndarray, Dict]:
     info: Dict = {}
@@ -177,9 +209,12 @@ def _fix_hijab_color(bgr, box: Box, hij_ref: Optional[np.ndarray], strength: flo
     cur = _median_lab(lab, cand, 1500)
     if cur is None:
         return bgr, None, {"hijab": "skipped (no hijab pixels)"}
+    band, _sp = user_hijab_lab(_pil(bgr), box)  # bands right next to the face: the broad mask above also catches skin/neck
+    if band is not None:
+        cur = band
     lit_sel = cand & (lab[..., 0] >= np.percentile(lab[..., 0][cand], 55))
     lit = _median_lab(lab, lit_sel, 800)
-    if lit is not None:
+    if lit is not None and band is None:
         cur_lit = lit
     else:
         cur_lit = cur
@@ -329,6 +364,11 @@ def fix_hijab_avatar(
         rep.update(r)
         bgr, hij_now, r = _fix_hijab_color(bgr, out_face, hij_ref, hijab_match)
         rep.update(r)
+        if hij_now is not None and hij_ref is not None and float(np.linalg.norm(hij_now - hij_ref)) > 40:
+            # the model kept its own (black) hijab and the user's colour was not applied: recolouring only the neck
+            # produced a flat taupe patch. Leave the drape as painted so head and neck stay one fabric.
+            rep["drape"] = "skipped (hijab colour not matched; drape left as painted)"
+            return _pil(bgr), rep
         bgr, r = _fix_drape(bgr, out_face, hij_now, drape)
         rep.update(r)
         if str(r.get("drape", "")).startswith("skipped"):

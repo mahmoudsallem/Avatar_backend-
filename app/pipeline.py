@@ -71,6 +71,19 @@ pipe = None
 # mode "adapters" : strength set with pipe.set_adapters(["bfs"], [w])            (fallback if the kwarg has no effect)
 _LORA = {"scale": 1.0, "mode": "kwargs"}
 
+def looks_corrupted(img) -> bool:
+    """True for a failed generation (static / half-denoised noise). The avatar template's four corners are pure black
+    (measured on 69 good outputs: corner mean <= 0.3); a broken denoise leaves them grey and grainy (mean ~50)."""
+    try:
+        a = np.asarray(img.convert("L"), dtype=np.float32)
+        H, W = a.shape
+        k = max(8, int(0.08 * min(H, W)))
+        c = np.concatenate([a[:k, :k].ravel(), a[:k, -k:].ravel(), a[-k:, :k].ravel(), a[-k:, -k:].ravel()])
+        return bool(c.mean() > 8.0 or c.std() > 6.0)
+    except Exception:
+        return False
+
+
 class GpuSlot:
     """One independent FLUX pipeline (own transformer + LoRA state + scheduler + CUDA stream).
     A request owns a slot for the whole of Step 2, so several avatars generate at once."""
@@ -85,6 +98,9 @@ class GpuSlot:
 
     def set_lora(self, weight: float) -> None:
         self.lora["scale"] = float(weight)
+        if settings.FLUX_BACKEND == "nunchaku":
+            self.pipe.transformer.set_lora_strength(float(weight))
+            return
         if self.fused:
             if abs(float(weight) - self.fused_scale) > 1e-6:
                 raise RuntimeError(
@@ -99,6 +115,8 @@ class GpuSlot:
             self.set_lora(settings.LORA_STRENGTH)
 
     def lora_kwargs(self):
+        if settings.FLUX_BACKEND == "nunchaku":
+            return None
         if self.fused:
             return None
         return {"scale": self.lora["scale"]} if self.lora["mode"] == "kwargs" else None
@@ -137,28 +155,42 @@ async def process_image_file(image_path: Path, overrides: Optional[dict] = None)
     the same GPU-slot/analysis-semaphore gating. Raises Rejected on an invalid
     or unsupported photo.
     """
+    t_req = time.time()
     async with analysis_sem:
+        t_a0 = time.time()
+        t_analysis_wait = t_a0 - t_req           # waiting for a free Step-1 slot
         t0 = time.time()
         info = await asyncio.to_thread(analyse_user, image_path)
 
     t_analysis = time.time() - t0
+    t_s0 = time.time()
     slot = await acquire_slot()
+    t_slot_wait = time.time() - t_s0             # waiting for a free GPU slot
     t0 = time.time() - t_analysis
     try:
-        return await asyncio.to_thread(generate_avatar, image_path, info, t0, slot, overrides)
+        jpeg_bytes, rec = await asyncio.to_thread(generate_avatar, image_path, info, t0, slot, overrides)
+        rec["analysis_wait_s"] = round(t_analysis_wait, 1)
+        rec["analysis_s"] = round(t_analysis, 1)
+        rec["slot_wait_s"] = round(t_slot_wait, 1)
+        logger.info("TIMING %s: analysis_wait=%.1fs analysis=%.1fs slot_wait=%.1fs gen=%.1fs score=%.1fs tries=%s total_server=%.1fs",
+                    image_path.name, t_analysis_wait, t_analysis, t_slot_wait, rec.get("gen_s", 0), rec.get("val_s", 0),
+                    rec.get("tries"), time.time() - t_req)
+        return jpeg_bytes, rec
     finally:
         release_slot(slot)
 
 # Persistent ArcFace embedding worker state
 _VW = {"p": None}
 _VLOCK = threading.RLock()
-_POOL = ThreadPoolExecutor(max_workers=1)
+_VW_ALL: list = []          # every scoring worker process
+_VW_FREE: "queue.Queue" = queue.Queue()   # idle workers
+_POOL = ThreadPoolExecutor(max_workers=max(1, int(getattr(settings, 'VAL_WORKERS', 1))))
 
-def close_val_worker() -> None:
-    with _VLOCK:
-        p = _VW.get("p")
-        _VW["p"] = None
-        if p is not None and p.poll() is None:
+def _kill_worker(p) -> None:
+    if p is None:
+        return
+    try:
+        if p.poll() is None:
             try:
                 p.stdin.close()
             except Exception:
@@ -171,15 +203,26 @@ def close_val_worker() -> None:
                     p.kill()
                 except Exception:
                     pass
+    except Exception:
+        pass
+
+def close_val_worker() -> None:
+    with _VLOCK:
+        procs = list(_VW_ALL)
+        _VW_ALL.clear()
+        _VW["p"] = None
+        while True:
+            try:
+                _VW_FREE.get_nowait()
+            except Exception:
+                break
+    for p in procs:
+        _kill_worker(p)
 
 atexit.register(close_val_worker)
 
-def get_val_worker() -> subprocess.Popen:
-    with _VLOCK:
-        p = _VW.get("p")
-        if p is not None and p.poll() is None:
-            return p
-
+def _start_val_worker() -> subprocess.Popen:
+    if True:
         env = {
             **os.environ,
             "CUDA_VISIBLE_DEVICES": "-1",
@@ -224,14 +267,31 @@ def get_val_worker() -> subprocess.Popen:
                 break
 
         if not ready or p.poll() is not None:
-            close_val_worker()
+            _kill_worker(p)
             raise RuntimeError(
                 f"DeepFace embedding worker failed to start - see {settings.WORKER_LOG}"
             )
 
-        _VW["p"] = p
         logger.info("DeepFace embedding worker ready.")
         return p
+
+
+def get_val_worker() -> subprocess.Popen:
+    """Starts the scoring worker pool (VAL_WORKERS processes) on first use; returns one live worker."""
+    with _VLOCK:
+        alive = [p for p in _VW_ALL if p.poll() is None]
+        if alive and len(alive) == len(_VW_ALL):
+            return alive[0]
+        close_val_worker()
+        n = max(1, int(getattr(settings, "VAL_WORKERS", 1)))
+        for _ in range(n):
+            p = _start_val_worker()
+            _VW_ALL.append(p)
+            _VW_FREE.put(p)
+        _VW["p"] = _VW_ALL[0]
+        if n > 1:
+            logger.info("DeepFace scoring pool: %d workers", n)
+        return _VW_ALL[0]
 
 # ============================================================================
 # Speed options (all controlled from .env, default OFF)
@@ -300,8 +360,64 @@ def _install_ref_cache(p) -> None:
 
     p._encode_vae_image = cached
 
+def _to_dtype(obj, dtype):
+    if torch.is_tensor(obj) and obj.is_floating_point():
+        return obj.to(dtype)
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_to_dtype(o, dtype) for o in obj)
+    if isinstance(obj, dict):
+        return {k: _to_dtype(v, dtype) for k, v in obj.items()}
+    return obj
+
+def _make_transformer_fp16(tr) -> None:
+    """Run the FLUX transformer in fp16 (for a TensorRT fp16 engine) while the rest of the pipeline stays bf16:
+    weights -> fp16, float inputs cast to fp16 on entry, outputs cast back to bf16. Needs the LoRA fused first."""
+    if getattr(tr, "_fp16_wrapped", False):
+        return
+    tr.to(torch.float16)
+    tr.register_forward_pre_hook(lambda m, a, kw: (_to_dtype(a, torch.float16), _to_dtype(kw, torch.float16)), with_kwargs=True)
+    tr.register_forward_hook(lambda m, a, kw, out: _to_dtype(out, torch.bfloat16), with_kwargs=True)
+    tr._fp16_wrapped = True
+
+_COMPILE_DISABLED = False   # set when TensorRT fails to import; skips the compile warm-up
+
+def _prepare_tensorrt_libs() -> None:
+    """The pip TensorRT wheels keep their .so files in site-packages/tensorrt_libs, which is usually NOT on
+    LD_LIBRARY_PATH, so torch_tensorrt cannot find libnvinfer / libnvonnxparser. Preload them (global symbols) first."""
+    import ctypes, glob, importlib.util
+    dirs = []
+    for mod in ("tensorrt_libs",):
+        try:
+            spec = importlib.util.find_spec(mod)
+        except Exception:
+            spec = None
+        if spec is not None and spec.submodule_search_locations:
+            dirs += [str(d) for d in spec.submodule_search_locations]
+    if dirs:   # torch_tensorrt searches the directories listed in LD_LIBRARY_PATH (read when it is imported)
+        cur = os.environ.get("LD_LIBRARY_PATH", "")
+        add = [d for d in dirs if d not in cur.split(":")]
+        if add:
+            os.environ["LD_LIBRARY_PATH"] = ":".join(add + ([cur] if cur else []))
+    pending = sorted(n for d in dirs for n in glob.glob(os.path.join(d, "libnv*.so*")))
+    for _ in range(3):   # a few passes: a library may need another one that is loaded later in the list
+        failed = []
+        for name in pending:
+            try:
+                ctypes.CDLL(name, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                failed.append(name)
+        pending = failed
+        if not pending:
+            break
+
+import threading as _threading
+_VAE_COMPILE_LOCK = _threading.Lock()
+
+
 def apply_speed_options(slot: "GpuSlot") -> None:
     p = slot.pipe
+    if settings.FLUX_BACKEND == "nunchaku" and (settings.FUSE_LORA or settings.COMPILE_TRANSFORMER):
+        raise ValueError("FUSE_LORA and COMPILE_TRANSFORMER are unsupported with FLUX_BACKEND=nunchaku")
     if settings.FUSE_LORA:
         mults = [float(m) for m in settings.ID_LORA_SCHEDULE]
         if len(set(round(m, 6) for m in mults)) != 1:
@@ -320,16 +436,75 @@ def apply_speed_options(slot: "GpuSlot") -> None:
                            slot.idx, settings.ATTENTION_BACKEND, exc)
     if settings.CACHE_REF_LATENTS:
         _install_ref_cache(p)
+    if settings.VAE_COMPILE:
+        try:
+            _orig_decode = p.vae.decode
+            _fast_decode = torch.compile(_orig_decode)
+            _state = {"ok": True, "warm": False}
+
+            def _safe_decode(*a, **k):
+                if _state["ok"]:
+                    try:
+                        if _state["warm"]:
+                            return _fast_decode(*a, **k)
+                        # torch.compile is not thread-safe: the first (compiling) call of every slot runs alone
+                        with _VAE_COMPILE_LOCK:
+                            r = _fast_decode(*a, **k)
+                        _state["warm"] = True
+                        return r
+                    except Exception as exc:
+                        _state["ok"] = False
+                        logger.warning("VAE compile failed (%s) - using the normal VAE decode", exc)
+                return _orig_decode(*a, **k)
+            p.vae.decode = _safe_decode
+            logger.info("Slot %d: VAE decode compiled", slot.idx)
+        except Exception as exc:
+            logger.warning("Slot %d: VAE_COMPILE skipped (%s)", slot.idx, exc)
     if settings.COMPILE_TRANSFORMER:
         if not slot.fused:
             logger.warning("COMPILE_TRANSFORMER without a fused LoRA recompiles for every LoRA strength - "
                            "enable FUSE_LORA with a uniform ID_LORA_SCHEDULE.")
-        p.transformer.compile(mode=settings.COMPILE_MODE, dynamic=False)
-        logger.info("Slot %d: transformer compiled (mode=%s) - first calls per shape are slow", slot.idx, settings.COMPILE_MODE)
+        if settings.COMPILE_BACKEND == "tensorrt":
+            global _COMPILE_DISABLED
+            try:
+                _prepare_tensorrt_libs()
+                import torch_tensorrt  # noqa: F401  (registers the "tensorrt" torch.compile backend)
+            except Exception as exc:
+                # A missing/mismatched TensorRT install must not take the whole service down: run uncompiled instead.
+                _COMPILE_DISABLED = True
+                logger.error(
+                    "TensorRT could not be loaded (%s: %s). Continuing WITHOUT TensorRT - the transformer is NOT compiled. "
+                    "Fix: make the TensorRT .so files visible (see tensorrt_libs in site-packages / LD_LIBRARY_PATH) or set "
+                    "COMPILE_TRANSFORMER=false.", type(exc).__name__, str(exc).splitlines()[0][:200])
+                return
+            # mode and options are mutually exclusive in torch.compile; bf16 keeps the numerics of the plain path
+            prec = (settings.TRT_PRECISION or "bf16").lower()
+            if prec == "fp16":
+                _make_transformer_fp16(p.transformer)
+                enabled = {torch.float16}
+            else:
+                enabled = {torch.bfloat16}
+            trt_opts = {"enabled_precisions": enabled, "min_block_size": 5,
+                        "truncate_double": True, "use_python_runtime": True}
+            if settings.TRT_ENGINE_CACHE_DIR:
+                cache_dir = str(Path(settings.TRT_ENGINE_CACHE_DIR).resolve() / f"{prec}")
+                Path(cache_dir).mkdir(parents=True, exist_ok=True)
+                trt_opts.update({"cache_built_engines": True, "reuse_cached_engines": True, "engine_cache_dir": cache_dir})
+            try:
+                p.transformer.compile(backend="tensorrt", dynamic=False, options=trt_opts)
+            except Exception as exc:
+                logger.warning("TensorRT engine-cache options not accepted (%s) - compiling without the cache", exc)
+                for k in ("cache_built_engines", "reuse_cached_engines", "engine_cache_dir"):
+                    trt_opts.pop(k, None)
+                p.transformer.compile(backend="tensorrt", dynamic=False, options=trt_opts)
+            logger.info("Slot %d: transformer compiled with TensorRT (%s) - first call per shape builds the engine (slow)", slot.idx, prec)
+        else:
+            p.transformer.compile(mode=settings.COMPILE_MODE, dynamic=False)
+            logger.info("Slot %d: transformer compiled (mode=%s) - first calls per shape are slow", slot.idx, settings.COMPILE_MODE)
 
 def warmup_slots() -> None:
     """Run each template through each slot once so torch.compile builds every shape before the first request."""
-    if not (settings.COMPILE_TRANSFORMER and settings.WARMUP_AT_STARTUP):
+    if not (settings.COMPILE_TRANSFORMER and settings.WARMUP_AT_STARTUP) or _COMPILE_DISABLED:
         return
     for slot in slots:
         for key in ("Man", "Woman", "Woman_Hijab"):
@@ -341,14 +516,79 @@ def warmup_slots() -> None:
                 images = [avatar, face] + ([visor] if visor is not None else [])
                 slot.set_lora(settings.LORA_STRENGTH * settings.ID_LORA_MULT * settings.ID_LORA_SCHEDULE[0])
                 with torch.no_grad(), torch.cuda.stream(slot.stream):
-                    slot.pipe(prompt="warmup", image=images, attention_kwargs=slot.lora_kwargs(),
-                              width=avatar.size[0], height=avatar.size[1], num_inference_steps=2,
-                              guidance_scale=settings.CFG, generator=torch.Generator("cuda").manual_seed(0))
+                    wimg = slot.pipe(prompt="warmup", image=images, attention_kwargs=slot.lora_kwargs(),
+                                     width=avatar.size[0], height=avatar.size[1], num_inference_steps=2,
+                                     guidance_scale=settings.CFG, generator=torch.Generator("cuda").manual_seed(0)).images[0]
                 slot.stream.synchronize()
+                if settings.COMPILE_BACKEND == "tensorrt" and (settings.TRT_PRECISION or "").lower() == "fp16":
+                    if float(np.asarray(wimg.convert("L"), dtype=np.float32).std()) < 1.0:
+                        logger.error("TensorRT fp16 warm-up image for %s is flat/black - FLUX overflowed in fp16. "
+                                     "Set TRT_PRECISION=bf16.", key)
                 logger.info("Warm-up slot %d / %s done in %.1fs", slot.idx, key, time.time() - t0)
             except Exception:
                 logger.exception("Warm-up slot %d / %s failed (continuing)", slot.idx, key)
     torch.cuda.empty_cache()
+
+def warmup_runtime() -> None:
+    """Throw-away warm-up (any backend): the first real batch after a restart otherwise pays all one-time costs -
+    CUDA/Nunchaku kernel init per slot, template latent + text caches, CLIP, and the first TensorFlow inference in each
+    DeepFace worker. Outputs are discarded; prompts, seeds and settings used for real requests are not touched."""
+    if not settings.WARMUP_RUNTIME:
+        return
+    t_all = time.time()
+    steps = max(1, int(settings.STEPS))
+    # 1) GPU: every slot x every template, at the real step count and the real number of reference images
+    for slot in slots:
+        for key in ("Man", "Woman", "Woman_Hijab"):
+            try:
+                t0 = time.time()
+                avatar, _ = load_avatar(key)
+                face = pad_square(avatar.resize((512, 512), Image.LANCZOS))
+                visor = load_visor_ref(key)
+                images = [avatar, face] + ([visor] if visor is not None else [])
+                slot.set_lora(settings.LORA_STRENGTH * settings.ID_LORA_MULT * settings.ID_LORA_SCHEDULE[0])
+                with torch.no_grad(), torch.cuda.stream(slot.stream):
+                    slot.pipe(prompt="warmup", image=images, attention_kwargs=slot.lora_kwargs(),
+                              width=avatar.size[0], height=avatar.size[1], num_inference_steps=steps,
+                              guidance_scale=settings.CFG, generator=torch.Generator("cuda").manual_seed(0)).images[0]
+                slot.stream.synchronize()
+                logger.info("Runtime warm-up slot %d / %s done in %.1fs", slot.idx, key, time.time() - t0)
+            except Exception:
+                logger.exception("Runtime warm-up slot %d / %s failed (continuing)", slot.idx, key)
+        try:
+            slot.reset_lora()
+        except Exception:
+            pass
+    # 2) CLIP
+    try:
+        im = load_avatar("Man")[0]
+        clip_scores(im.convert("RGB").resize((224, 224)), ["a photo of a person", "a photo of an animal"])
+    except Exception:
+        logger.exception("CLIP warm-up failed (continuing)")
+    # 3) CPU workers: touch every detect worker and every scoring worker once, in parallel
+    try:
+        files = sorted(p for p in settings.AVATAR_DIR.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS)
+        sample = files[0] if files else None
+        im = load_avatar("Man")[0].convert("RGB")
+        jobs = []
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            if sample is not None and _DETECT_Q is not None:
+                for _ in range(max(1, settings.DETECT_WORKERS)):
+                    jobs.append(ex.submit(_run_detect_persistent, sample, settings.WORKER_TIMEOUT))
+            for _ in range(max(1, int(getattr(settings, "VAL_WORKERS", 1)))):
+                jobs.append(ex.submit(embed, im, False, "warm"))
+            for j in jobs:
+                try:
+                    j.result()
+                except Exception:
+                    logger.exception("CPU worker warm-up failed (continuing)")
+    except Exception:
+        logger.exception("CPU worker warm-up failed (continuing)")
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+    logger.info("Runtime warm-up finished in %.1fs - server is warm.", time.time() - t_all)
 
 # ---- persistent face-detection workers (PERSISTENT_DETECT) ----
 _DETECT_Q: Optional["queue.Queue"] = None
@@ -453,8 +693,7 @@ def get_cuda_device_name() -> Optional[str]:
     return None
 
 def is_val_worker_alive() -> bool:
-    p = _VW.get("p")
-    return p is not None and p.poll() is None
+    return any(p.poll() is None for p in list(_VW_ALL))
 
 lora_layers = 0
 
@@ -488,11 +727,78 @@ def _log_versions() -> None:
     except Exception:
         pass
 
+def _load_nunchaku_transformer():
+    """Load one independent quantized transformer for a GPU slot."""
+    try:
+        from nunchaku import NunchakuFlux2Transformer2DModel
+        from nunchaku.utils import get_precision
+    except ImportError as exc:
+        raise RuntimeError(
+            "FLUX_BACKEND=nunchaku requires the Vitoom Nunchaku wheel in the same Python "
+            "environment that starts app.py. The published Linux x86_64 wheel is available "
+            "for Python 3.11 with Torch 2.11/cu130; see the README setup steps."
+        ) from exc
+    name = "FLUX.2-klein-9B-Nunchaku"
+    model = settings.NUNCHAKU_MODEL
+    weights = f"{model}/svdq-{get_precision()}_r32-{name}.safetensors"
+    transformer = NunchakuFlux2Transformer2DModel.from_pretrained(weights, torch_dtype=torch.bfloat16)
+    from huggingface_hub import hf_hub_download
+    lora_source = Path(settings.LORA)
+    lora_path = (lora_source / settings.LORA_FILE if lora_source.is_dir()
+                 else Path(hf_hub_download(repo_id=settings.LORA, filename=settings.LORA_FILE)))
+    if not lora_path.is_file():
+        raise FileNotFoundError(f"BFS LoRA file is missing: {lora_path}")
+    transformer.update_lora_params(str(lora_path))
+    transformer.set_lora_strength(settings.LORA_STRENGTH)
+    return transformer
+
+def model_dtype():
+    """dtype of the diffusers FLUX pipeline (MODEL_DTYPE). fp16 is not quantization, but FLUX can overflow in fp16."""
+    return torch.float16 if (settings.MODEL_DTYPE or "bf16").lower() in ("fp16", "float16", "half") else torch.bfloat16
+
+_DIRECT_GPU_OK = False   # set in load_models(): True only when there is enough free VRAM (not CPU-offload mode)
+
+def _load_flux_pipeline(shared=None):
+    from diffusers import Flux2KleinPipeline
+    if settings.FLUX_BACKEND == "nunchaku":
+        return Flux2KleinPipeline.from_pretrained(
+            settings.NUNCHAKU_MODEL, torch_dtype=torch.bfloat16,
+            transformer=_load_nunchaku_transformer(), **(shared or {}))
+    if settings.LOAD_DIRECT_TO_GPU and _DIRECT_GPU_OK:
+        try:
+            return Flux2KleinPipeline.from_pretrained(
+                settings.FLUX_MODEL, dtype=model_dtype(), device_map="cuda", **(shared or {}))
+        except Exception as exc:
+            logger.warning("Direct-to-GPU load failed (%s) - falling back to CPU RAM load + .to('cuda')", exc)
+    return Flux2KleinPipeline.from_pretrained(
+        settings.FLUX_MODEL, dtype=model_dtype(), **(shared or {}))
+
 def _lora_selftest() -> None:
     """Generate the same tiny image with the LoRA off and on. If the output does not change, the face-swap LoRA is
     doing nothing (this is what makes avatars ignore the user's face). Tries the notebook's way (attention_kwargs
     scale) first, then pipe.set_adapters; raises if neither changes the output."""
     logger.info("LoRA self-test: generating 4 tiny images (a few seconds)...")
+    if settings.FLUX_BACKEND == "nunchaku":
+        av, _ = load_avatar("Man")
+        base = av.resize((512, 512), Image.LANCZOS)
+        face = pad_square(base.crop((140, 20, 400, 300)), 512)
+        def gen_nunchaku(strength):
+            pipe.transformer.set_lora_strength(strength)
+            with torch.no_grad():
+                im = pipe(prompt=lora_prompt("head_swap: replace the head in Picture 1 with the head from Picture 2."),
+                          image=[base, face], width=512, height=512, num_inference_steps=4,
+                          guidance_scale=settings.CFG,
+                          generator=torch.Generator("cuda").manual_seed(1)).images[0]
+            return np.asarray(im.convert("RGB")).astype(np.int16)
+        try:
+            difference = float(np.abs(gen_nunchaku(0.0) - gen_nunchaku(1.1)).mean())
+        finally:
+            pipe.transformer.set_lora_strength(settings.LORA_STRENGTH)
+        if difference <= 1.0:
+            raise RuntimeError(f"Nunchaku BFS LoRA self-test failed: mean pixel difference {difference:.2f}")
+        _LORA["mode"] = "nunchaku"
+        logger.info("Nunchaku BFS LoRA self-test passed: mean pixel difference %.2f", difference)
+        return
     av, _ = load_avatar("Man")
     base = av.resize((512, 512), Image.LANCZOS)
     face = pad_square(base.crop((140, 20, 400, 300)), 512)
@@ -505,7 +811,7 @@ def _lora_selftest() -> None:
             pipe.set_adapters(["bfs"], adapter_weights=[1.0])
         with torch.no_grad():
             im = pipe(
-                prompt="head_swap: start with Picture 1 as the base image, replace the head with the head from Picture 2.",
+                prompt=lora_prompt("head_swap: start with Picture 1 as the base image, replace the head with the head from Picture 2."),
                 image=[base, face],
                 attention_kwargs={"scale": float(weight)} if kwargs_mode else None,
                 width=512, height=512, num_inference_steps=4, guidance_scale=settings.CFG,
@@ -539,8 +845,33 @@ def _lora_selftest() -> None:
         "ignore the user's photo. Check diffusers / peft / transformers versions (see env_report.py)."
     )
 
+def _trim_slots_for_headroom() -> None:
+    """OOM guard: every running job needs ~SLOT_PEAK_GB of activation memory on top of the loaded weights.
+    Drop the last slot(s) until the free VRAM left after loading covers all concurrent jobs."""
+    import gc as _gc
+    while len(slots) > 1:
+        free_now, _t = get_gpu_memory_info()
+        need = len(slots) * float(settings.SLOT_PEAK_GB)
+        if free_now is None or free_now >= need:
+            break
+        dropped = slots.pop()
+        msg = (f"slot {dropped.idx} dropped to avoid CUDA OOM: {free_now:.1f} GB free < {len(slots) + 1} slots x "
+               f"SLOT_PEAK_GB={settings.SLOT_PEAK_GB} GB")
+        logger.warning(msg)
+        slot_errors.append(msg)
+        del dropped
+        _gc.collect()
+        torch.cuda.empty_cache()
+
 def load_models() -> None:
     global clip, pipe
+
+    if settings.FLUX_BACKEND not in {"diffusers", "nunchaku"}:
+        raise ValueError("FLUX_BACKEND must be 'diffusers' or 'nunchaku'")
+    if settings.FLUX_BACKEND == "nunchaku":
+        if settings.FUSE_LORA or settings.COMPILE_TRANSFORMER:
+            raise ValueError("Nunchaku requires FUSE_LORA=false and COMPILE_TRANSFORMER=false")
+        _LORA["mode"] = "nunchaku"
 
     assert torch.cuda.is_available(), "PyTorch cannot see the GPU - FLUX needs CUDA."
     torch.backends.cudnn.enabled = bool(settings.CUDNN_ENABLED)
@@ -548,6 +879,8 @@ def load_models() -> None:
     free_gb, total_gb = get_gpu_memory_info()
     free_gb_val = free_gb if free_gb is not None else 0.0
     low_vram = free_gb_val < 45.0
+    global _DIRECT_GPU_OK
+    _DIRECT_GPU_OK = not low_vram
     logger.info(
         "GPU free VRAM: %s / %s GB -> %s",
         f"{free_gb_val:.1f}",
@@ -567,15 +900,15 @@ def load_models() -> None:
     )
     logger.info("CLIP loaded successfully.")
 
-    from diffusers import Flux2KleinPipeline, FlowMatchEulerDiscreteScheduler
+    from diffusers import FlowMatchEulerDiscreteScheduler
     from diffusers.utils import logging as df_logging
     df_logging.set_verbosity_error()
 
-    logger.info("Loading FLUX model: %s", settings.FLUX_MODEL)
-    pipe = Flux2KleinPipeline.from_pretrained(settings.FLUX_MODEL, dtype=torch.bfloat16)
+    logger.info("Loading FLUX backend %s", settings.FLUX_BACKEND)
+    pipe = _load_flux_pipeline()
     if low_vram:
         pipe.enable_model_cpu_offload()
-    else:
+    elif getattr(pipe, "hf_device_map", None) is None:   # loaded with device_map="cuda" -> already on the GPU (diffusers rejects .to() then)
         pipe.to("cuda")
 
     # Decode the final image in tiles instead of one giant allocation - this is what was
@@ -584,17 +917,20 @@ def load_models() -> None:
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
 
-    logger.info("Loading LoRA weights: %s / %s", settings.LORA, settings.LORA_FILE)
-    pipe.load_lora_weights(settings.LORA, weight_name=settings.LORA_FILE, adapter_name="bfs")
+    if settings.FLUX_BACKEND == "diffusers":
+        logger.info("Loading LoRA weights: %s / %s", settings.LORA, settings.LORA_FILE)
+        pipe.load_lora_weights(settings.LORA, weight_name=settings.LORA_FILE, adapter_name="bfs")
     pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
         pipe.scheduler.config,
-        shift=1.0,
+        shift=settings.SCHED_SHIFT,
         use_dynamic_shifting=False,
     )
     global lora_layers
-    lora_layers = _count_lora_layers()
+    lora_layers = _count_lora_layers() if settings.FLUX_BACKEND == "diffusers" else -1
     if settings.LORA_SELFTEST:
         _lora_selftest()
+    if settings.FLUX_BACKEND == "diffusers" and model_dtype() == torch.float16:
+        logger.info("MODEL_DTYPE=fp16: FLUX runs in half precision. If avatars come out black/noisy, set MODEL_DTYPE=bf16.")
     _log_versions()
     logger.info("Active adapters: %s | LoRA layers attached to transformer: %d", _adapters(), lora_layers)
     if lora_layers == 0:
@@ -612,7 +948,8 @@ def load_models() -> None:
     if low_vram and settings.GPU_SLOTS > 1:
         logger.warning("Low free VRAM - running with 1 GPU slot (CPU-offload mode cannot run concurrent jobs).")
     try:
-        te_has_lora = any(hasattr(m, "lora_A") for m in pipe.text_encoder.modules())
+        te_has_lora = settings.FLUX_BACKEND == "diffusers" and any(
+            hasattr(m, "lora_A") for m in pipe.text_encoder.modules())
     except Exception:
         te_has_lora = True
     shared = {} if te_has_lora else dict(text_encoder=pipe.text_encoder, tokenizer=pipe.tokenizer, vae=pipe.vae)
@@ -635,11 +972,13 @@ def load_models() -> None:
                 break
             try:
                 logger.info("Loading GPU slot %d (%s)...", i, attempt)
-                sp = Flux2KleinPipeline.from_pretrained(settings.FLUX_MODEL, dtype=torch.bfloat16, **comps)
-                sp.to("cuda")
-                sp.load_lora_weights(settings.LORA, weight_name=settings.LORA_FILE, adapter_name="bfs")
+                sp = _load_flux_pipeline(comps)
+                if getattr(sp, "hf_device_map", None) is None:
+                    sp.to("cuda")
+                if settings.FLUX_BACKEND == "diffusers":
+                    sp.load_lora_weights(settings.LORA, weight_name=settings.LORA_FILE, adapter_name="bfs")
                 sp.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
-                    sp.scheduler.config, shift=1.0, use_dynamic_shifting=False)
+                    sp.scheduler.config, shift=settings.SCHED_SHIFT, use_dynamic_shifting=False)
                 st = GpuSlot(i, sp, {"scale": 1.0, "mode": _LORA["mode"]})
                 if st.lora["mode"] == "adapters":
                     sp.set_adapters(["bfs"], adapter_weights=[1.0])
@@ -653,6 +992,8 @@ def load_models() -> None:
         if sp is None:
             logger.warning("Could not load GPU slot %d - continuing with %d slot(s).", i, len(slots))
             break
+    sp = st = None  # drop the loop references so a trimmed slot's memory can really be freed
+    _trim_slots_for_headroom()
     for s in slots:
         apply_speed_options(s)
     _slot_q = asyncio.Queue()
@@ -665,6 +1006,7 @@ def load_models() -> None:
     get_val_worker()
     start_detect_pool()
     warmup_slots()
+    warmup_runtime()
 
 def shutdown_models() -> None:
     logger.info("Shutting down model resources...")
@@ -1290,6 +1632,93 @@ HAIR_RETRY = (
     "same receding hairline as Picture 2. the top of the head must be covered by hair, never a bare shiny scalp. "
 )
 
+# ---------------------------------------------------------------------------------------------------------------
+# Women / hijab prompt tune (settings.WOMEN_PROMPT_TUNE). From the 16-Oct runs: women came out with the template's
+# eyes and brows and bluish irises (the old Picture 3 was the template's face behind a blue lens), aged skin (the
+# id_focus text asks to keep forehead lines / crow's feet / pores - on women FLUX over-paints them) and a visor that
+# sticks out past the cheek / hijab edge. Applied as text edits on the finished prompt; men are untouched.
+# ---------------------------------------------------------------------------------------------------------------
+WOMEN_EYES = (
+    "EYES: her eyes come only from Picture 2: the same eye shape, size, eyelid fold, lash line and eye spacing, and "
+    "the same natural iris colour as Picture 2 (dark brown stays dark brown), with clear white eye whites and a "
+    "small catchlight, seen sharply through the clear, untinted lens. her eyebrows keep the exact shape, thickness "
+    "and arch of Picture 2. "
+)
+
+WOMEN_SKIN_OLD = (
+    "keep the real skin texture and age: forehead lines, smile lines, crow's feet, under-eye bags, pores and the "
+    "true grey or white strands in the hair; do not airbrush them away. "
+)
+WOMEN_SKIN_NEW = (
+    "keep her real age exactly as in Picture 2 (not younger, not older), her full natural cheeks and face shape and "
+    "her real skin tone. paint her skin exactly like the male avatars of this series: crisp semi-realistic digital "
+    "painting with clearly defined light and shadow shapes, warm healthy skin colour, visible natural skin texture, "
+    "sharp detail and strong contrast, lit by the red rim light and cool blue fill light. "
+)
+
+WOMEN_VISOR_FIT = (
+    "the visor is fitted to her face like real glasses: its width matches her face from temple to temple, the top "
+    "edge sits just under her eyebrows, the lower edge rests on the top of her cheeks, and the outer corners end at "
+    "her temples, inside the outline of her face{hijab}. on the side nearest the camera the corner block ends at the "
+    "edge of her cheek, so the visor does not stick out past her face. "
+)
+
+# Hijab avatars keep the EXACT wording of the good hijab run (run_20261016_233752): soft clean skin, no red-rim-light line,
+# original visor-fit text. Non-hijab women keep the newer crisp wording above.
+WOMEN_SKIN_HIJAB = (
+    "keep her real age and her natural skin tone, painted as smooth, clean, softly shaded skin with only the smile "
+    "lines that are clearly visible in Picture 2. "
+)
+WOMEN_VISOR_FIT_HIJAB = (
+    "the visor is fitted to her face like real glasses: its width matches her face from temple to temple, the top "
+    "edge sits just under her eyebrows, the lower edge rests on the top of her cheeks, and the outer corners end at "
+    "her temples, inside the outline of her face{hijab}. "
+)
+
+WOMEN_VISOR_REF = (
+    "Picture 3 shows the exact visor on its own: copy its shape (straight top edge, angular faceted corners, thin "
+    "electric-blue frame, cyan corner blocks, clear see-through lens) and scale it to fit her face. "
+)
+
+def _women_tune(p: str, info, ref: bool) -> str:
+    hijab = bool(info.get("hijab", False))
+    if hijab:
+        p = p.replace(WOMEN_SKIN_OLD, WOMEN_SKIN_HIJAB)
+        p = (
+            p.replace("painted with softly shaded skin that keeps the visible skin texture",
+                      "painted with smooth, clean, softly shaded skin")
+            .replace("painted with smooth airbrushed skin and soft realistic shading",
+                     "painted with smooth, clean, softly shaded skin")
+            .replace("keep the natural age, forehead lines, smile lines, under-eye detail and any grey in the hair of "
+                     "Picture 2;", "keep the natural age and smile of Picture 2;")
+            .replace("the visor is exactly the large angular futuristic shield worn in Picture 1",
+                     "the visor is exactly the angular futuristic shield worn in Picture 1")
+            .replace("broad faceted outer corners", "compact faceted outer corners")
+        )
+    else:
+        p = p.replace(WOMEN_SKIN_OLD, WOMEN_SKIN_NEW)
+        # id_focus wording "softly shaded skin" -> crisp, like the male avatars
+        p = p.replace("painted with softly shaded skin that keeps the visible skin texture",
+                      "painted with crisp, clearly defined skin shading that keeps the visible skin texture and strong contrast")
+        # skin style: leave the shared style text exactly as the men get it (no softening) - only the wrinkle list goes
+        p = (
+            p.replace("keep the natural age, forehead lines, smile lines, under-eye detail and any grey in the hair of "
+                      "Picture 2;", "keep the natural age and smile of Picture 2;")
+            .replace("the visor is exactly the large angular futuristic shield worn in Picture 1",
+                     "the visor is exactly the angular futuristic shield worn in Picture 1")
+            .replace("broad faceted outer corners", "compact faceted outer corners")
+        )
+    if "BUILD: match" in p:
+        p = p.replace("BUILD: match", WOMEN_EYES + "BUILD: match", 1)
+    else:
+        p = WOMEN_EYES + p
+    if VISOR_FIT in p:
+        _fit = WOMEN_VISOR_FIT_HIJAB if hijab else WOMEN_VISOR_FIT
+        p = p.replace(VISOR_FIT, VISOR_FIT + _fit.format(hijab=" and inside the hijab opening" if hijab else ""), 1)
+    if ref and info.get("avatar") in settings.VISOR_REF_CLEAN and VISOR_REF_TEXT in p:
+        p = p.replace(VISOR_REF_TEXT, WOMEN_VISOR_REF, 1)
+    return p
+
 def visor_block(info, attempt=0, ref=False):
     look = VISOR_LOOK_MAN if info.get("avatar") == "Man" else VISOR_LOOK_DEFAULT
     return (
@@ -1301,23 +1730,169 @@ def visor_block(info, attempt=0, ref=False):
         + (VISOR_RETRY if attempt > 0 else "")
     )
 
+# ----------------------------------------------------------------------------
+# "v3" prompt variant (settings.PROMPT_VARIANT=v3): short, positive-only, no contradictions.
+# Why (from the 14-photo concurrency run, test_results/run_20261016_224210):
+#   * the old prompts are ~1,300+ words. FLUX.2-klein is distilled (CFG ~1) so there is no negative guidance:
+#     every "never blue eyes / no stubble / no red highlights / double chin" sentence only puts that concept IN the
+#     prompt, and the 6+ repeated identity paragraphs dilute each other.
+#   * contradictions: "Picture 2 is the ONLY source of facial structure" vs "copy head rotation + micro expressions
+#     from Picture 1"; "do not airbrush" vs "smooth airbrushed skin" vs FACE_CLEAN "smooth, evenly painted skin";
+#     BUILD asks for "a soft double chin / thicker neck" (caricature).
+#   * VISOR_MANDATORY names "Picture 1 or 3" even when there is no Picture 3.
+#   * hijab: the template's black hijab and grey cowl bleed through (user's lilac/pink hijab came out black, flat
+#     grey patch on the chest). The hijab text must say the colour comes from Picture 2 and the drape is hijab fabric.
+# The old variants ("tuned", "id_focus") are untouched. Switch with PROMPT_VARIANT=v3 and A/B with send_10_images.py.
+# ----------------------------------------------------------------------------
+V3_HEAD = (
+    "head_swap: start with Picture 1 as the base image and keep its jacket, emblem, lighting and solid black "
+    "background. replace the head with the head of the real person in Picture 2. "
+)
+
+V3_IDENTITY = (
+    "the face is the exact person from Picture 2, recognisable at first glance, an honest unflattered likeness: same "
+    "face width and length, forehead, cheekbones, cheek fullness, jaw and chin, nose, lips, eyebrows, eye shape and "
+    "eye spacing, ears, skin tone, real age and skin texture (smile lines, pores, under-eye detail). the head "
+    "angle follows Picture 1, the smile and mouth {mouth}, and the eyes look straight at the viewer with the real "
+    "dark eye colour of Picture 2. "
+)
+
+V3_BUILD = (
+    "the face keeps the fullness of Picture 2: a full face stays full, a lean face stays lean. "
+)
+
+V3_STYLE = (
+    "style: semi-realistic digital painting like Picture 1, with softly shaded skin that keeps the real skin "
+    "texture, thin dark line work around the eyes, lips and hair, glossy individual hair strands, a red rim light "
+    "along the hair, forehead and cheek edge and a cool blue fill light on the shadow side, so the head blends into "
+    "the illustration with no swap seam. sharp detail, 4k. "
+)
+
+V3_VISOR_MAN = (
+    "the face wears the angular electric-blue wraparound visor from Picture 1{ref}: one continuous clear panel with "
+    "a straight top edge just under the eyebrows, chamfered lower corners, a thin electric-blue frame, a cyan corner "
+    "block at the outer end and a silver-blue arm to the ear. it spans temple to temple, sits level over both eyes "
+    "and follows the head tilt. the lens is clear glass, so the eyes and eyebrows of Picture 2 stay sharp and keep "
+    "their real colour behind it. any eyeglasses worn in Picture 2 are removed and replaced by this visor. "
+)
+
+V3_VISOR_DEFAULT = (
+    "the face wears the angular electric-blue wraparound visor from Picture 1{ref}: one continuous clear panel "
+    "covering both eyes, a straight thin blue upper rim just under the eyebrows, faceted outer corners, a shallow "
+    "V-shaped lower edge around the nose, cyan side blocks and slim arms to the temples. it spans temple to "
+    "temple, sits level over both eyes and follows the head tilt. the lens is clear glass, so the eyes and "
+    "eyebrows of Picture 2 stay sharp and keep their real colour behind it. any eyeglasses worn in Picture 2 are "
+    "removed and replaced by this visor. "
+)
+
+V3_HAIR = (
+    "hair: the exact hair of Picture 2 (colour, length, texture, volume, hairline and parting), with only a thin red "
+    "rim light added. "
+)
+
+V3_BALD = (
+    "the head is completely bald like Picture 2: a smooth bare shaved scalp in skin tone with only a thin red rim "
+    "light on its edge. "
+)
+
+V3_BEARD = (
+    "facial hair: the exact moustache, beard or stubble of Picture 2 with the same shape, coverage, length and grey "
+    "or black colour; a clean-shaven face stays clean-shaven. "
+)
+
+V3_WOMAN_HAIR = (
+    "her hair is styled like Picture 1, a high voluminous updo with soft strands framing her face, in the real "
+    "hair colour of Picture 2 with a thin red rim light. "
+)
+
+V3_FEMALE = (
+    "her natural look from Picture 2: her eyebrows, eyelids, lashes, lips and smile, her natural makeup level and "
+    "lip colour, her dimples and cheek fullness, her face shape. "
+)
+
+V3_HIJAB = (
+    "she wears her own {colour}hijab from Picture 2, copied in its real colours ({colour_rule}), the same sheen and "
+    "soft folds, wrapped snugly around the face with the "
+    "edge in the same place on the forehead, cheeks and under the chin, covering all hair, ears and neck. the "
+    "scarf then falls over the shoulders and chest in soft shaded folds of the same fabric and colour as the "
+    "head covering, lit by the red and blue lights of the jacket, and tucks into the jacket collar of Picture 1 "
+    "with no flat patches. only her head and hijab "
+    "come from Picture 2; her clothes and background do not. the visor sits inside the hijab opening, no wider "
+    "than the face, with its arms resting at the temples, and the hijab edge above the eyebrows stays visible. "
+)
+
+V3_CLOSING = (
+    "final check: the same real person as Picture 2, one visor on the face, jacket, emblem and black background "
+    "of Picture 1 unchanged."
+)
+
+V3_SKIN_TEXT = (
+    "real age and skin texture (smile lines, pores, under-eye detail)",
+    "natural skin tone and gentle smile lines, with clean, smooth, evenly painted skin and no pores, grain or blemish texture",
+)
+
+def _v3_women_skin(text: str) -> str:
+    """women/hijab: asking FLUX for real skin texture painted coarse, aged, orange skin on them; ask for clean skin.
+    Also keeps the visor no wider than her face (it stuck out past the cheek / hijab edge)."""
+    return (
+        text.replace(V3_SKIN_TEXT[0], V3_SKIN_TEXT[1])
+        .replace("softly shaded skin that keeps the real skin texture", "softly airbrushed, clean, smooth skin in the natural skin tone of Picture 2")
+        .replace("her natural look from Picture 2:", "her natural look from Picture 2, looking her real age, not older and not glamorised:")
+        .replace("it spans temple to temple, sits level", "it spans temple to temple and is never wider than her face, sits level")
+    )
+
+def _build_prompt_v3(info, attempt=0, ref=False, keep_user_expression=True, hair_retry=False):
+    is_woman = info.get("gender") == "Woman"
+    is_hijab = bool(info.get("hijab", False))
+    is_bald = bool(info.get("bald", False)) and not is_hijab and not is_woman
+    ident = V3_IDENTITY.format(mouth=("stay as in Picture 2" if keep_user_expression else "follow Picture 1"))
+    visor = (V3_VISOR_MAN if info.get("avatar") == "Man" else V3_VISOR_DEFAULT).format(
+        ref=" and the close-up in Picture 3" if ref else ""
+    )
+    if attempt > 0:
+        visor += VISOR_RETRY
+    if is_hijab:
+        col = info.get("hijab_colour")
+        hij = V3_HIJAB.format(
+            colour=(col + " " if col else ""),
+            colour_rule=(f"the hijab is {col}, not black" if col else "the hijab takes the colour of Picture 2's hijab, not the black of the template"),
+        )
+        p = V3_HEAD + ident + V3_FEMALE + V3_BUILD + hij + visor + V3_STYLE + V3_CLOSING
+    elif is_woman:
+        p = V3_HEAD + ident + V3_FEMALE + V3_BUILD + V3_WOMAN_HAIR + visor + V3_STYLE + V3_CLOSING
+    else:
+        hair = (V3_BALD + (BALD_RETRY if attempt > 0 else "")) if is_bald else (V3_HAIR + (HAIR_RETRY if hair_retry else ""))
+        p = V3_HEAD + ident + V3_BUILD + hair + V3_BEARD + visor + V3_STYLE + V3_CLOSING
+    if is_woman or is_hijab:
+        p = _strip_facial_hair(_v3_women_skin(p))
+    return p
+
+
+def lora_prompt(text: str) -> str:
+    """Prepend the LoRA trigger word (settings.LORA_TRIGGER, e.g. "jhuangswap") when one is configured."""
+    t = (settings.LORA_TRIGGER or "").strip()
+    return f"{t}, {text}" if t and not text.lstrip().startswith(t) else text
+
 def build_prompt(info, attempt=0, ref=False, style_mode=None, keep_user_expression=None, hair_retry=False):
+    return lora_prompt(_build_prompt_core(info, attempt, ref, style_mode, keep_user_expression, hair_retry))
+
+def _build_prompt_core(info, attempt=0, ref=False, style_mode=None, keep_user_expression=None, hair_retry=False):
     if style_mode is None:
         style_mode = settings.STYLE_MODE
     if keep_user_expression is None:
         keep_user_expression = settings.KEEP_USER_EXPRESSION
+    if settings.PROMPT_VARIANT == "v3":
+        return _build_prompt_v3(info, attempt, ref, keep_user_expression, hair_retry)
 
     # Only the MALE prompt has a bald branch; women / hijab prompts are untouched.
     is_bald = bool(info.get("bald", False)) and not info.get("hijab", False) and info.get("gender") != "Woman"
 
+    # Restored to the 16-Oct 11:09 wording (best women/hijab run). The "Mona-Lisa-style gaze" text added in commit
+    # 0fa6920 made FLUX close every smile (Mona Lisa = closed lips) and brought back the template's dark neck drape.
     expr = (
-        "copy the head rotation from Picture 1, but the eyes look straight into the camera at the viewer: a "
-        "steady, direct Mona-Lisa-style gaze that meets the viewer's eyes regardless of the head angle, using the "
-        "exact eye shape and real eye color of Picture 2. keep the facial expression and smile of Picture 2"
+        "copy the head rotation and eye direction from Picture 1, but keep the facial expression and smile of Picture 2"
         if keep_user_expression
-        else "copy the head rotation and micro expressions from Picture 1, but the eyes look straight into the "
-        "camera at the viewer: a steady, direct Mona-Lisa-style gaze that meets the viewer's eyes regardless of "
-        "the head angle, using the exact eye shape and real eye color of Picture 2"
+        else "copy the direction of the eye, head rotation, micro expressions from Picture 1"
     )
     hair_desc = "bare bald scalp (no hair)" if is_bald else "hair"
     bfs = (
@@ -1366,13 +1941,14 @@ def build_prompt(info, attempt=0, ref=False, style_mode=None, keep_user_expressi
             _strip_facial_hair(head), _strip_facial_hair(IDENTITY_TXT),
             _strip_facial_hair(style_text), _strip_facial_hair(closing),
         )
+    tune = (lambda t: _women_tune(t, info, ref)) if settings.WOMEN_PROMPT_TUNE else (lambda t: t)
     if info.get("hijab", False):
-        return (
+        return tune(
             f"{head}{IDENTITY_TXT}{BUILD}{V}{HIJAB_VISOR_NOTE}"
             f"{HIJAB_FACE}{HIJAB_USER}{FACE_CLEAN}{style_text} {closing} the visor is present and fits her face."
         )
     if info.get("gender") == "Woman":
-        return (
+        return tune(
             f"{head}{IDENTITY_TXT}{FEMALE_FACE}{BUILD}"
             "her hair is styled exactly like Picture 1: long black hair with red and orange highlights woven "
             "throughout, styled in a high voluminous bun or updo at the crown, sleek and professionally polished, "
@@ -1464,7 +2040,16 @@ def load_avatar(key: str) -> Tuple[Image.Image, str]:
                 )
             chosen = fallback_path
         logger.info("Loaded avatar template for %s: %s", key, chosen.name)
-        _AV[key] = (avatar_on_black(chosen), chosen.name)
+        av_img = avatar_on_black(chosen)
+        if key in settings.TEMPLATE_LENS_DETINT and key in VISOR_REFS:
+            from app.visor_ref import detint_template_lens
+            av_img = detint_template_lens(av_img, key, VISOR_REFS[key]["box"])
+            logger.info("Template %s: lens tint removed (clear lens over the eyes)", key)
+        if key in settings.VISOR_TRIM_FAR_SIDE and key in VISOR_REFS:
+            from app.visor_ref import trim_template_overhang
+            av_img = trim_template_overhang(av_img, key, VISOR_REFS[key]["box"])
+            logger.info("Template %s: far-side visor overhang trimmed", key)
+        _AV[key] = (av_img, chosen.name)
     return _AV[key]
 
 def load_visor_ref(key: str) -> Optional[Image.Image]:
@@ -1495,6 +2080,15 @@ def load_visor_ref(key: str) -> Optional[Image.Image]:
                     key,
                     cfg["file"],
                 )
+        if crop is not None and key in settings.VISOR_REF_CLEAN:
+            from app.visor_ref import isolate_visor
+            cleaned = isolate_visor(crop, key)
+            if cleaned is not None and key in settings.VISOR_TRIM_FAR_SIDE:
+                from app.visor_ref import trim_ref_overhang
+                cleaned = trim_ref_overhang(cleaned, key)
+            if cleaned is not None:
+                crop = cleaned
+                logger.info("Visor reference for %s: cleaned (visor only, clear lens)", key)
         if crop is not None:
             s = max(crop.size)
             canvas = Image.new("RGB", (s, s), "black")
@@ -1630,22 +2224,42 @@ def embed(img: Image.Image, enforce: bool = True, name: str = "out") -> Optional
     )
     im.save(temp_path)
     try:
-        with _VLOCK:
-            try:
-                p = get_val_worker()
-                p.stdin.write(json.dumps({"img": str(temp_path), "enforce": bool(enforce)}) + "\n")
-                p.stdin.flush()
-                while True:
-                    line = p.stdout.readline()
-                    if not line:
-                        close_val_worker()
-                        return None
-                    if line.startswith("__JSON__"):
-                        r = json.loads(line[len("__JSON__"):])
-                        break
-            except BaseException:
-                close_val_worker()
-                raise
+        if not _VW_ALL:
+            get_val_worker()                # starts the pool on first use
+        p = _VW_FREE.get()                  # wait for an idle scoring worker (each handles one request at a time)
+        broken = False
+        try:
+            p.stdin.write(json.dumps({"img": str(temp_path), "enforce": bool(enforce)}) + "\n")
+            p.stdin.flush()
+            while True:
+                line = p.stdout.readline()
+                if not line:
+                    broken = True
+                    r = None
+                    break
+                if line.startswith("__JSON__"):
+                    r = json.loads(line[len("__JSON__"):])
+                    break
+        except BaseException:
+            broken = True
+            raise
+        finally:
+            if broken:
+                with _VLOCK:
+                    if p in _VW_ALL:
+                        _VW_ALL.remove(p)
+                _kill_worker(p)
+                try:                        # replace the dead worker so the pool keeps its size
+                    np_ = _start_val_worker()
+                    with _VLOCK:
+                        _VW_ALL.append(np_)
+                    _VW_FREE.put(np_)
+                except Exception as _exc:
+                    logger.warning("could not restart a scoring worker: %s", _exc)
+            else:
+                _VW_FREE.put(p)
+        if r is None:
+            return None
         if "error" in r or not r.get("faces"):
             return None
         return {"faces": r["faces"], "width": im.width, "height": im.height}
@@ -1670,7 +2284,8 @@ def _face_box(emb_res, target_w: int, target_h: int):
         return None
 
 
-def _apply_hijab_postfix(out: Image.Image, face: Image.Image, user_emb, rec: dict, key_for_debug=None) -> Image.Image:
+def _apply_hijab_postfix(out: Image.Image, face: Image.Image, user_emb, rec: dict, key_for_debug=None,
+                         skin_only: bool = False) -> Image.Image:
     """Skin smoothing / tone match + neck-drape recolour for hijab avatars. Fail-soft: returns `out` on any problem."""
     try:
         from app.postprocess_hijab import fix_hijab_avatar
@@ -1685,10 +2300,10 @@ def _apply_hijab_postfix(out: Image.Image, face: Image.Image, user_emb, rec: dic
             return out
         fixed, report = fix_hijab_avatar(
             out, ob, face if ub else None, ub,
-            skin_smooth=settings.HIJAB_SKIN_SMOOTH,
-            skin_match=settings.HIJAB_SKIN_MATCH,
-            hijab_match=settings.HIJAB_COLOR_MATCH,
-            drape=settings.HIJAB_DRAPE_FIX,
+            skin_smooth=settings.SKIN_POSTFIX_SMOOTH if skin_only else settings.HIJAB_SKIN_SMOOTH,
+            skin_match=settings.SKIN_POSTFIX_MATCH if skin_only else settings.HIJAB_SKIN_MATCH,
+            hijab_match=0.0 if skin_only else settings.HIJAB_COLOR_MATCH,
+            drape=0.0 if skin_only else settings.HIJAB_DRAPE_FIX,
         )
         rec["postfix"] = {"applied": True, **{k: v for k, v in report.items() if isinstance(v, (int, float, str, bool, type(None)))}}
         if settings.DEBUG_DUMP and key_for_debug:
@@ -1842,29 +2457,68 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         fut = _POOL.submit(embed_user, face) if settings.VALIDATE else None
 
         best, k, gen_s, val_s, stopped = None, 0, 0.0, 0.0, "all tries"
+        bad_tries = 0   # corrupted (noise) generations thrown away so far
         t_loop = time.time()
 
         progress = tqdm(total=max_k, desc=f"Generating avatar ({user_path.name})", unit="try")
         while True:
             mult = settings.ID_LORA_SCHEDULE[k % len(settings.ID_LORA_SCHEDULE)]
             slot.set_lora(test_lora * mult)
+            if info.get("hijab") and settings.PROMPT_VARIANT == "v3" and "hijab_colour" not in info:
+                info["hijab_colour"] = None  # computed once; stays None if the sample is unreliable
+                try:
+                    from app.postprocess_hijab import user_hijab_colour
+                    ue = fut.result() if fut is not None else embed_user(face)
+                    ub0 = _face_box(ue, face.width, face.height) if ue else None
+                    if ub0:
+                        info["hijab_colour"] = user_hijab_colour(face, ub0)
+                    logger.info("hijab colour for prompt: %s", info["hijab_colour"])
+                except Exception as e:
+                    logger.warning("hijab colour sampling failed: %s", e)
             prompt = build_prompt(info, attempt=k, ref=visor_ref is not None, style_mode=style_mode, hair_retry=(prev_hair == "bald"))
 
             tg = time.time()
-            with torch.no_grad(), torch.cuda.stream(slot.stream):
-                out = slot.pipe(
-                    **prompt_inputs(slot, prompt),
-                    image=images,
-                    attention_kwargs=slot.lora_kwargs(),
-                    width=w,
-                    height=h,
-                    num_inference_steps=steps,
-                    guidance_scale=cfg,
-                    generator=torch.Generator("cuda").manual_seed(seed + k),
-                ).images[0]
+            for _oom_try in (0, 1):
+                try:
+                    with torch.no_grad(), torch.cuda.stream(slot.stream):
+                        out = slot.pipe(
+                            **prompt_inputs(slot, prompt),
+                            image=images,
+                            attention_kwargs=slot.lora_kwargs(),
+                            width=w,
+                            height=h,
+                            num_inference_steps=steps,
+                            guidance_scale=cfg,
+                            generator=torch.Generator("cuda").manual_seed(seed + k + 1000 * bad_tries),
+                        ).images[0]
+                    break
+                except Exception as _gen_exc:
+                    if _oom_try or not settings.OOM_RETRY:
+                        raise
+                    if not isinstance(_gen_exc, torch.cuda.OutOfMemoryError):
+                        logger.exception("Generation error on slot %d (try %d) - retrying once", slot.idx, k + 1)
+                    logger.warning("Freeing the cache and retrying once on slot %d (try %d)", slot.idx, k + 1)
+                    slot.stream.synchronize()
+                    import gc as _gc
+                    _gc.collect()
+                    torch.cuda.empty_cache()
+                    time.sleep(2)
             slot.stream.synchronize()
-            torch.cuda.empty_cache()
+            # Keeping the allocator cache avoids repeated CUDA allocations between
+            # candidates and between concurrent slots. Let the allocator retain
+            # memory for the next quantized generation.
+            if settings.FLUX_BACKEND == "diffusers":
+                torch.cuda.empty_cache()
             g = time.time() - tg
+
+            if looks_corrupted(out) and bad_tries < 2:
+                bad_tries += 1
+                gen_s += g
+                logger.warning("Try %d on slot %d came out as noise (corrupted generation) - discarded, regenerating "
+                               "with a new seed (%d/2)", k + 1, slot.idx, bad_tries)
+                if dbg is not None:
+                    out.save(dbg / f"corrupt{bad_tries}_try{k + 1}.png")
+                continue
 
             tv = time.time()
             user_emb = fut.result() if fut is not None else None
@@ -1955,6 +2609,8 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         out, v = best["out"], best["v"]
         if info.get("hijab") and settings.HIJAB_POSTFIX:
             out = _apply_hijab_postfix(out, face, user_emb, rec, key_for_debug=locals().get("dbg"))
+        elif info.get("avatar") in settings.SKIN_POSTFIX_AVATARS:
+            out = _apply_hijab_postfix(out, face, user_emb, rec, key_for_debug=locals().get("dbg"), skin_only=True)
         jpeg_bytes = encode_jpeg_capped(out, settings.OUTPUT_MAX_BYTES)
         rec.update(
             status="done",

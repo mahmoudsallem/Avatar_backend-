@@ -34,3 +34,5 @@ bench_results/
 
 .claude
 skills-lock.json
+_to_delete
+trt_cache/

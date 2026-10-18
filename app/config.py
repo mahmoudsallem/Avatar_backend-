@@ -63,8 +63,12 @@ class Settings(BaseSettings):
     CLIP_DIR: Path = Path("/Models/clip-vit-base-patch32")
     CLIP_MODEL: str = "openai/clip-vit-base-patch32"
     FLUX_MODEL: str = "black-forest-labs/FLUX.2-klein-9B"
+    FLUX_BACKEND: str = "diffusers"  # "diffusers" or "nunchaku"
+    NUNCHAKU_MODEL: str = "tonera/FLUX.2-klein-9B-Nunchaku"
     LORA: str = "sisniha/BFS-Best-Face-Swap"
     LORA_FILE: str = "bfs_head_v1_flux-klein_9b_step3500_rank128.safetensors"
+    # Trigger word put at the START of every prompt (empty = none). The SmartCharacterSwap LoRA needs "jhuangswap".
+    LORA_TRIGGER: str = ""
 
     # ---------------- Face Detection Rules ----------------
     FACE_DETECTOR: str = "retinaface"
@@ -112,6 +116,11 @@ class Settings(BaseSettings):
     # ---------------- GPU Concurrency ----------------
     # Number of avatars generated at the same time on the GPU. Each extra slot loads another copy of the
     # FLUX transformer (~18 GB bf16); the text encoder + VAE are shared between slots.
+    SLOT_PEAK_GB: float = 19.0       # activation memory one running job can peak at; after loading, slots are trimmed until free VRAM >= slots x this (OOM guard)
+    OOM_RETRY: bool = True           # on a CUDA out-of-memory error during generation: free the cache, wait, retry that candidate once
+    VAL_WORKERS: int = 1             # persistent DeepFace/ArcFace scoring processes (CPU). 1 = old behaviour; with GPU_SLOTS=3 use 3 so slots do not queue for scoring
+    SCHED_SHIFT: float = 1.0         # FlowMatch scheduler shift. 1.0 = unchanged; 1.5-2.0 spends more of the few steps on face structure (identity)
+    VAE_COMPILE: bool = False        # torch.compile the VAE decoder (falls back to the normal decode if compile fails)
     GPU_SLOTS: int = 2               # 0 = AUTO: keep adding slots while at least SLOT_MIN_FREE_GB VRAM stays free (max 8)
     SLOT_MIN_FREE_GB: float = 44.0   # don't load another slot unless this much VRAM is still free (each running job peaks at ~19 GB of activations)
     ANALYSIS_CONCURRENCY: int = 4    # Step 1 (CPU subprocesses) running at once, outside the GPU slots
@@ -123,8 +132,14 @@ class Settings(BaseSettings):
     FUSE_LORA: bool = False            # merge the LoRA into the weights; needs a uniform ID_LORA_SCHEDULE (rounding-level change)
     ATTENTION_BACKEND: str = ""        # "" = diffusers default; try "_native_cudnn" or "native" (rounding-level change)
     COMPILE_TRANSFORMER: bool = False  # torch.compile the FLUX transformer (use together with FUSE_LORA; slow first start)
-    COMPILE_MODE: str = "default"      # "default" | "max-autotune-no-cudagraphs"
+    COMPILE_MODE: str = "default"      # "default" | "max-autotune-no-cudagraphs" (inductor only)
+    COMPILE_BACKEND: str = "inductor"  # "inductor" | "tensorrt" (torch-tensorrt; diffusers backend + FUSE_LORA only, NOT with nunchaku)
+    MODEL_DTYPE: str = "bf16"          # diffusers backend: "bf16" (default) | "fp16" - dtype of the FLUX pipeline weights (no quantization either way)
+    LOAD_DIRECT_TO_GPU: bool = True   # diffusers backend: load the FLUX weights straight onto the GPU (device_map="cuda") instead of into CPU RAM first, then .to("cuda")
+    TRT_ENGINE_CACHE_DIR: str = "trt_cache"  # TensorRT engines are saved here and reused on the next start (first start builds them: slow)
+    TRT_PRECISION: str = "bf16"        # COMPILE_BACKEND=tensorrt only: "bf16" (default) | "fp16" (transformer cast to fp16; checked for NaN/black output at warm-up)
     WARMUP_AT_STARTUP: bool = True     # with COMPILE_TRANSFORMER: compile every template shape before serving
+    WARMUP_RUNTIME: bool = True        # at startup run a throw-away generation on every GPU slot + template, and wake every CPU worker, so the first real batch is not slow (works with any backend)
     CUDNN_ENABLED: bool = False        # the old code forced cuDNN off; True may speed up the VAE convolutions
     PERSISTENT_DETECT: bool = False    # keep DeepFace face-detection processes alive instead of spawning one per photo
     DETECT_WORKERS: int = 2            # how many persistent detection processes (each ~2 GB RAM)
@@ -147,6 +162,12 @@ class Settings(BaseSettings):
 
     FALLBACK_SCALE: float = 1.15
     HIJAB_SCALE: float = 1.25
+    # Skin-only clean-up (light smoothing, shine removal, tone nudged toward the user's real skin) for these avatars.
+    # No hijab recolour / drape painting - that is HIJAB_POSTFIX, kept off.
+    # Off: the smoothing / shine compression made women's skin flat and hazy next to the crisp male avatars.
+    SKIN_POSTFIX_AVATARS: List[str] = []
+    SKIN_POSTFIX_SMOOTH: float = 0.35
+    SKIN_POSTFIX_MATCH: float = 0.6
     HIJAB_POSTFIX: bool = True  # pixel post-process for hijab avatars (skin smooth/tone match, neck-cowl recolour)
     HIJAB_SKIN_SMOOTH: float = 0.8
     HIJAB_SKIN_MATCH: float = 0.6
@@ -154,11 +175,23 @@ class Settings(BaseSettings):
     HIJAB_DRAPE_FIX: float = 0.9
     REF_SIZE: int = 1024
     STYLE_MODE: str = "comic"  # "semi_real" | "comic" | "off"
-    PROMPT_VARIANT: str = "tuned"  # "tuned" = the notebook prompt (default) | "id_focus" = identity-first prompt (A/B test with bench_prompt_ab.py before switching)
+    PROMPT_VARIANT: str = "tuned"  # "tuned" = the notebook prompt (default) | "id_focus" = identity-first prompt | "v3" = short positive-only prompt (~380 words vs ~1300), A/B with send_10_images.py
     KEEP_USER_EXPRESSION: bool = True
 
     # ---------------- Visor & Similarity ----------------
     USE_VISOR_REF: bool = True
+    # Picture 3 cleanup: replace the template close-up (template eyes/brows/nose behind a dark-blue lens) with the
+    # traced visor alone on black + a clear see-through lens. Stops template eyes / blue irises / oversized visor.
+    VISOR_REF_CLEAN: List[str] = ["Woman", "Woman_Hijab", "Man"]
+    # Remove the blue lens tint from the TEMPLATE (Picture 1 = base image) for these avatars: its tinted lens made the
+    # user's eyes come out blue/purple. Only the lens area inside the traced visor outline is touched.
+    TEMPLATE_LENS_DETINT: List[str] = ["Woman", "Woman_Hijab", "Man"]
+    # OPT-IN (A/B first): cut the far-side part of the visor that sticks out past the cheek, in the template (inpainted)
+    # and in the visor reference. e.g. VISOR_TRIM_FAR_SIDE=["Woman","Woman_Hijab"]
+    VISOR_TRIM_FAR_SIDE: List[str] = []
+    # Women/hijab prompt tune (id_focus/tuned): user's own eyes block, smooth clean skin instead of "keep wrinkles/pores",
+    # visor fitted to her face. false = exact previous prompt.
+    WOMEN_PROMPT_TUNE: bool = True
     VALIDATE: bool = True
     BEST_OF_N: int = 3
     VISOR_EXTRA_TRIES: int = 2
