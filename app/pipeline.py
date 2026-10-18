@@ -396,7 +396,7 @@ def _install_ref_cache(p) -> None:
             hit = _REF_CACHE.get(key)
             if hit is not None:
                 _REF_CACHE.move_to_end(key)
-            else:
+            elif settings.CACHE_USER_LATENTS:
                 rec = _RECENT_REF.get(key)
                 if rec is not None:                    # seen in a recent try (e.g. the user's photo on try 2)
                     _RECENT_REF.move_to_end(key)
@@ -412,9 +412,10 @@ def _install_ref_cache(p) -> None:
         _CACHE_STATS["ref_miss"] += 1
         out = orig(image=image, generator=generator)
         with _REF_LOCK:
-            _RECENT_REF[key] = [out.detach().to("cpu"), 0]   # first sighting: keep briefly so the next try skips the encode
-            while len(_RECENT_REF) > 48:
-                _RECENT_REF.popitem(last=False)
+            if settings.CACHE_USER_LATENTS:
+                _RECENT_REF[key] = [out.detach().to("cpu"), 0]   # first sighting: keep briefly so the next try skips the encode
+                while len(_RECENT_REF) > 48:
+                    _RECENT_REF.popitem(last=False)
             if key in _REF_SEEN:                       # second sighting -> worth keeping
                 _REF_CACHE[key] = out.detach().to("cpu")
                 while len(_REF_CACHE) > 64:

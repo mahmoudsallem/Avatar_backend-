@@ -289,6 +289,8 @@ def main():
     meta = (f"server {base} | status={h.get('status')} gpu={h.get('device_name')} gpu_slots={h.get('gpu_slots', '?')} "
             f"free_vram={h.get('gpu_free_vram_gb')}GB")
     log(meta)
+    log(f"server config: backend={h.get('flux_backend')} lora_mode={h.get('lora_mode')} slots_requested={h.get('gpu_slots_requested')} "
+        f"settings={h.get('settings')} speed_options={h.get('speed_options')}")
     if h.get("status") != "ok":
         log("Server is not healthy - fix that first.")
         sys.exit(2)
@@ -339,6 +341,12 @@ def main():
             return f"{sum(v) / len(v):.1f}s" if v else "n/a"
         log(f"Server stages (avg per avatar): analysis-queue {_avg('a_wait')} | analysis {_avg('analysis')} | "
             f"GPU-slot-queue {_avg('slot_wait')} | generation {_avg('gen_only')} | scoring {_avg('score')}")
+    if ok:
+        _ids = [float(r["id_sim"]) for r in ok if r.get("id_sim") not in ("", None)]
+        _tr = [float(r["tries"]) for r in ok if r.get("tries") not in ("", None)]
+        if _ids and _tr:
+            log(f"QUALITY: mean id_sim {sum(_ids) / len(_ids):.3f} | min {min(_ids):.3f} | tries/avatar {sum(_tr) / len(_tr):.2f} "
+                f"(reference good run: id_sim 0.42, tries 1.57)")
     if ok:
         log(f"Effective time per avatar: {wall / len(ok):.1f}s (wall-clock / avatars) -> about {len(ok) / wall * 3600:.0f} avatars per hour")
         log("Note: per-avatar 'total s' is long because all requests run at the same time and share the GPU; compare the wall-clock between runs.")

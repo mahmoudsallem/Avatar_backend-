@@ -129,6 +129,7 @@ class Settings(BaseSettings):
     # ---------------- Speed options (all OFF by default = identical behaviour to before) ----------------
     # Exact / near-exact: they must not change the picture (check with bench_speed.py before enabling).
     CACHE_PROMPT_EMBEDS: bool = False  # cache the text-encoder output per distinct prompt (bit-identical)
+    CACHE_USER_LATENTS: bool = False   # TEST (off = exact previous behaviour): also keep the user's photo latents for the next try
     CACHE_REF_LATENTS: bool = False    # cache VAE latents of repeated reference images, e.g. the templates (bit-identical)
     FUSE_LORA: bool = False            # merge the LoRA into the weights; needs a uniform ID_LORA_SCHEDULE (rounding-level change)
     ATTENTION_BACKEND: str = ""        # "" = diffusers default; try "_native_cudnn" or "native" (rounding-level change)
