@@ -139,6 +139,7 @@ class Settings(BaseSettings):
     TRT_ENGINE_CACHE_DIR: str = "trt_cache"  # TensorRT engines are saved here and reused on the next start (first start builds them: slow)
     TRT_PRECISION: str = "bf16"        # COMPILE_BACKEND=tensorrt only: "bf16" (default) | "fp16" (transformer cast to fp16; checked for NaN/black output at warm-up)
     WARMUP_AT_STARTUP: bool = True     # with COMPILE_TRANSFORMER: compile every template shape before serving
+    WARMUP_RUNTIME: bool = True        # at startup run a throw-away generation on every GPU slot + template, and wake every CPU worker, so the first real batch is not slow (works with any backend)
     CUDNN_ENABLED: bool = False        # the old code forced cuDNN off; True may speed up the VAE convolutions
     PERSISTENT_DETECT: bool = False    # keep DeepFace face-detection processes alive instead of spawning one per photo
     DETECT_WORKERS: int = 2            # how many persistent detection processes (each ~2 GB RAM)

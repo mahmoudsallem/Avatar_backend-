@@ -529,6 +529,67 @@ def warmup_slots() -> None:
                 logger.exception("Warm-up slot %d / %s failed (continuing)", slot.idx, key)
     torch.cuda.empty_cache()
 
+def warmup_runtime() -> None:
+    """Throw-away warm-up (any backend): the first real batch after a restart otherwise pays all one-time costs -
+    CUDA/Nunchaku kernel init per slot, template latent + text caches, CLIP, and the first TensorFlow inference in each
+    DeepFace worker. Outputs are discarded; prompts, seeds and settings used for real requests are not touched."""
+    if not settings.WARMUP_RUNTIME:
+        return
+    t_all = time.time()
+    steps = max(1, int(settings.STEPS))
+    # 1) GPU: every slot x every template, at the real step count and the real number of reference images
+    for slot in slots:
+        for key in ("Man", "Woman", "Woman_Hijab"):
+            try:
+                t0 = time.time()
+                avatar, _ = load_avatar(key)
+                face = pad_square(avatar.resize((512, 512), Image.LANCZOS))
+                visor = load_visor_ref(key)
+                images = [avatar, face] + ([visor] if visor is not None else [])
+                slot.set_lora(settings.LORA_STRENGTH * settings.ID_LORA_MULT * settings.ID_LORA_SCHEDULE[0])
+                with torch.no_grad(), torch.cuda.stream(slot.stream):
+                    slot.pipe(prompt="warmup", image=images, attention_kwargs=slot.lora_kwargs(),
+                              width=avatar.size[0], height=avatar.size[1], num_inference_steps=steps,
+                              guidance_scale=settings.CFG, generator=torch.Generator("cuda").manual_seed(0)).images[0]
+                slot.stream.synchronize()
+                logger.info("Runtime warm-up slot %d / %s done in %.1fs", slot.idx, key, time.time() - t0)
+            except Exception:
+                logger.exception("Runtime warm-up slot %d / %s failed (continuing)", slot.idx, key)
+        try:
+            slot.reset_lora()
+        except Exception:
+            pass
+    # 2) CLIP
+    try:
+        im = load_avatar("Man")[0]
+        clip_scores(im.convert("RGB").resize((224, 224)), ["a photo of a person", "a photo of an animal"])
+    except Exception:
+        logger.exception("CLIP warm-up failed (continuing)")
+    # 3) CPU workers: touch every detect worker and every scoring worker once, in parallel
+    try:
+        files = sorted(p for p in settings.AVATAR_DIR.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS)
+        sample = files[0] if files else None
+        im = load_avatar("Man")[0].convert("RGB")
+        jobs = []
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            if sample is not None and _DETECT_Q is not None:
+                for _ in range(max(1, settings.DETECT_WORKERS)):
+                    jobs.append(ex.submit(_run_detect_persistent, sample, settings.WORKER_TIMEOUT))
+            for _ in range(max(1, int(getattr(settings, "VAL_WORKERS", 1)))):
+                jobs.append(ex.submit(embed, im, False, "warm"))
+            for j in jobs:
+                try:
+                    j.result()
+                except Exception:
+                    logger.exception("CPU worker warm-up failed (continuing)")
+    except Exception:
+        logger.exception("CPU worker warm-up failed (continuing)")
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+    logger.info("Runtime warm-up finished in %.1fs - server is warm.", time.time() - t_all)
+
 # ---- persistent face-detection workers (PERSISTENT_DETECT) ----
 _DETECT_Q: Optional["queue.Queue"] = None
 _DETECT_ALL: List[subprocess.Popen] = []
@@ -945,6 +1006,7 @@ def load_models() -> None:
     get_val_worker()
     start_detect_pool()
     warmup_slots()
+    warmup_runtime()
 
 def shutdown_models() -> None:
     logger.info("Shutting down model resources...")
