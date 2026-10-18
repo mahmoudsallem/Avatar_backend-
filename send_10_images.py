@@ -71,7 +71,7 @@ def send(endpoint, img, idx, out_dir, timeout, t_run):
     row = {"n": idx, "input": img.name, "input_kb": round(len(raw) / 1024), "input_copy": in_copy.relative_to(out_dir).as_posix(),
            "output": "", "output_kb": 0, "status": None, "ok": False, "rejected": False,
            "start": "", "end": "", "start_s": 0.0, "end_s": 0.0, "sec": 0.0,
-           "gen": "", "tries": "", "best_try": "", "id_sim": "", "visor": "", "steps": "", "note": ""}
+           "gen": "", "a_wait": "", "analysis": "", "slot_wait": "", "gen_only": "", "score": "", "tries": "", "best_try": "", "id_sim": "", "visor": "", "steps": "", "note": ""}
     t0 = time.time()
     row["start"] = datetime.now().strftime("%H:%M:%S")
     row["start_s"] = round(t0 - t_run, 1)
@@ -83,6 +83,11 @@ def send(endpoint, img, idx, out_dir, timeout, t_run):
             row["status"] = r.status
             h = r.headers
             row["gen"] = h.get("X-Generation-Seconds", "")
+            row["a_wait"] = h.get("X-Analysis-Wait-Seconds", "")
+            row["analysis"] = h.get("X-Analysis-Seconds", "")
+            row["slot_wait"] = h.get("X-Slot-Wait-Seconds", "")
+            row["gen_only"] = h.get("X-Gen-Only-Seconds", "")
+            row["score"] = h.get("X-Score-Seconds", "")
             row["tries"] = h.get("X-Tries-Used", "")
             row["best_try"] = h.get("X-Best-Try", "")
             row["id_sim"] = h.get("X-Identity-Similarity", "")
@@ -329,6 +334,11 @@ def main():
     if ok:
         secs = [r["sec"] for r in ok]
         log(f"Per-avatar time: min {min(secs)}s | avg {sum(secs) / len(secs):.1f}s | max {max(secs)}s")
+        def _avg(k):
+            v = [float(r[k]) for r in ok if r.get(k) not in ("", None)]
+            return f"{sum(v) / len(v):.1f}s" if v else "n/a"
+        log(f"Server stages (avg per avatar): analysis-queue {_avg('a_wait')} | analysis {_avg('analysis')} | "
+            f"GPU-slot-queue {_avg('slot_wait')} | generation {_avg('gen_only')} | scoring {_avg('score')}")
     if ok:
         log(f"Effective time per avatar: {wall / len(ok):.1f}s (wall-clock / avatars) -> about {len(ok) / wall * 3600:.0f} avatars per hour")
         log("Note: per-avatar 'total s' is long because all requests run at the same time and share the GPU; compare the wall-clock between runs.")

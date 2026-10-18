@@ -155,15 +155,27 @@ async def process_image_file(image_path: Path, overrides: Optional[dict] = None)
     the same GPU-slot/analysis-semaphore gating. Raises Rejected on an invalid
     or unsupported photo.
     """
+    t_req = time.time()
     async with analysis_sem:
+        t_a0 = time.time()
+        t_analysis_wait = t_a0 - t_req           # waiting for a free Step-1 slot
         t0 = time.time()
         info = await asyncio.to_thread(analyse_user, image_path)
 
     t_analysis = time.time() - t0
+    t_s0 = time.time()
     slot = await acquire_slot()
+    t_slot_wait = time.time() - t_s0             # waiting for a free GPU slot
     t0 = time.time() - t_analysis
     try:
-        return await asyncio.to_thread(generate_avatar, image_path, info, t0, slot, overrides)
+        jpeg_bytes, rec = await asyncio.to_thread(generate_avatar, image_path, info, t0, slot, overrides)
+        rec["analysis_wait_s"] = round(t_analysis_wait, 1)
+        rec["analysis_s"] = round(t_analysis, 1)
+        rec["slot_wait_s"] = round(t_slot_wait, 1)
+        logger.info("TIMING %s: analysis_wait=%.1fs analysis=%.1fs slot_wait=%.1fs gen=%.1fs score=%.1fs tries=%s total_server=%.1fs",
+                    image_path.name, t_analysis_wait, t_analysis, t_slot_wait, rec.get("gen_s", 0), rec.get("val_s", 0),
+                    rec.get("tries"), time.time() - t_req)
+        return jpeg_bytes, rec
     finally:
         release_slot(slot)
 

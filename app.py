@@ -80,6 +80,11 @@ app.add_middleware(
         "X-Visor-Status",
         "X-Bald-Status",
         "X-Steps-Used",
+        "X-Analysis-Wait-Seconds",
+        "X-Analysis-Seconds",
+        "X-Slot-Wait-Seconds",
+        "X-Gen-Only-Seconds",
+        "X-Score-Seconds",
     ],
 )
 
@@ -190,6 +195,11 @@ async def _generate_avatar_from_bytes(content: bytes, filename: str, overrides: 
             "X-Steps-Used": str(metadata.get("steps", "")),
             "X-Cfg-Used": str(metadata.get("cfg", "")),
             "X-Style-Used": str(metadata.get("style", "")),
+            "X-Analysis-Wait-Seconds": str(metadata.get("analysis_wait_s", "")),
+            "X-Analysis-Seconds": str(metadata.get("analysis_s", "")),
+            "X-Slot-Wait-Seconds": str(metadata.get("slot_wait_s", "")),
+            "X-Gen-Only-Seconds": str(metadata.get("gen_s", "")),
+            "X-Score-Seconds": str(metadata.get("val_s", "")),
         }
         return Response(content=jpeg_bytes, media_type="image/jpeg", headers=headers)
 
