@@ -354,6 +354,7 @@ _PROMPT_CACHE: "OrderedDict[str, torch.Tensor]" = OrderedDict()
 _PROMPT_LOCK = threading.Lock()
 _REF_CACHE: "OrderedDict[str, torch.Tensor]" = OrderedDict()
 _REF_SEEN: set = set()
+_RECENT_REF: "OrderedDict[str, list]" = OrderedDict()   # [latent_cpu, hits] - a user's photo is encoded once, reused by the next try
 _REF_LOCK = threading.Lock()
 _CACHE_STATS = {"prompt_hit": 0, "prompt_miss": 0, "ref_hit": 0, "ref_miss": 0}
 
@@ -395,12 +396,25 @@ def _install_ref_cache(p) -> None:
             hit = _REF_CACHE.get(key)
             if hit is not None:
                 _REF_CACHE.move_to_end(key)
+            else:
+                rec = _RECENT_REF.get(key)
+                if rec is not None:                    # seen in a recent try (e.g. the user's photo on try 2)
+                    _RECENT_REF.move_to_end(key)
+                    rec[1] += 1
+                    hit = rec[0]
+                    if rec[1] >= 2:                    # 3rd sighting -> a template/visor ref, keep it long-term
+                        _REF_CACHE[key] = rec[0]
+                        while len(_REF_CACHE) > 64:
+                            _REF_CACHE.popitem(last=False)
         if hit is not None:
             _CACHE_STATS["ref_hit"] += 1
             return hit.to(image.device)
         _CACHE_STATS["ref_miss"] += 1
         out = orig(image=image, generator=generator)
         with _REF_LOCK:
+            _RECENT_REF[key] = [out.detach().to("cpu"), 0]   # first sighting: keep briefly so the next try skips the encode
+            while len(_RECENT_REF) > 48:
+                _RECENT_REF.popitem(last=False)
             if key in _REF_SEEN:                       # second sighting -> worth keeping
                 _REF_CACHE[key] = out.detach().to("cpu")
                 while len(_REF_CACHE) > 64:
@@ -1058,6 +1072,8 @@ def load_models() -> None:
         _slot_q.put_nowait(s)
     free_after, _t = get_gpu_memory_info()
     logger.info("GPU slots ready: %d concurrent avatar generations (free VRAM now %s GB).", len(slots), free_after)
+    logger.info("ACTIVE SETTINGS: SCORE_OVERLAP=%s GPU_SLOTS(req)=%s slots(actual)=%d VAE_COMPILE=%s VAL_WORKERS=%s DETECT_WORKERS=%s ANALYSIS_CONCURRENCY=%s CUDNN=%s WORKER_CPU_THREADS=%s WARMUP_RUNTIME=%s BACKEND=%s",
+                settings.SCORE_OVERLAP, settings.GPU_SLOTS, len(slots), settings.VAE_COMPILE, settings.VAL_WORKERS, settings.DETECT_WORKERS, settings.ANALYSIS_CONCURRENCY, settings.CUDNN_ENABLED, settings.WORKER_CPU_THREADS, settings.WARMUP_RUNTIME, settings.FLUX_BACKEND)
 
     # Start persistent ArcFace identity verification worker
     get_val_worker()
