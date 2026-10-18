@@ -111,6 +111,8 @@ class Settings(BaseSettings):
     VERIFY_HAIR_VOLUME: bool = True
     HAIR_VOLUME_MISMATCH: float = 0.35   # |candidate short-hair score - user short-hair score| at/above this = mismatch
     W_HAIR_VOLUME: float = 2.0           # score penalty for a hair-volume mismatch
+    ID_EXTRA_TRIES: int = 1              # extra generations (beyond BEST_OF_N) when no candidate reached ID_EXTRA_BELOW; 0 = off
+    ID_EXTRA_BELOW: float = 0.40         # identity (id_sim) a result should reach before the search stops; same bar as STOP_ID
     HAIR_VOLUME_EXTRA_TRIES: int = 1     # extra generations (beyond BEST_OF_N) when every candidate still mismatches
 
     # ---------------- GPU Concurrency ----------------

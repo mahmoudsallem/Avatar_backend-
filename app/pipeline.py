@@ -2515,6 +2515,7 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         extras = 0
         hair_extras = 0
         hair_vol_extras = 0
+        id_extras = 0
         prev_hair = "ok"
 
         dbg = None
@@ -2673,6 +2674,14 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                     progress.total = max_k
                     progress.refresh()
                     logger.info("Hair volume mismatch in every candidate (diff=%s) - adding extra try (if budget permits)", best["v"].get("hair_vol_diff"))
+                elif (settings.VALIDATE and id_extras < settings.ID_EXTRA_TRIES
+                      and (best["v"]["id_sim"] or 0) < settings.ID_EXTRA_BELOW):
+                    id_extras += 1
+                    max_k += 1
+                    progress.total = max_k
+                    progress.refresh()
+                    logger.info("Identity low in every candidate (best id_sim=%s < %.2f) - adding extra try (if budget permits)",
+                                best["v"]["id_sim"], settings.ID_EXTRA_BELOW)
                 else:
                     break
 
