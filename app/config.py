@@ -121,6 +121,7 @@ class Settings(BaseSettings):
     VAL_WORKERS: int = 1             # persistent DeepFace/ArcFace scoring processes (CPU). 1 = old behaviour; with GPU_SLOTS=3 use 3 so slots do not queue for scoring
     SCHED_SHIFT: float = 1.0         # FlowMatch scheduler shift. 1.0 = unchanged; 1.5-2.0 spends more of the few steps on face structure (identity)
     VAE_COMPILE: bool = False        # torch.compile the VAE decoder (falls back to the normal decode if compile fails)
+    SCORE_OVERLAP: bool = False      # TEST: hand the GPU slot back while a try is being scored (CPU) and re-acquire it for the next try, so another request can use the GPU meanwhile. Same seeds/prompts/selection -> same outputs; only scheduling changes.
     GPU_SLOTS: int = 2               # 0 = AUTO: keep adding slots while at least SLOT_MIN_FREE_GB VRAM stays free (max 8)
     SLOT_MIN_FREE_GB: float = 44.0   # don't load another slot unless this much VRAM is still free (each running job peaks at ~19 GB of activations)
     ANALYSIS_CONCURRENCY: int = 4    # Step 1 (CPU subprocesses) running at once, outside the GPU slots

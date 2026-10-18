@@ -144,6 +144,37 @@ def set_lora(weight: float) -> None:  # slot 0 helper, kept for older callers/te
 def lora_kwargs():
     return slots[0].lora_kwargs()
 
+class SlotLease:
+    """SCORE_OVERLAP: lets generate_avatar (a worker thread) give its GPU slot back while a try is scored on the CPU and
+    take a slot again for the next try. The slot queue lives on the event loop, so hand-offs go through it thread-safely."""
+    def __init__(self, slot: "GpuSlot", loop):
+        self.slot, self.loop = slot, loop
+        self.held, self.closed, self.wait_s = True, False, 0.0
+
+    def release(self) -> None:
+        if self.held and not self.closed:
+            self.held = False
+            self.loop.call_soon_threadsafe(release_slot, self.slot)
+
+    def reacquire(self) -> "GpuSlot":
+        if self.held:
+            return self.slot
+        if self.closed:
+            raise RuntimeError("request was cancelled")
+        t = time.time()
+        self.slot = asyncio.run_coroutine_threadsafe(acquire_slot(), self.loop).result()
+        self.wait_s += time.time() - t
+        self.held = True
+        if self.closed:                       # request cancelled while we waited: give the slot straight back
+            self.held = False
+            self.loop.call_soon_threadsafe(release_slot, self.slot)
+            raise RuntimeError("request was cancelled")
+        return self.slot
+
+# generate_avatar threads for SCORE_OVERLAP: more requests can be "between tries" than there are slots, so they get their
+# own pool instead of asyncio's small default executor (which also runs Step 1).
+_GEN_EXEC = ThreadPoolExecutor(max_workers=48, thread_name_prefix="gen")
+
 # Step 1 (CPU: RetinaFace/DeepFace subprocess + CLIP) runs outside the GPU slots, this many at a time
 analysis_sem = asyncio.Semaphore(settings.ANALYSIS_CONCURRENCY)
 _CLIP_LOCK = threading.Lock()
@@ -167,8 +198,14 @@ async def process_image_file(image_path: Path, overrides: Optional[dict] = None)
     slot = await acquire_slot()
     t_slot_wait = time.time() - t_s0             # waiting for a free GPU slot
     t0 = time.time() - t_analysis
+    lease = SlotLease(slot, asyncio.get_running_loop()) if settings.SCORE_OVERLAP else None
     try:
-        jpeg_bytes, rec = await asyncio.to_thread(generate_avatar, image_path, info, t0, slot, overrides)
+        if lease is None:
+            jpeg_bytes, rec = await asyncio.to_thread(generate_avatar, image_path, info, t0, slot, overrides)
+        else:
+            jpeg_bytes, rec = await asyncio.get_running_loop().run_in_executor(
+                _GEN_EXEC, lambda: generate_avatar(image_path, info, t0, slot, overrides, lease))
+            t_slot_wait += lease.wait_s
         rec["analysis_wait_s"] = round(t_analysis_wait, 1)
         rec["analysis_s"] = round(t_analysis, 1)
         rec["slot_wait_s"] = round(t_slot_wait, 1)
@@ -177,7 +214,13 @@ async def process_image_file(image_path: Path, overrides: Optional[dict] = None)
                     rec.get("tries"), time.time() - t_req)
         return jpeg_bytes, rec
     finally:
-        release_slot(slot)
+        if lease is None:
+            release_slot(slot)
+        else:
+            lease.closed = True
+            if lease.held:
+                release_slot(lease.slot)
+                lease.held = False
 
 # Persistent ArcFace embedding worker state
 _VW = {"p": None}
@@ -446,8 +489,11 @@ def apply_speed_options(slot: "GpuSlot") -> None:
                            slot.idx, settings.ATTENTION_BACKEND, exc)
     if settings.CACHE_REF_LATENTS:
         _install_ref_cache(p)
-    if settings.VAE_COMPILE:
+    if settings.VAE_COMPILE and getattr(p.vae, "_saytara_vae_compiled", False):
+        logger.info("Slot %d: VAE decode already compiled (shared VAE)", slot.idx)
+    elif settings.VAE_COMPILE:
         try:
+            p.vae._saytara_vae_compiled = True      # the VAE is shared between slots: wrap/compile it once, not once per slot
             _orig_decode = p.vae.decode
             _fast_decode = torch.compile(_orig_decode)
             _state = {"ok": True, "warm": False}
@@ -2422,7 +2468,8 @@ def encode_jpeg_capped(img: Image.Image, max_bytes: int = None) -> bytes:
     return smallest
 
 def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = None,
-                    slot: Optional[GpuSlot] = None, overrides: Optional[dict] = None) -> Tuple[bytes, dict]:
+                    slot: Optional[GpuSlot] = None, overrides: Optional[dict] = None,
+                    lease: Optional["SlotLease"] = None) -> Tuple[bytes, dict]:
     # t0 defaults to "now" (generation-only budget) but callers should pass the
     # timestamp from before Step 1 analysis so TIME_BUDGET covers the whole
     # image end-to-end, matching the notebook.
@@ -2475,6 +2522,8 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         progress = tqdm(total=max_k, desc=f"Generating avatar ({user_path.name})", unit="try")
         while True:
             mult = settings.ID_LORA_SCHEDULE[k % len(settings.ID_LORA_SCHEDULE)]
+            if lease is not None and not lease.held:
+                slot = lease.reacquire()          # SCORE_OVERLAP: the slot was handed back while the last try was scored
             slot.set_lora(test_lora * mult)
             if info.get("hijab") and settings.PROMPT_VARIANT == "v3" and "hijab_colour" not in info:
                 info["hijab_colour"] = None  # computed once; stays None if the sample is unreliable
@@ -2532,6 +2581,8 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                     out.save(dbg / f"corrupt{bad_tries}_try{k + 1}.png")
                 continue
 
+            if lease is not None:
+                lease.release()                   # SCORE_OVERLAP: scoring is CPU work - let another request use this slot now
             tv = time.time()
             user_emb = fut.result() if fut is not None else None
             v = score_output(user_emb, out, info)
@@ -2669,4 +2720,5 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
     finally:
         if progress is not None:
             progress.close()
-        slot.reset_lora()
+        if lease is None or lease.held:
+            slot.reset_lora()
