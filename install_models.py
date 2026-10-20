@@ -9,11 +9,12 @@ Mirrors three local directories <-> s3://<S3_MODEL_BUCKET>/<S3_MODEL_CACHE_PREFI
 separate bucket from the one the photo pipeline (app/s3_watcher.py) uses:
 
   huggingface_hub/   <-> ~/.cache/huggingface/hub (or $HF_HOME/hub)
-                         FLUX.2-klein-9B, the Nunchaku quantized FLUX.2-klein-9B (if
-                         FLUX_BACKEND=nunchaku), the BFS LoRA, the CLIP model (if not using
-                         the local /Models override below), and anything else
-                         from_pretrained()/hf_hub_download() pulled - this is HF's own cache,
-                         so whatever is in it is "every model actually used so far".
+                         Only the specific repos app/config.py currently points at are synced -
+                         NUNCHAKU_MODEL or FLUX_MODEL (whichever FLUX_BACKEND actually uses),
+                         LORA, and CLIP_MODEL. Anything else sitting in this cache (old A/B
+                         experiments, a model someone tried out, an interrupted download) is
+                         left alone - the HF cache is shared/cumulative and routinely ends up
+                         holding things this app doesn't use.
   deepface_weights/  <-> ~/.deepface/weights (or $DEEPFACE_HOME/weights)
                          RetinaFace detector, ArcFace recognition, gender classifier - these
                          are auto-downloaded by DeepFace on first use (app/deepface_worker.py).
@@ -55,6 +56,8 @@ DEEPFACE_WEIGHTS_DIR = Path(os.environ.get("DEEPFACE_HOME", "~/.deepface")).expa
 MANIFEST_NAME = "_symlinks_manifest.json"
 # HF's own housekeeping (lock files / "checked and it doesn't exist" markers) - not model data.
 _SKIP_PARTS = {".locks", ".no_exist"}
+# A download that got interrupted - never a complete, loadable weight file regardless of model.
+_SKIP_SUFFIX = ".incomplete"
 
 # name -> (local dir, is this an HF hub cache - i.e. blobs/ + symlinked snapshots/ - or a flat dir?)
 MODEL_SETS: List[Tuple[str, Path, bool]] = [
@@ -62,6 +65,29 @@ MODEL_SETS: List[Tuple[str, Path, bool]] = [
     ("deepface_weights", DEEPFACE_WEIGHTS_DIR, False),
     ("local_clip", settings.CLIP_DIR, False),
 ]
+
+
+def _configured_hf_repos() -> List[str]:
+    """HF repo IDs this app actually loads right now, per the current app/config.py settings -
+    not everything that happens to be sitting in the cache. A "repo" that's actually a local
+    directory path (e.g. LORA or CLIP_MODEL pointed at a folder instead of a HF repo id) has
+    nothing to sync here - that's not stored in the HF hub cache at all."""
+    repos: List[str] = []
+
+    def _add(repo_id: str) -> None:
+        if repo_id and not Path(repo_id).is_dir() and repo_id not in repos:
+            repos.append(repo_id)
+
+    _add(settings.NUNCHAKU_MODEL if settings.FLUX_BACKEND == "nunchaku" else settings.FLUX_MODEL)
+    _add(settings.LORA)
+    _add(settings.CLIP_MODEL)
+    return repos
+
+
+def _configured_hf_repo_dirs() -> List[str]:
+    """Each configured repo id's cache directory name, e.g. "black-forest-labs/FLUX.2-klein-9B"
+    -> "models--black-forest-labs--FLUX.2-klein-9B" (HF's own naming convention)."""
+    return [f"models--{repo.replace('/', '--')}" for repo in _configured_hf_repos()]
 
 
 def _client():
@@ -87,35 +113,45 @@ def _s3_objects(s3, bucket: str, prefix: str) -> Dict[str, int]:
 
 
 def _plain_files(root: Path) -> Iterable[Path]:
-    """Every real (non-symlink) file under root, skipping HF's .locks/.no_exist housekeeping."""
+    """Every real (non-symlink) file under root, skipping HF's .locks/.no_exist housekeeping and
+    any interrupted-download fragment."""
     for path in root.rglob("*"):
-        if _SKIP_PARTS.intersection(path.parts):
+        if _SKIP_PARTS.intersection(path.parts) or path.name.endswith(_SKIP_SUFFIX):
             continue
         if path.is_file() and not path.is_symlink():
             yield path
 
 
-def _hf_cache_contents(root: Path) -> Tuple[List[Path], List[Tuple[str, str]]]:
-    """Splits an HF hub cache dir into real files and symlinks. Snapshot dirs are almost
-    entirely symlinks into blobs/ - without this split, every snapshot that links to a given
-    blob would re-upload/re-download that blob's bytes again. These are multi-GB model
-    weights, so that duplication is not an acceptable "simple" tradeoff."""
+def _hf_cache_contents(root: Path, repo_dirs: List[str]) -> Tuple[List[Path], List[Tuple[str, str]]]:
+    """Splits the configured repos' cache dirs (only repo_dirs - e.g.
+    "models--black-forest-labs--FLUX.2-klein-9B" - not the whole HF cache) into real files and
+    symlinks. Snapshot dirs are almost entirely symlinks into blobs/ - without this split, every
+    snapshot that links to a given blob would re-upload/re-download that blob's bytes again.
+    These are multi-GB model weights, so that duplication is not an acceptable "simple"
+    tradeoff. Relative paths are computed against root (the overall HF cache dir), so the S3
+    layout stays e.g. "models--.../blobs/<hash>" regardless of which repos are configured."""
     root_resolved = root.resolve()
-    real_files = list(_plain_files(root))
+    real_files: List[Path] = []
     symlinks: List[Tuple[str, str]] = []
-    for path in root.rglob("*"):
-        if _SKIP_PARTS.intersection(path.parts) or not path.is_symlink():
+    for repo_dir in repo_dirs:
+        repo_root = root / repo_dir
+        if not repo_root.is_dir():
+            print(f"  [WARN] configured model not in the cache, skipping: {repo_dir}", file=sys.stderr)
             continue
-        target = path.resolve()
-        if not target.exists():
-            print(f"  [WARN] broken symlink, skipping: {path.relative_to(root)}", file=sys.stderr)
-            continue
-        try:
-            target_rel = target.relative_to(root_resolved).as_posix()
-        except ValueError:
-            print(f"  [WARN] symlink points outside the cache, skipping: {path.relative_to(root)}", file=sys.stderr)
-            continue
-        symlinks.append((path.relative_to(root).as_posix(), target_rel))
+        real_files.extend(_plain_files(repo_root))
+        for path in repo_root.rglob("*"):
+            if _SKIP_PARTS.intersection(path.parts) or not path.is_symlink():
+                continue
+            target = path.resolve()
+            if not target.exists():
+                print(f"  [WARN] broken symlink, skipping: {path.relative_to(root)}", file=sys.stderr)
+                continue
+            try:
+                target_rel = target.relative_to(root_resolved).as_posix()
+            except ValueError:
+                print(f"  [WARN] symlink points outside the cache, skipping: {path.relative_to(root)}", file=sys.stderr)
+                continue
+            symlinks.append((path.relative_to(root).as_posix(), target_rel))
     return real_files, symlinks
 
 
@@ -169,7 +205,7 @@ def push(s3, bucket: str, name: str, local_root: Path, s3_prefix: str, is_hf_cac
         return
 
     if is_hf_cache:
-        real_files, symlinks = _hf_cache_contents(local_root)
+        real_files, symlinks = _hf_cache_contents(local_root, _configured_hf_repo_dirs())
     else:
         real_files, symlinks = list(_plain_files(local_root)), []
 
@@ -184,8 +220,17 @@ def push(s3, bucket: str, name: str, local_root: Path, s3_prefix: str, is_hf_cac
     uploaded, skipped, uploaded_bytes = _upload(s3, bucket, existing, items, dry_run)
 
     if symlinks and not dry_run:
+        # Merge into (not overwrite) any existing manifest - a differently-configured instance
+        # may have pushed a different set of repos earlier, and this push only ever collects
+        # symlinks for ITS OWN configured repos, not everything the bucket holds.
         manifest_key = s3_prefix + MANIFEST_NAME
-        s3.put_object(Bucket=bucket, Key=manifest_key, Body=json.dumps({"symlinks": symlinks}, indent=2).encode())
+        try:
+            resp = s3.get_object(Bucket=bucket, Key=manifest_key)
+            merged = dict(json.loads(resp["Body"].read()).get("symlinks", []))
+        except (BotoCoreError, ClientError):
+            merged = {}
+        merged.update(symlinks)
+        s3.put_object(Bucket=bucket, Key=manifest_key, Body=json.dumps({"symlinks": sorted(merged.items())}, indent=2).encode())
 
     print(f"[{name}] done: {uploaded} uploaded ({_human(uploaded_bytes)}), {skipped} already up to date")
 
@@ -194,6 +239,15 @@ def pull(s3, bucket: str, name: str, local_root: Path, s3_prefix: str, is_hf_cac
     objects = _s3_objects(s3, bucket, s3_prefix)
     manifest_key = s3_prefix + MANIFEST_NAME
     objects.pop(manifest_key, None)
+
+    if is_hf_cache:
+        # Only fetch repos THIS instance's config actually needs - the bucket may also hold
+        # repos pushed by a differently-configured instance (e.g. a diffusers-backend box next
+        # to a nunchaku-backend one).
+        repo_dirs = _configured_hf_repo_dirs()
+        allowed = tuple(s3_prefix + d + "/" for d in repo_dirs)
+        objects = {k: v for k, v in objects.items() if k.startswith(allowed)}
+
     if not objects:
         print(f"[{name}] skipping - s3://{bucket}/{s3_prefix} is empty")
         return
@@ -209,7 +263,11 @@ def pull(s3, bucket: str, name: str, local_root: Path, s3_prefix: str, is_hf_cac
             manifest = json.loads(resp["Body"].read())
         except (BotoCoreError, ClientError):
             manifest = {"symlinks": []}
+        repo_prefixes = tuple(d + "/" for d in _configured_hf_repo_dirs())
+        recreated = 0
         for link_rel, target_rel in manifest.get("symlinks", []):
+            if not link_rel.startswith(repo_prefixes):
+                continue  # recorded by a differently-configured instance's push - not pulled here
             link_path = local_root / link_rel
             target_path = local_root / target_rel
             link_path.parent.mkdir(parents=True, exist_ok=True)
@@ -217,10 +275,11 @@ def pull(s3, bucket: str, name: str, local_root: Path, s3_prefix: str, is_hf_cac
                 link_path.unlink()
             try:
                 os.symlink(os.path.relpath(target_path, link_path.parent), link_path)
+                recreated += 1
             except OSError as exc:
                 print(f"  [WARN] could not recreate symlink {link_rel}: {exc}", file=sys.stderr)
-        if manifest.get("symlinks"):
-            print(f"[{name}] recreated {len(manifest['symlinks'])} symlink(s)")
+        if recreated:
+            print(f"[{name}] recreated {recreated} symlink(s)")
 
 
 def main() -> None:
