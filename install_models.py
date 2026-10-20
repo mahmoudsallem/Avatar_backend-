@@ -44,7 +44,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -199,13 +199,18 @@ def _download(s3, bucket: str, items: List[Tuple[str, int, Path]], dry_run: bool
     return downloaded, skipped, downloaded_bytes
 
 
-def push(s3, bucket: str, name: str, local_root: Path, s3_prefix: str, is_hf_cache: bool, dry_run: bool) -> None:
+def push(s3, bucket: str, name: str, local_root: Path, s3_prefix: str, is_hf_cache: bool, dry_run: bool,
+         extra_repos: Optional[List[str]] = None) -> None:
     if not local_root.is_dir():
         print(f"[{name}] skipping - {local_root} does not exist locally")
         return
 
     if is_hf_cache:
-        real_files, symlinks = _hf_cache_contents(local_root, _configured_hf_repo_dirs())
+        # extra_repos backs up specific repos NOT in app/config.py (e.g. stray downloads you
+        # want archived before running `huggingface-cli delete-cache` to reclaim disk) - on top
+        # of, not instead of, the normally-configured ones.
+        repo_dirs = _configured_hf_repo_dirs() + [f"models--{r.replace('/', '--')}" for r in (extra_repos or [])]
+        real_files, symlinks = _hf_cache_contents(local_root, repo_dirs)
     else:
         real_files, symlinks = list(_plain_files(local_root)), []
 
@@ -287,6 +292,9 @@ def main() -> None:
     parser.add_argument("action", choices=["push", "pull"], help="push: local caches -> S3. pull: S3 -> local caches")
     parser.add_argument("--only", help="comma-separated subset of: " + ",".join(n for n, _, _ in MODEL_SETS))
     parser.add_argument("--dry-run", action="store_true", help="list what would transfer without moving data")
+    parser.add_argument("--extra-repos", help="push only: comma-separated HF repo ids to back up IN ADDITION to the "
+                                               "normally-configured ones (e.g. stray downloads you want archived "
+                                               "before running `huggingface-cli delete-cache` to reclaim disk space)")
     args = parser.parse_args()
 
     wanted = set(args.only.split(",")) if args.only else None
@@ -307,10 +315,15 @@ def main() -> None:
     dry_suffix = "  (dry run)" if args.dry_run else ""
     print(f"Bucket: s3://{bucket}/{base_prefix}  |  action: {args.action}{dry_suffix}\n")
 
+    extra_repos = [r.strip() for r in args.extra_repos.split(",")] if args.extra_repos else None
+    if extra_repos and args.action != "push":
+        parser.error("--extra-repos only applies to push")
+
     for name, local_root, is_hf_cache in sets:
         s3_prefix = f"{base_prefix}{name}/"
         if args.action == "push":
-            push(s3, bucket, name, local_root, s3_prefix, is_hf_cache, args.dry_run)
+            push(s3, bucket, name, local_root, s3_prefix, is_hf_cache, args.dry_run,
+                 extra_repos=extra_repos if is_hf_cache else None)
         else:
             pull(s3, bucket, name, local_root, s3_prefix, is_hf_cache, args.dry_run)
         print()
