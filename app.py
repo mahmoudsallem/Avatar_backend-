@@ -26,9 +26,48 @@ logging.basicConfig(
 )
 logger = logging.getLogger("saytara")
 
+_models_loaded = False
+
+def _download_s3_prefix_if_needed():
+    """Download all objects under s3://bucket/prefix into dest_dir if MODEL_S3_URI is set."""
+    s3_uri = os.environ.get("MODEL_S3_URI")
+    if not s3_uri:
+        return
+    logger.info("MODEL_S3_URI is set (%s). Downloading model files from S3...", s3_uri)
+    from urllib.parse import urlparse
+    import boto3
+    from boto3.s3.transfer import TransferConfig
+
+    u = urlparse(s3_uri)
+    bucket = u.netloc
+    prefix = u.path.lstrip("/")
+    dest = Path(os.environ.get("LOCAL_MODEL_DIR", os.environ.get("HF_HOME", "/models/huggingface")))
+    dest.mkdir(parents=True, exist_ok=True)
+
+    s3 = boto3.client("s3", region_name=getattr(settings, "S3_REGION", "us-east-1"))
+    cfg = TransferConfig(max_concurrency=32, multipart_chunksize=64 * 1024 * 1024)
+    count = 0
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.endswith("/"):
+                continue
+            rel_path = os.path.relpath(key, prefix)
+            target = dest / rel_path
+            if target.is_file() and target.stat().st_size == obj["Size"]:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            logger.info("Downloading s3://%s/%s -> %s (%d bytes)", bucket, key, target, obj["Size"])
+            s3.download_file(bucket, key, str(target), Config=cfg)
+            count += 1
+    logger.info("S3 model download complete. Transferred %d new/updated files.", count)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load models once at startup, clean up workers at shutdown."""
+    global _models_loaded
+    _models_loaded = False
+
     logger.info("Initializing Saytara Avatar backend...")
     logger.info("Environment: host=%s, port=%d", settings.HOST, settings.PORT)
 
@@ -39,8 +78,11 @@ async def lifespan(app: FastAPI):
         logger.critical("Fatal: GPU check failed: %s", exc)
         raise
 
+    _download_s3_prefix_if_needed()
+
     try:
         pipeline.load_models()
+        _models_loaded = True
         logger.info("All models and workers initialized successfully.")
     except Exception as exc:
         logger.critical("Fatal: Failed to load models on startup: %s", exc, exc_info=True)
@@ -267,6 +309,74 @@ async def create_avatar_base64(
         )
     return await _generate_avatar_from_bytes(content, filename, _test_overrides(steps, tries, time_budget, cfg, style))
 
+@app.get("/ping", summary="SageMaker health ping endpoint", include_in_schema=False)
+async def sagemaker_ping():
+    """SageMaker ping endpoint: returns 200 when models are loaded, 503 while loading."""
+    if _models_loaded and pipeline.is_val_worker_alive():
+        return Response(status_code=status.HTTP_200_OK, content="OK")
+    return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content="Model loading or unready")
+
+@app.post("/invocations", summary="SageMaker inference invocation endpoint", include_in_schema=False)
+async def sagemaker_invocations(request: Request):
+    """SageMaker invocations endpoint. Accepts JSON (base64 image), raw binary image, or multipart."""
+    content_type = request.headers.get("content-type", "").lower()
+    accept_header = request.headers.get("accept", "").lower()
+
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"error": "Invalid JSON payload"})
+
+        raw_b64 = body.get("image") or body.get("image_base64") or body.get("photo")
+        filename = body.get("filename", "upload.jpg")
+        if not raw_b64:
+            return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"error": "Missing 'image' or 'image_base64' in JSON body"})
+        if raw_b64.startswith("data:"):
+            raw_b64 = raw_b64.split(",", 1)[-1]
+        try:
+            content = base64.b64decode(raw_b64, validate=True)
+        except Exception:
+            return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"error": "Invalid base64 image data"})
+
+        res = await _generate_avatar_from_bytes(content, filename)
+        if isinstance(res, JSONResponse):
+            return res
+        if "application/json" in accept_header or body.get("return_base64", False):
+            img_b64 = base64.b64encode(res.body).decode("ascii")
+            return JSONResponse(content={"image_base64": img_b64, "content_type": "image/jpeg"})
+        return res
+
+    elif any(t in content_type for t in ("image/", "application/octet-stream")):
+        content = await request.body()
+        if not content:
+            return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"error": "Empty body"})
+        ext = ".png" if "png" in content_type else ".jpg"
+        return await _generate_avatar_from_bytes(content, f"upload{ext}")
+
+    elif "multipart/form-data" in content_type:
+        form = await request.form()
+        file_obj = form.get("file") or form.get("image")
+        if not file_obj or not hasattr(file_obj, "read"):
+            return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"error": "Missing file in form data"})
+        content = await file_obj.read()
+        filename = getattr(file_obj, "filename", "upload.jpg")
+        return await _generate_avatar_from_bytes(content, filename)
+
+    else:
+        body_bytes = await request.body()
+        try:
+            body = json.loads(body_bytes.decode("utf-8"))
+            raw_b64 = body.get("image") or body.get("image_base64")
+            if raw_b64:
+                if raw_b64.startswith("data:"):
+                    raw_b64 = raw_b64.split(",", 1)[-1]
+                content = base64.b64decode(raw_b64)
+                return await _generate_avatar_from_bytes(content, body.get("filename", "upload.jpg"))
+        except Exception:
+            pass
+        return await _generate_avatar_from_bytes(body_bytes, "upload.jpg")
+
 @app.get("/", summary="Root status", include_in_schema=False)
 async def root():
     return {
@@ -274,8 +384,13 @@ async def root():
         "status": "online",
         "docs": "/docs",
         "health": "/health",
+        "ping": "/ping",
+        "invocations": "/invocations",
     }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=settings.HOST, port=settings.PORT, reload=False, workers=1)
+    # SageMaker passes "serve" as argv[1] - ignore extra CLI args and launch uvicorn
+    port = int(os.environ.get("PORT", getattr(settings, "PORT", 8080)))
+    host = os.environ.get("HOST", getattr(settings, "HOST", "0.0.0.0"))
+    uvicorn.run(app, host=host, port=port, reload=False, workers=1)

@@ -19,9 +19,9 @@ ENV HF_HOME=/models/huggingface \
     DEEPFACE_HOME=/models/deepface \
     CLIP_DIR=/models/clip-vit-base-patch32
 
-# Application networking
+# Application networking (Port 8080 is standard for SageMaker)
 ENV HOST=0.0.0.0 \
-    PORT=8000
+    PORT=8080
 
 # Install required system packages for OpenCV, DeepFace, Git, and build tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -76,12 +76,13 @@ COPY Avatar/ ./Avatar/
 COPY app.py ./
 COPY install_models.py ./
 
-# Expose FastAPI service port
-EXPOSE 8000
+# Expose SageMaker service port
+EXPOSE 8080
 
-# Container healthcheck
+# Container healthcheck (SageMaker /ping endpoint)
 HEALTHCHECK --interval=30s --timeout=15s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:8080/ping || exit 1
 
-# Start FastAPI server directly
-CMD ["python", "app.py"]
+# SageMaker executes: docker run <image> serve
+ENTRYPOINT ["python", "app.py"]
+CMD ["serve"]

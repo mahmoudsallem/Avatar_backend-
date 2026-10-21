@@ -268,8 +268,14 @@ def _start_val_worker() -> subprocess.Popen:
 
         if not ready or p.poll() is not None:
             _kill_worker(p)
+            err_details = ""
+            if settings.WORKER_LOG.is_file():
+                try:
+                    err_details = settings.WORKER_LOG.read_text(encoding="utf-8", errors="ignore").strip()[-2000:]
+                except Exception:
+                    pass
             raise RuntimeError(
-                f"DeepFace embedding worker failed to start - see {settings.WORKER_LOG}"
+                f"DeepFace embedding worker failed to start. Worker stderr log:\n{err_details or '(empty)'}"
             )
 
         logger.info("DeepFace embedding worker ready.")

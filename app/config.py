@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     # on the same photos (send_10_images.py --matrix). Keep false in production.
     ALLOW_TEST_OVERRIDES: bool = False
     HOST: str = "0.0.0.0"
-    PORT: int = 8000
+    PORT: int = int(os.environ.get("PORT", 8080))
     CORS_ORIGINS: List[str] = ["*"]
     LOG_LEVEL: str = "INFO"
 
