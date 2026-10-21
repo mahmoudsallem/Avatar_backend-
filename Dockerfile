@@ -81,7 +81,7 @@ EXPOSE 8080
 
 # Container healthcheck (SageMaker /ping endpoint)
 HEALTHCHECK --interval=30s --timeout=15s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:8080/ping || exit 1
+    CMD curl -f http://localhost:${PORT:-8080}/ping || exit 1
 
 # SageMaker executes: docker run <image> serve
 ENTRYPOINT ["python", "app.py"]

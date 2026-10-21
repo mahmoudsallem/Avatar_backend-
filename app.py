@@ -29,23 +29,46 @@ logger = logging.getLogger("saytara")
 _models_loaded = False
 
 def _download_s3_prefix_if_needed():
-    """Download all objects under s3://bucket/prefix into dest_dir if MODEL_S3_URI is set."""
+    """Download all objects under s3://bucket/prefix (or tar.gz archive) into dest_dir if MODEL_S3_URI is set."""
+    dest = Path(os.environ.get("LOCAL_MODEL_DIR", os.environ.get("HF_HOME", "/models/huggingface")))
+    dest.mkdir(parents=True, exist_ok=True)
+
+    # Check if SageMaker has already mounted models into /opt/ml/model
+    sagemaker_model_dir = Path("/opt/ml/model")
+    if sagemaker_model_dir.is_dir():
+        model_files = list(sagemaker_model_dir.glob("*"))
+        if model_files:
+            logger.info("Found %d file(s) in SageMaker model directory /opt/ml/model.", len(model_files))
+
     s3_uri = os.environ.get("MODEL_S3_URI")
     if not s3_uri:
         return
+
     logger.info("MODEL_S3_URI is set (%s). Downloading model files from S3...", s3_uri)
     from urllib.parse import urlparse
     import boto3
+    import tarfile
     from boto3.s3.transfer import TransferConfig
 
     u = urlparse(s3_uri)
     bucket = u.netloc
     prefix = u.path.lstrip("/")
-    dest = Path(os.environ.get("LOCAL_MODEL_DIR", os.environ.get("HF_HOME", "/models/huggingface")))
-    dest.mkdir(parents=True, exist_ok=True)
 
     s3 = boto3.client("s3", region_name=getattr(settings, "S3_REGION", "us-east-1"))
     cfg = TransferConfig(max_concurrency=32, multipart_chunksize=64 * 1024 * 1024)
+
+    # If URI points directly to a tar.gz / tar archive (SageMaker standard artifact format)
+    if prefix.endswith((".tar.gz", ".tgz", ".tar")):
+        archive_target = dest / Path(prefix).name
+        logger.info("Downloading S3 model archive s3://%s/%s -> %s...", bucket, prefix, archive_target)
+        s3.download_file(bucket, prefix, str(archive_target), Config=cfg)
+        logger.info("Extracting model archive %s to %s...", archive_target, dest)
+        with tarfile.open(archive_target, "r:*") as tar:
+            tar.extractall(path=dest)
+        archive_target.unlink(missing_ok=True)
+        logger.info("Model extraction complete.")
+        return
+
     count = 0
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
@@ -309,14 +332,14 @@ async def create_avatar_base64(
         )
     return await _generate_avatar_from_bytes(content, filename, _test_overrides(steps, tries, time_budget, cfg, style))
 
-@app.get("/ping", summary="SageMaker health ping endpoint", include_in_schema=False)
+@app.get("/ping", summary="SageMaker health ping endpoint")
 async def sagemaker_ping():
     """SageMaker ping endpoint: returns 200 when models are loaded, 503 while loading."""
     if _models_loaded and pipeline.is_val_worker_alive():
         return Response(status_code=status.HTTP_200_OK, content="OK")
     return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content="Model loading or unready")
 
-@app.post("/invocations", summary="SageMaker inference invocation endpoint", include_in_schema=False)
+@app.post("/invocations", summary="SageMaker inference invocation endpoint")
 async def sagemaker_invocations(request: Request):
     """SageMaker invocations endpoint. Accepts JSON (base64 image), raw binary image, or multipart."""
     content_type = request.headers.get("content-type", "").lower()
@@ -331,6 +354,14 @@ async def sagemaker_invocations(request: Request):
         raw_b64 = body.get("image") or body.get("image_base64") or body.get("photo")
         filename = body.get("filename", "upload.jpg")
         if not raw_b64:
+            if body.get("prompt"):
+                return JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content={
+                        "error": "Saytara Avatar Generation transforms portrait photos into sci-fi avatars. "
+                                 "Please provide 'image' or 'image_base64' (base64-encoded JPEG/PNG) along with or instead of 'prompt'."
+                    },
+                )
             return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"error": "Missing 'image' or 'image_base64' in JSON body"})
         if raw_b64.startswith("data:"):
             raw_b64 = raw_b64.split(",", 1)[-1]
@@ -377,7 +408,7 @@ async def sagemaker_invocations(request: Request):
             pass
         return await _generate_avatar_from_bytes(body_bytes, "upload.jpg")
 
-@app.get("/", summary="Root status", include_in_schema=False)
+@app.get("/", summary="Root status")
 async def root():
     return {
         "service": "Saytara Avatar Generation API",
@@ -390,7 +421,8 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    # SageMaker passes "serve" as argv[1] - ignore extra CLI args and launch uvicorn
+    # SageMaker passes "serve" as argv[1] - ignore extra CLI args and launch uvicorn on port 8080 by default
     port = int(os.environ.get("PORT", getattr(settings, "PORT", 8080)))
     host = os.environ.get("HOST", getattr(settings, "HOST", "0.0.0.0"))
+    logger.info("Starting Saytara Avatar server on %s:%d (argv=%s)", host, port, sys.argv[1:])
     uvicorn.run(app, host=host, port=port, reload=False, workers=1)
