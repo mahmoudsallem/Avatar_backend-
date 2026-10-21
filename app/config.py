@@ -180,7 +180,7 @@ class Settings(BaseSettings):
     HIJAB_DRAPE_FIX: float = 0.9
     REF_SIZE: int = 1024
     STYLE_MODE: str = "comic"  # "semi_real" | "comic" | "off"
-    PROMPT_VARIANT: str = "tuned"  # "tuned" = the notebook prompt (default) | "id_focus" = identity-first prompt | "v3" = short positive-only prompt (~380 words vs ~1300), A/B with send_10_images.py
+    PROMPT_VARIANT: str = "tuned"  # "tuned" = the notebook prompt (default) | "id_focus" = identity-first prompt | "v3" = short positive-only prompt (~380 words vs ~1300), A/B with send_10_images.py | "v4" = v3 + per-photo measured face traits (face shape, skin tone, beard style, hair type) with a stronger identity block
     KEEP_USER_EXPRESSION: bool = True
 
     # ---------------- Visor & Similarity ----------------
