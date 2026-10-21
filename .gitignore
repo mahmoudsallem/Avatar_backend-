@@ -38,6 +38,6 @@ skills-lock.json
 _to_delete
 _to_deletetrt_cache/
 archive/
-
+evaluation_results/*
 sagemaker-flux2-deployment-guide.pdf
 *.ps1

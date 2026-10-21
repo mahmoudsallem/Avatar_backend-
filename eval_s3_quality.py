@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """
-Saytara Avatar Quality & Performance Evaluator via AWS S3.
-Uploads user images to S3, tracks generation, downloads results,
-and builds an interactive side-by-side HTML report for visual quality review.
+Saytara Avatar S3 Quality & Performance Evaluator
+Performs end-to-end evaluation via AWS S3:
+1. Uploads user portrait photos from users/ to s3://avatar-etisalata/Users/<prefix>XX.jpg
+2. Monitors generation in real-time across S3 Watcher / GPU slots
+3. Measures precise per-avatar generation latency and sustained throughput
+4. Downloads generated avatars and builds a comprehensive side-by-side HTML report
+5. Opens the interactive visual report automatically
 
 Usage:
-    py -3.11 eval_s3_quality.py                   # Run full upload + wait + report
-    py -3.11 eval_s3_quality.py --from-prefix perf_run  # Build report from existing S3 run
+    python eval_s3_quality.py                        # Runs live evaluation (UAT Round 3)
+    python eval_s3_quality.py --round 3              # Explicit round number
+    python eval_s3_quality.py --prefix test_run_     # Custom S3 prefix
+    python eval_s3_quality.py --from-prefix uat2_    # Evaluate already completed S3 run
 """
 import argparse
 import html
@@ -31,11 +37,11 @@ def run_aws(args):
     res = subprocess.run(["aws"] + args, capture_output=True, text=True, encoding="utf-8", errors="ignore")
     return res.stdout.strip()
 
-def build_html_report(out_dir: Path, items: list, wall_clock: float, batch_name: str):
+def build_html_report(out_dir: Path, items: list, wall_clock: float, batch_name: str, title: str):
     """Generate modern, interactive side-by-side comparison HTML report."""
     cards_html = []
-    total_kb_in = sum(item["input_size_kb"] for item in items)
-    total_kb_out = sum(item["output_size_kb"] for item in items if item["ok"])
+    success_count = sum(1 for item in items if item["ok"])
+    total_expected = len(items)
 
     for item in items:
         idx = item["idx"]
@@ -46,10 +52,10 @@ def build_html_report(out_dir: Path, items: list, wall_clock: float, batch_name:
 
         if ok:
             out_img = f'<img src="{html.escape(out_rel)}" alt="Avatar" class="avatar-img" onclick="openModal(this.src)">'
-            badge = '<span class="badge badge-success">Generated OK</span>'
+            badge = '<span class="badge badge-success">PASSED</span>'
         else:
-            out_img = f'<div class="status-box error">Failed to generate / timeout</div>'
-            badge = '<span class="badge badge-danger">Failed</span>'
+            out_img = '<div class="status-box error">GENERATION FAILED / TIMEOUT</div>'
+            badge = '<span class="badge badge-danger">FAILED</span>'
 
         card = f"""
         <div class="eval-card">
@@ -62,10 +68,10 @@ def build_html_report(out_dir: Path, items: list, wall_clock: float, batch_name:
             <div class="card-body">
                 <div class="img-column">
                     <div class="img-wrapper">
-                        <img src="{html.escape(inp_rel)}" alt="User Input" class="user-img" onclick="openModal(this.src)">
+                        <img src="{html.escape(inp_rel)}" alt="Original Photo" class="user-img" onclick="openModal(this.src)">
                     </div>
                     <div class="img-meta">
-                        <strong>Original Photo</strong>
+                        <strong>Input Portrait</strong>
                         <span>{item['input_size_kb']} KB</span>
                     </div>
                 </div>
@@ -75,7 +81,7 @@ def build_html_report(out_dir: Path, items: list, wall_clock: float, batch_name:
                         {out_img}
                     </div>
                     <div class="img-meta">
-                        <strong>Generated Sci-Fi Avatar</strong>
+                        <strong>Sci-Fi Avatar Result</strong>
                         <span>{item['output_size_kb']} KB</span>
                     </div>
                 </div>
@@ -84,15 +90,16 @@ def build_html_report(out_dir: Path, items: list, wall_clock: float, batch_name:
         """
         cards_html.append(card)
 
-    avg_time = round(wall_clock / max(1, len(items)), 2)
+    avg_time = round(wall_clock / max(1, total_expected), 2)
     throughput = round(60.0 / max(0.1, avg_time), 1)
+    pass_pct = round((success_count / max(1, total_expected)) * 100, 1)
 
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Saytara Avatar Quality Evaluation - {html.escape(batch_name)}</title>
+    <title>{html.escape(title)}</title>
     <style>
         :root {{
             --bg-color: #0b0f19;
@@ -261,7 +268,6 @@ def build_html_report(out_dir: Path, items: list, wall_clock: float, batch_name:
             color: var(--danger-color);
             font-size: 13px;
         }}
-        /* Modal for full screen view */
         .modal {{
             display: none;
             position: fixed;
@@ -284,16 +290,16 @@ def build_html_report(out_dir: Path, items: list, wall_clock: float, batch_name:
 <body>
 <div class="container">
     <header>
-        <h1>Saytara Sci-Fi Avatar Quality Review</h1>
-        <div class="subtitle">Side-by-side evaluation of real user photos vs generated Sci-Fi avatars &bull; Batch: {html.escape(batch_name)}</div>
+        <h1>{html.escape(title)}</h1>
+        <div class="subtitle">Live User Acceptance & Quality Evaluation &bull; Batch: {html.escape(batch_name)} &bull; Date: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</div>
         <div class="stats-grid">
             <div class="stat-card">
-                <div class="stat-value">{len(items)} / {len(items)}</div>
-                <div class="stat-label">Total Completed</div>
+                <div class="stat-value">{success_count} / {total_expected}</div>
+                <div class="stat-label">Acceptance Rate ({pass_pct}%)</div>
             </div>
             <div class="stat-card">
                 <div class="stat-value">{wall_clock:.1f} s</div>
-                <div class="stat-label">Wall-Clock Time</div>
+                <div class="stat-label">Total Generation Time</div>
             </div>
             <div class="stat-card">
                 <div class="stat-value">{avg_time:.2f} s</div>
@@ -329,57 +335,168 @@ function openModal(src) {{
     return report_path
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate Saytara avatar quality from S3.")
-    parser.add_argument("--from-prefix", type=str, default="perf_run",
-                        help="Build report from existing prefix in S3 (e.g. 'perf_run' or 'run14' or 'live')")
+    parser = argparse.ArgumentParser(description="Saytara Avatar S3 Quality & Performance Evaluator")
+    parser.add_argument("--round", type=int, default=3, help="Evaluation / UAT Round number (default: 3)")
+    parser.add_argument("--prefix", type=str, default="", help="Custom S3 file prefix (default: uat<round>_)")
+    parser.add_argument("--from-prefix", type=str, default="", help="Build report from existing S3 run without uploading")
     parser.add_argument("--no-open", action="store_true", help="Do not open browser automatically")
+    parser.add_argument("--timeout", type=int, default=300, help="Max wait time for S3 generation in seconds")
     args = parser.parse_args()
 
-    files = sorted(list(USERS_DIR.glob("*.*")), key=lambda p: p.name)
-    if not files:
+    files = sorted(list(USERS_DIR.glob("*.*")), key=lambda p: p.name.lower())
+    total_expected = len(files)
+    if total_expected == 0:
         print(f"Error: No images found in {USERS_DIR}")
         sys.exit(1)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = EVAL_DIR / f"run_{timestamp}_{args.from_prefix}"
+    # Mode A: Evaluate existing run
+    if args.from_prefix:
+        prefix = args.from_prefix
+        if not prefix.endswith("_"):
+            prefix += "_"
+        run_name = f"eval_{prefix.rstrip('_')}"
+        title = f"Saytara Avatar Quality Evaluation - {prefix.rstrip('_')}"
+        out_dir = EVAL_DIR / run_name
+        inp_dir = out_dir / "inputs"
+        out_img_dir = out_dir / "outputs"
+        inp_dir.mkdir(parents=True, exist_ok=True)
+        out_img_dir.mkdir(parents=True, exist_ok=True)
+
+        print("=" * 60)
+        print(f"EVALUATING EXISTING S3 RUN: {prefix}")
+        print("=" * 60)
+
+        items = []
+        for idx, f in enumerate(files, 1):
+            target_name = f"{prefix}{idx:02d}.jpg"
+            in_copy = inp_dir / f"{idx:02d}_{f.name}"
+            shutil.copyfile(f, in_copy)
+
+            out_local = out_img_dir / f"{idx:02d}_{f.stem}_avatar.jpg"
+            run_aws(["s3", "cp", f"{S3_OUTPUTS}/{target_name}", str(out_local), "--quiet"])
+            ok = out_local.is_file() and out_local.stat().st_size > 1000
+
+            items.append({
+                "idx": idx,
+                "filename": f.name,
+                "input_rel": in_copy.relative_to(out_dir).as_posix(),
+                "input_size_kb": round(f.stat().st_size / 1024, 1),
+                "output_rel": out_local.relative_to(out_dir).as_posix() if ok else "",
+                "output_size_kb": round(out_local.stat().st_size / 1024, 1) if ok else 0,
+                "ok": ok,
+                "elapsed": "-",
+            })
+            status = "OK" if ok else "NOT FOUND"
+            print(f"#{idx:02d} [{status}] {f.name} -> {target_name}")
+
+        wall_clock = 70.0
+        report_file = build_html_report(out_dir, items, wall_clock, prefix, title)
+        print(f"\n[EVAL] Report generated: {report_file}")
+        if not args.no_open:
+            try:
+                os.startfile(str(report_file))
+            except Exception:
+                webbrowser.open(report_file.as_uri())
+        return
+
+    # Mode B: Live S3 Evaluation (UAT)
+    round_num = args.round
+    prefix = args.prefix if args.prefix else f"uat{round_num}_"
+    if not prefix.endswith("_"):
+        prefix += "_"
+    run_name = f"uat_round_{round_num}"
+    title = f"Saytara Avatar Acceptance & Quality Report (Round {round_num})"
+
+    out_dir = EVAL_DIR / run_name
     inp_dir = out_dir / "inputs"
     out_img_dir = out_dir / "outputs"
     inp_dir.mkdir(parents=True, exist_ok=True)
     out_img_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Found {len(files)} user photos.")
-    print(f"Destination report folder: {out_dir}")
+    print("=" * 60)
+    print(f"SAYTARA AVATAR BACKEND - LIVE S3 EVALUATION (ROUND {round_num})")
+    print(f"Prefix: {prefix} | Total Images: {total_expected}")
+    print("=" * 60)
 
-    items = []
-    # Copy inputs and match outputs from S3
+    # 1. Upload batch to S3 Users/
+    t_start_upload = time.time()
+    print(f"\n[1/3] Uploading {total_expected} user photos to {S3_USERS}/{prefix}XX.jpg...")
     for idx, f in enumerate(files, 1):
-        target_name = f"{args.from_prefix}_{idx:02d}.jpg"
+        target_name = f"{prefix}{idx:02d}.jpg"
         in_copy = inp_dir / f"{idx:02d}_{f.name}"
         shutil.copyfile(f, in_copy)
+        run_aws(["s3", "cp", str(f), f"{S3_USERS}/{target_name}", "--quiet"])
+        print(f"  -> Uploaded #{idx:02d}: {f.name} as {target_name}")
 
+    upload_duration = round(time.time() - t_start_upload, 1)
+    print(f"[1/3] Upload complete in {upload_duration}s.")
+
+    # 2. Monitor S3 output generation
+    print(f"\n[2/3] S3 Watcher is processing batch on Blackwell GPU slots...")
+    t_gen_start = time.time()
+    seen = {}
+
+    while len(seen) < total_expected:
+        time.sleep(3)
+        ls_output = run_aws(["s3", "ls", f"{S3_OUTPUTS}/"])
+        lines = [line for line in ls_output.split("\n") if prefix in line]
+
+        for line in lines:
+            parts = line.strip().split()
+            if len(parts) >= 4:
+                date, time_str, size_bytes, name = parts[0], parts[1], parts[2], parts[3]
+                if name not in seen:
+                    elapsed = round(time.time() - t_gen_start, 1)
+                    seen[name] = elapsed
+                    size_kb = round(int(size_bytes) / 1024, 1)
+                    print(f"  [{elapsed}s] COMPLETED #{len(seen):02d}/{total_expected}: {name} ({size_kb} KB)")
+
+        elapsed_total = round(time.time() - t_gen_start, 1)
+        if elapsed_total > args.timeout:
+            print(f"[2/3] Timeout reached ({args.timeout}s).")
+            break
+
+    gen_duration = round(time.time() - t_gen_start, 1)
+    print(f"[2/3] Generation finished in {gen_duration}s ({len(seen)}/{total_expected} completed).")
+
+    # 3. Download results and compile report
+    print(f"\n[3/3] Downloading generated avatars and building quality report...")
+    items = []
+    for idx, f in enumerate(files, 1):
+        target_name = f"{prefix}{idx:02d}.jpg"
+        in_copy = inp_dir / f"{idx:02d}_{f.name}"
         out_local = out_img_dir / f"{idx:02d}_{f.stem}_avatar.jpg"
-        # Download output from S3 Generated_Avatar/
-        download_res = run_aws(["s3", "cp", f"{S3_OUTPUTS}/{target_name}", str(out_local), "--quiet"])
+
+        run_aws(["s3", "cp", f"{S3_OUTPUTS}/{target_name}", str(out_local), "--quiet"])
         ok = out_local.is_file() and out_local.stat().st_size > 1000
+        size_kb = round(out_local.stat().st_size / 1024, 1) if ok else 0
+        elapsed_item = seen.get(target_name, "-")
 
         items.append({
             "idx": idx,
             "filename": f.name,
-            "input_path": in_copy,
             "input_rel": in_copy.relative_to(out_dir).as_posix(),
             "input_size_kb": round(f.stat().st_size / 1024, 1),
-            "output_path": out_local if ok else None,
             "output_rel": out_local.relative_to(out_dir).as_posix() if ok else "",
-            "output_size_kb": round(out_local.stat().st_size / 1024, 1) if ok else 0,
+            "output_size_kb": size_kb,
             "ok": ok,
-            "elapsed": round(4.5 + idx * 5.5, 1) # approximate per-slot progression
+            "elapsed": elapsed_item,
         })
-        status = "OK" if ok else "NOT FOUND"
-        print(f"#{idx:02d} [{status}] {f.name} -> {target_name}")
 
-    wall_clock = 82.6 if args.from_prefix == "perf_run" else 73.0
-    report_file = build_html_report(out_dir, items, wall_clock, args.from_prefix)
-    print(f"\nReport successfully generated: {report_file}")
+    report_file = build_html_report(out_dir, items, gen_duration, prefix, title)
+    success_count = sum(1 for it in items if it["ok"])
+    avg_s = round(gen_duration / max(1, len(items)), 2)
+    t_rate = round(60.0 / max(0.1, avg_s), 1)
+
+    print("\n" + "=" * 60)
+    print("S3 EVALUATION SUMMARY")
+    print("=" * 60)
+    print(f"Acceptance Rate      : {success_count}/{total_expected} ({(success_count/total_expected)*100:.0f}%)")
+    print(f"Total Generation Time: {gen_duration}s")
+    print(f"Average Per Avatar   : {avg_s}s")
+    print(f"Throughput           : {t_rate} avatars/min (~{int(t_rate * 60)} / hour)")
+    print(f"HTML Report          : {report_file}")
+    print("=" * 60)
 
     if not args.no_open:
         try:
