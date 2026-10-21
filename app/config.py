@@ -59,6 +59,11 @@ class Settings(BaseSettings):
     S3_QUEUE_URL: str = ""
     S3_QUEUE_WAIT_SECONDS: int = 20   # SQS long-poll wait (max 20); keeps the loop from hammering SQS with empty receives
 
+    # Model cache (install_models.py): a separate bucket (not the photo bucket above) that the
+    # HF hub cache / DeepFace weights / local CLIP dir get mirrored to/from.
+    S3_MODEL_BUCKET: str = "saytara-models"
+    S3_MODEL_CACHE_PREFIX: str = ""
+
     # ---------------- Models ----------------
     CLIP_DIR: Path = Path("/Models/clip-vit-base-patch32")
     CLIP_MODEL: str = "openai/clip-vit-base-patch32"
