@@ -1,9 +1,8 @@
 # ==============================================================================
 # Saytara Avatar Generation Backend - Production Dockerfile
 # ==============================================================================
-# Base image: Official PyTorch GPU image with CUDA 12.4, cuDNN 9 & Python 3.11 pre-installed
-# (Aligns with AWS Deep Learning Containers & SageMaker CUDA standards)
-FROM pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime
+# Base image: Python 3.11 with Debian Bookworm
+FROM python:3.11-slim-bookworm
 
 # System configuration & performance flags
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -41,7 +40,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Set up working directory
 WORKDIR /app
 
-# Install Python requirements (Torch is already pre-installed with CUDA support)
+# Install PyTorch 2.11 with CUDA 13.0 (Required for Blackwell sm_120 and transformers >= v2.6 requirement)
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu130
+
+# Install Python requirements
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
