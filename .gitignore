@@ -40,3 +40,4 @@ _to_deletetrt_cache/
 archive/
 
 sagemaker-flux2-deployment-guide.pdf
+*.ps1

@@ -34,6 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libxrender-dev \
     libgomp1 \
+    ninja-build \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -56,6 +57,14 @@ RUN if [ "$INSTALL_NUNCHAKU" = "true" ]; then \
 whl = hf_hub_download(repo_id='tonera/vitoom-nunchaku', filename='nunchaku-1.3.0.dev20260622+cu13.0torch2.11-cp311-cp311-linux_x86_64.whl'); \
 subprocess.check_call(['pip', 'install', '--no-deps', whl])" || \
         echo "Warning: Nunchaku wheel install skipped or failed. Falling back to diffusers backend."; \
+    fi
+
+# Optional build arg: install FlashAttention-4 for Blackwell architectures
+ARG INSTALL_FLASH_ATTN=true
+RUN if [ "$INSTALL_FLASH_ATTN" = "true" ]; then \
+        pip install --no-cache-dir flash-attn-4 || \
+        pip install --no-cache-dir --pre flash-attn-4 || \
+        echo "Notice: flash-attn-4 wheel not found on PyPI for this python/cuda version. Using Hub/SDPA dispatcher."; \
     fi
 
 # Create directory structure for models and runtime storage

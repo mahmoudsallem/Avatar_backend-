@@ -444,7 +444,9 @@ def apply_speed_options(slot: "GpuSlot") -> None:
         else:
             backend_raw = settings.ATTENTION_BACKEND.strip()
             backends_to_try = [backend_raw]
-            if backend_raw.lower() in ("flash3", "flash_3", "flash-3"):
+            if backend_raw.lower() in ("flash4", "flash_4", "flash-4", "_flash_4"):
+                backends_to_try = ["_flash_4", "_flash_4_hub", "flash4"]
+            elif backend_raw.lower() in ("flash3", "flash_3", "flash-3", "_flash_3"):
                 backends_to_try = ["_flash_3_hub", "_flash_3"]
 
             applied = False
@@ -461,7 +463,7 @@ def apply_speed_options(slot: "GpuSlot") -> None:
             if not applied:
                 logger.warning(
                     "Slot %d: could not set attention backend %r (%s). "
-                    "Make sure 'kernels' or 'flash_attn_3' is installed. Keeping the default.",
+                    "Make sure 'flash_attn_4', 'flash_attn_3', or 'kernels' is installed. Keeping the default.",
                     slot.idx, settings.ATTENTION_BACKEND, last_err
                 )
     if settings.CACHE_REF_LATENTS:

@@ -41,3 +41,4 @@ opencv-python-headless>=4.10.0
 numpy>=1.26.0
 pillow>=10.4.0
 tqdm>=4.42.1
+ninja>=1.11.0
