@@ -2656,7 +2656,7 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         while True:
             mult = settings.ID_LORA_SCHEDULE[k % len(settings.ID_LORA_SCHEDULE)]
             slot.set_lora(test_lora * mult)
-            if info.get("hijab") and settings.PROMPT_VARIANT == "v3" and "hijab_colour" not in info:
+            if info.get("hijab") and settings.PROMPT_VARIANT in ("v3", "v4") and "hijab_colour" not in info:
                 info["hijab_colour"] = None  # computed once; stays None if the sample is unreliable
                 try:
                     from app.postprocess_hijab import user_hijab_colour
