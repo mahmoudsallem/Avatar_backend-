@@ -41,12 +41,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Install PyTorch 2.11 with CUDA 13.0 (Required for Blackwell sm_120 and transformers >= v2.6 requirement)
-RUN pip install --upgrade pip setuptools wheel && \
-    pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu130
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu130
 
 # Install Python requirements
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Optional build arg: install prebuilt Vitoom Nunchaku wheel for FLUX_BACKEND=nunchaku
 ARG INSTALL_NUNCHAKU=true
