@@ -1,0 +1,34 @@
+# Git & Version Control
+.git/
+.gitignore
+
+# Virtual Environments & Caches
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Runtime and local test output directories
+crop/
+output/
+rejected/
+users/
+test_results/
+bench_results/
+archive/
+_to_delete/
+*.log
+
+# IDE & Editor settings
+.vscode/
+.idea/
+.claude/
+skills-lock.json
+*.ipynb
+
+# Environment files (never bake into image, pass at runtime as parameter)
+.env
+.env.*
