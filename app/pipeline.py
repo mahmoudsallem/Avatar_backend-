@@ -434,12 +434,36 @@ def apply_speed_options(slot: "GpuSlot") -> None:
             slot.fuse(strength)
             logger.info("Slot %d: LoRA fused into the weights at strength %.3f", slot.idx, strength)
     if settings.ATTENTION_BACKEND:
-        try:
-            p.transformer.set_attention_backend(settings.ATTENTION_BACKEND)
-            logger.info("Slot %d: attention backend = %s", slot.idx, settings.ATTENTION_BACKEND)
-        except Exception as exc:
-            logger.warning("Slot %d: could not set attention backend %r (%s) - keeping the default",
-                           slot.idx, settings.ATTENTION_BACKEND, exc)
+        if settings.FLUX_BACKEND == "nunchaku":
+            logger.warning(
+                "Slot %d: ATTENTION_BACKEND=%r is skipped with FLUX_BACKEND=nunchaku. "
+                "Nunchaku uses its own internal 4-bit fused attention kernels (NunchakuFlux2Attention). "
+                "To benchmark or test FlashAttention-3, run with FLUX_BACKEND=diffusers and ATTENTION_BACKEND=_flash_3_hub.",
+                slot.idx, settings.ATTENTION_BACKEND
+            )
+        else:
+            backend_raw = settings.ATTENTION_BACKEND.strip()
+            backends_to_try = [backend_raw]
+            if backend_raw.lower() in ("flash3", "flash_3", "flash-3"):
+                backends_to_try = ["_flash_3_hub", "_flash_3"]
+
+            applied = False
+            last_err = None
+            for b in backends_to_try:
+                try:
+                    p.transformer.set_attention_backend(b)
+                    logger.info("Slot %d: attention backend successfully set to %r", slot.idx, b)
+                    applied = True
+                    break
+                except Exception as exc:
+                    last_err = exc
+
+            if not applied:
+                logger.warning(
+                    "Slot %d: could not set attention backend %r (%s). "
+                    "Make sure 'kernels' or 'flash_attn_3' is installed. Keeping the default.",
+                    slot.idx, settings.ATTENTION_BACKEND, last_err
+                )
     if settings.CACHE_REF_LATENTS:
         _install_ref_cache(p)
     if settings.VAE_COMPILE:

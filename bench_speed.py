@@ -39,6 +39,7 @@ CONFIGS = [
     ("detect",           "baseline",         {"PERSISTENT_DETECT": "true"}),
     ("attn_native",      "baseline",         {"ATTENTION_BACKEND": "native"}),
     ("attn_cudnn",       "baseline",         {"ATTENTION_BACKEND": "_native_cudnn"}),
+    ("attn_flash3",      "baseline",         {"FLUX_BACKEND": "diffusers", "ATTENTION_BACKEND": "_flash_3_hub"}),
     ("cudnn_on",         "baseline",         {"CUDNN_ENABLED": "true"}),
     # --- these change the result on purpose: the table tells you how much (judge by the images + id_sim) ---
     ("steps_4",          "baseline",         {"STEPS": "4"}),

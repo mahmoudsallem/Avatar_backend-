@@ -28,6 +28,7 @@ accelerate>=0.34.0
 peft>=0.17.0,<0.22
 safetensors>=0.4.5
 huggingface-hub>=0.34.0,<1.0
+kernels>=0.1.0
 
 # Face Analysis & Embeddings (DeepFace CPU subprocesses)
 tensorflow-cpu>=2.17.0

@@ -135,7 +135,7 @@ class Settings(BaseSettings):
     CACHE_PROMPT_EMBEDS: bool = False  # cache the text-encoder output per distinct prompt (bit-identical)
     CACHE_REF_LATENTS: bool = False    # cache VAE latents of repeated reference images, e.g. the templates (bit-identical)
     FUSE_LORA: bool = False            # merge the LoRA into the weights; needs a uniform ID_LORA_SCHEDULE (rounding-level change)
-    ATTENTION_BACKEND: str = ""        # "" = diffusers default; try "_native_cudnn" or "native" (rounding-level change)
+    ATTENTION_BACKEND: str = ""        # "" = diffusers default; try "_flash_3_hub" / "flash3" (FlashAttention-3), "flash" (FlashAttention-2), "_native_cudnn", or "native"
     COMPILE_TRANSFORMER: bool = False  # torch.compile the FLUX transformer (use together with FUSE_LORA; slow first start)
     COMPILE_MODE: str = "default"      # "default" | "max-autotune-no-cudagraphs" (inductor only)
     COMPILE_BACKEND: str = "inductor"  # "inductor" | "tensorrt" (torch-tensorrt; diffusers backend + FUSE_LORA only, NOT with nunchaku)
