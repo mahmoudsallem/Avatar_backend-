@@ -146,7 +146,13 @@ def lora_kwargs():
 
 # Step 1 (CPU: RetinaFace/DeepFace subprocess + CLIP) runs outside the GPU slots, this many at a time
 analysis_sem = asyncio.Semaphore(settings.ANALYSIS_CONCURRENCY)
-_CLIP_LOCK = threading.Lock()
+# analyse_user() makes ~10-15 CLIP calls per image (gender/glasses/beard/bald/hijab across several
+# crops each). This was a plain Lock, fully serializing every CLIP call process-wide regardless of
+# ANALYSIS_CONCURRENCY - measured as the dominant cost (analysis+analysis_wait ~14-15s combined,
+# unmoved by CPU worker/concurrency retuning). HF pipeline forward passes in eval mode have no
+# shared mutable state across calls, so bounded concurrent access should be safe; using a semaphore
+# instead of a hard lock to allow real parallelism while still capping concurrent GPU memory use.
+_CLIP_LOCK = threading.Semaphore(settings.CLIP_CONCURRENCY)
 
 async def process_image_file(image_path: Path, overrides: Optional[dict] = None) -> Tuple[bytes, dict]:
     """Run Step 1 (analysis) + Step 2 (generation) for a local image file.

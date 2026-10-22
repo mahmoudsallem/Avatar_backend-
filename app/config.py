@@ -68,6 +68,7 @@ class Settings(BaseSettings):
     CLIP_DIR: Path = Path("/Models/clip-vit-base-patch32")
     CLIP_MODEL: str = "openai/clip-vit-base-patch32"
     CLIP_ON_CPU: bool = False  # force CLIP off the GPU so Step-1 analysis doesn't contend with FLUX generation for the CUDA scheduler
+    CLIP_CONCURRENCY: int = 1  # how many CLIP forward passes may run at once (was a hard Lock = 1); HF eval-mode forward passes have no shared mutable state, so >1 should be safe
     FLUX_MODEL: str = "black-forest-labs/FLUX.2-klein-9B"
     FLUX_BACKEND: str = "diffusers"  # "diffusers" or "nunchaku"
     NUNCHAKU_MODEL: str = "tonera/FLUX.2-klein-9B-Nunchaku"
