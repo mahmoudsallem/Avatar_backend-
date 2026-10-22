@@ -1127,7 +1127,10 @@ def clip_scores(pil_img: Image.Image, labels: List[str]) -> Dict[str, float]:
                 if _CLIP_FAST_PATH_OK:
                     logger.info("CLIP fast path verified (matches pipeline output within tolerance).")
                     return fast
-                logger.warning("CLIP fast path mismatch vs reference output - disabling, using slow path.")
+                logger.warning(
+                    "CLIP fast path mismatch vs reference output - disabling, using slow path.\n"
+                    "  slow=%s\n  fast=%s", slow, fast,
+                )
                 return slow
             except Exception:
                 logger.exception("CLIP fast path failed canary check - disabling, using slow path.")
