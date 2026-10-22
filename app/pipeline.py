@@ -935,12 +935,27 @@ def load_models() -> None:
     # scheduler; forcing CLIP to CPU frees the GPU for FLUX exclusively. Testing this as a lever for
     # the Step-1 analysis bottleneck (analysis+analysis_wait averaging ~14-15s combined under load).
     clip_device = -1 if (low_vram or settings.CLIP_ON_CPU) else 0
-    logger.info("Loading CLIP model: %s (device=%s)", settings.CLIP_MODEL, clip_device)
-    clip = hf_pipeline(
-        "zero-shot-image-classification",
-        model=settings.CLIP_MODEL,
-        device=clip_device,
-    )
+    logger.info("Loading CLIP model: %s (device=%s, attn=%s)", settings.CLIP_MODEL, clip_device, settings.CLIP_ATTN_IMPLEMENTATION)
+    try:
+        clip = hf_pipeline(
+            "zero-shot-image-classification",
+            model=settings.CLIP_MODEL,
+            device=clip_device,
+            model_kwargs={"attn_implementation": settings.CLIP_ATTN_IMPLEMENTATION},
+        )
+    except Exception:
+        # Mathematically equivalent attention kernel, not the classification math - if this specific
+        # implementation string isn't supported for this model/torch/transformers combo, fail loud at
+        # load time (not a silent scoring difference) and fall back to the library's own default.
+        logger.exception(
+            "CLIP failed to load with attn_implementation=%s - falling back to the default implementation.",
+            settings.CLIP_ATTN_IMPLEMENTATION,
+        )
+        clip = hf_pipeline(
+            "zero-shot-image-classification",
+            model=settings.CLIP_MODEL,
+            device=clip_device,
+        )
     logger.info("CLIP loaded successfully.")
 
     from diffusers import FlowMatchEulerDiscreteScheduler
