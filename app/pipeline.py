@@ -1846,6 +1846,65 @@ def visor_block(info, attempt=0, ref=False):
     )
 
 # ----------------------------------------------------------------------------
+# "id_focus2" prompt variant (settings.PROMPT_VARIANT=id_focus2): the production id_focus prompt, tightened for face
+# matching. Prompt-text only: no extra model calls, no per-photo measurements, and the text is STATIC per avatar type
+# so the CACHE_PROMPT_EMBEDS cache keeps hitting. It is also SHORTER than id_focus (fewer text tokens to encode and to
+# attend over), so it cannot cost speed.
+# What changed vs id_focus (drift seen in the 21/22-Oct runs: narrower face and jaw, beard trimmed, hair taller/fuller,
+# head turned upright, heavier brows):
+#   * one identity block that states the proportions as POSITIVE anchors ("exactly as wide and as full as Picture 2,
+#     same jaw width, same cheek width, same head silhouette incl. hair and beard") instead of ~15 "never ..." clauses
+#     (the distilled model has no negative guidance; every "never slim" only puts "slim" in the prompt).
+#   * removed the contradiction FACE_CLEAN "skin smooth, evenly painted" vs "keep the real skin texture" (men).
+#   * BUILD no longer asks for "a soft double chin / thicker neck" (caricature).
+#   * men: beard and hair paragraphs name length / fullness / outline / height explicitly (what drifted).
+# The women/hijab tune still works: it keys on BUILD's "BUILD: match" prefix and on the WOMEN_SKIN_OLD sentence, both
+# kept verbatim for women. Visor text, bald text, hijab text and the LoRA trigger sentence are untouched.
+# Rollback: PROMPT_VARIANT=id_focus.
+# ----------------------------------------------------------------------------
+IDENTITY_FOCUS2 = (
+    "FACE IDENTITY (highest priority, above style and above the visor): the face is the exact person in Picture 2, an "
+    "honest, unflattered likeness recognisable at first glance. Picture 2 is the ONLY source of facial structure; "
+    "Picture 1 supplies only painting style, lighting, jacket, emblem and background. copy from Picture 2, landmark by "
+    "landmark: head width-to-height ratio, forehead, cheekbones, cheek fullness, jaw width and jawline angle, chin, "
+    "ears, nose length, bridge and nostrils, lip shape and thickness, the same mouth and smile with the same visible "
+    "teeth, eyebrow shape, thickness and spacing, eye shape, eye size and eye spacing, and the exact eye color of "
+    "Picture 2 (dark brown stays dark brown, also behind the visor lens). the face is exactly as wide and as full as "
+    "in Picture 2, with the same cheek width and the same jaw width, so the whole head silhouette ({sil}) has the "
+    "width and proportions of Picture 2 and every landmark sits at the same relative position. "
+    "{skin}"
+)
+IDENTITY_FOCUS2_SKIN_MAN = (
+    "keep the real age and skin texture of Picture 2: forehead lines, smile lines, crow's feet, under-eye bags, pores "
+    "and stubble, in the same skin tone. "
+)
+
+BUILD2 = (
+    "BUILD: match the fullness of the person in Picture 2: a round, full face keeps full cheeks, a wide soft jaw and a "
+    "full neck; a lean face keeps lean cheeks, a defined jaw and a slim neck; an average face stays average. the build "
+    "comes from Picture 2 only. "
+)
+
+FACE_CLEAN2 = (
+    "FACE QUALITY: a clean, continuous jawline and chin contour from ear to chin on both sides, symmetrical and "
+    "undistorted, joining the neck naturally. "
+)
+
+HAIR_USER2 = (
+    "HAIR: ignore the hairstyle of Picture 1 and keep the exact hair of Picture 2: the same color, length, texture "
+    "(curly, wavy or straight), volume, height above the forehead, hairline, parting and side length; short hair "
+    "stays short, and a bald, shaved or receding head stays bald or receding exactly as in Picture 2 with no hair "
+    "painted on. the only change to the hair is a thin red rim light. "
+)
+
+FACIAL_HAIR2 = (
+    "FACIAL HAIR: the exact moustache, beard or stubble of Picture 2, with the same shape, coverage, length, density, "
+    "edge line and grey or black color; a full beard stays full and long along the whole jaw and chin and joins the "
+    "moustache exactly as in Picture 2; a clean-shaven face stays clean-shaven with smooth skin. facial hair comes "
+    "from Picture 2 only. "
+)
+
+# ----------------------------------------------------------------------------
 # "v3" prompt variant (settings.PROMPT_VARIANT=v3): short, positive-only, no contradictions.
 # Why (from the 14-photo concurrency run, test_results/run_20261016_224210):
 #   * the old prompts are ~1,300+ words. FLUX.2-klein is distilled (CFG ~1) so there is no negative guidance:
@@ -2124,8 +2183,15 @@ def _build_prompt_core(info, attempt=0, ref=False, style_mode=None, keep_user_ex
     )
     # Prompt variant: "tuned" (default) is byte-for-byte the notebook order; "id_focus" puts the identity text first.
     head, IDENTITY_TXT = f"{VISOR_MANDATORY}{bfs}", IDENTITY
+    id2 = settings.PROMPT_VARIANT == "id_focus2"
     if settings.PROMPT_VARIANT == "id_focus":
         head, IDENTITY_TXT = f"{bfs}{IDENTITY_FOCUS}{VISOR_MANDATORY}", ""
+        style_text = _id_focus_style(style_text)
+        closing = IDENTITY_FOCUS_CLOSING + closing
+    elif id2:
+        # women keep the exact WOMEN_SKIN_OLD sentence so _women_tune() swaps it as before; men get the texture sentence
+        _skin = WOMEN_SKIN_OLD if info.get("gender") == "Woman" else IDENTITY_FOCUS2_SKIN_MAN
+        head, IDENTITY_TXT = f"{bfs}{IDENTITY_FOCUS2.format(skin=_skin, sil=("face and hair" if info.get("gender") == "Woman" else "face, hair and beard"))}{VISOR_MANDATORY}", ""
         style_text = _id_focus_style(style_text)
         closing = IDENTITY_FOCUS_CLOSING + closing
     if info.get("gender") == "Woman":
@@ -2136,17 +2202,19 @@ def _build_prompt_core(info, attempt=0, ref=False, style_mode=None, keep_user_ex
     tune = (lambda t: _women_tune(t, info, ref)) if settings.WOMEN_PROMPT_TUNE else (lambda t: t)
     if info.get("hijab", False):
         return tune(
-            f"{head}{IDENTITY_TXT}{BUILD}{V}{HIJAB_VISOR_NOTE}"
+            f"{head}{IDENTITY_TXT}{BUILD2 if id2 else BUILD}{V}{HIJAB_VISOR_NOTE}"
             f"{HIJAB_FACE}{HIJAB_USER}{FACE_CLEAN}{style_text} {closing} the visor is present and fits her face."
         )
     if info.get("gender") == "Woman":
         return tune(
-            f"{head}{IDENTITY_TXT}{FEMALE_FACE}{BUILD}"
+            f"{head}{IDENTITY_TXT}{FEMALE_FACE}{BUILD2 if id2 else BUILD}"
             "her hair is styled exactly like Picture 1: long black hair with red and orange highlights woven "
             "throughout, styled in a high voluminous bun or updo at the crown, sleek and professionally polished, "
             f"framing the face. {V}{FACE_CLEAN}{style_text} " + closing
         )
-    hair_user_block = (BALD_USER + (BALD_RETRY if attempt > 0 else "")) if is_bald else (HAIR_USER + (HAIR_RETRY if hair_retry else ""))
+    hair_user_block = (BALD_USER + (BALD_RETRY if attempt > 0 else "")) if is_bald else ((HAIR_USER2 if id2 else HAIR_USER) + (HAIR_RETRY if hair_retry else ""))
+    if id2:
+        return f"{head}{IDENTITY_TXT}{BUILD2}{hair_user_block}{FACIAL_HAIR2}{V}{FACE_CLEAN2}{style_text} " + closing
     return (
         f"{head}{IDENTITY_TXT}{BUILD}{hair_user_block}"
         "FACIAL HAIR: keep the facial hair of Picture 2 exactly as it is: if Picture 2 has a moustache, goatee, "
