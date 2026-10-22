@@ -1068,12 +1068,78 @@ def load_image(path: Path) -> np.ndarray:
         raise Rejected("Image cannot be read (not an image or corrupted)")
     return img_bgr
 
+_CLIP_TEXT_CACHE: Dict[Tuple[str, ...], "torch.Tensor"] = {}
+_CLIP_FAST_PATH_OK: Optional[bool] = None  # None = not yet verified; True/False after a canary check
+
+def _clip_scores_slow(pil_img: Image.Image, labels: List[str]) -> Dict[str, float]:
+    res = clip(pil_img, candidate_labels=list(labels))
+    return {r["label"]: float(r["score"]) for r in res}
+
+def _clip_text_embeds(labels: Tuple[str, ...]):
+    """L2-normalized text embeddings for this exact label tuple, computed once and cached forever
+    (these are fixed strings baked into the code - gender/glasses/beard/bald/hijab prompts never
+    change at runtime, so this cache never goes stale)."""
+    cached = _CLIP_TEXT_CACHE.get(labels)
+    if cached is not None:
+        return cached
+    tokenizer = getattr(clip, "tokenizer")
+    model = clip.model
+    device = model.device
+    inputs = tokenizer(list(labels), padding=True, return_tensors="pt").to(device)
+    with torch.no_grad():
+        text_embeds = model.get_text_features(**inputs)
+    text_embeds = text_embeds / text_embeds.norm(p=2, dim=-1, keepdim=True)
+    _CLIP_TEXT_CACHE[labels] = text_embeds
+    return text_embeds
+
+def _clip_scores_fast(pil_img: Image.Image, labels: List[str]) -> Dict[str, float]:
+    """Mathematically identical to _clip_scores_slow (same normalize -> logit_scale -> softmax CLIP
+    does internally), but reuses cached text embeddings instead of re-encoding the same fixed label
+    strings on every single call. Only the per-image vision forward pass runs fresh each time."""
+    labels_t = tuple(labels)
+    model = clip.model
+    device = model.device
+    image_processor = getattr(clip, "image_processor", None) or getattr(clip, "feature_extractor")
+    pixel_values = image_processor(images=pil_img, return_tensors="pt")["pixel_values"].to(device)
+    with torch.no_grad():
+        image_embeds = model.get_image_features(pixel_values=pixel_values)
+        image_embeds = image_embeds / image_embeds.norm(p=2, dim=-1, keepdim=True)
+        text_embeds = _clip_text_embeds(labels_t)
+        logit_scale = model.logit_scale.exp()
+        logits = logit_scale * image_embeds @ text_embeds.T
+        probs = logits.softmax(dim=-1)[0]
+    return {label: float(p) for label, p in zip(labels_t, probs)}
+
 def clip_scores(pil_img: Image.Image, labels: List[str]) -> Dict[str, float]:
+    global _CLIP_FAST_PATH_OK
     if clip is None:
         raise RuntimeError("CLIP model is not loaded.")
     with _CLIP_LOCK:
-        res = clip(pil_img, candidate_labels=list(labels))
-    return {r["label"]: float(r["score"]) for r in res}
+        if _CLIP_FAST_PATH_OK is None:
+            # One-time canary: fast path must match the proven-correct slow path within float
+            # tolerance, or we permanently fall back - never trade correctness for speed silently.
+            try:
+                slow = _clip_scores_slow(pil_img, labels)
+                fast = _clip_scores_fast(pil_img, labels)
+                _CLIP_FAST_PATH_OK = all(
+                    abs(slow[k] - fast.get(k, -1.0)) < 1e-3 for k in slow
+                ) and set(slow) == set(fast)
+                if _CLIP_FAST_PATH_OK:
+                    logger.info("CLIP fast path verified (matches pipeline output within tolerance).")
+                    return fast
+                logger.warning("CLIP fast path mismatch vs reference output - disabling, using slow path.")
+                return slow
+            except Exception:
+                logger.exception("CLIP fast path failed canary check - disabling, using slow path.")
+                _CLIP_FAST_PATH_OK = False
+                return _clip_scores_slow(pil_img, labels)
+        if _CLIP_FAST_PATH_OK:
+            try:
+                return _clip_scores_fast(pil_img, labels)
+            except Exception:
+                logger.exception("CLIP fast path failed at runtime - falling back to slow path for this call.")
+                return _clip_scores_slow(pil_img, labels)
+        return _clip_scores_slow(pil_img, labels)
 
 def check_scope(pil_img: Image.Image) -> Dict[str, float]:
     s = clip_scores(pil_img, list(SCOPE_LABELS.values()))
