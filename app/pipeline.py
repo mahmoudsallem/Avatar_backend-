@@ -1075,6 +1075,53 @@ def clip_scores(pil_img: Image.Image, labels: List[str]) -> Dict[str, float]:
         res = clip(pil_img, candidate_labels=list(labels))
     return {r["label"]: float(r["score"]) for r in res}
 
+_CLIP_BATCH_OK: Optional[bool] = None  # None = not yet verified; True/False after a canary check
+
+def clip_scores_batch(views: List[Image.Image], labels: List[str]) -> List[Dict[str, float]]:
+    """Same model and math as clip_scores (the pipeline's own batching, nothing reimplemented),
+    called once for all views instead of once per view - saves N-1 separate forward-pass round
+    trips when scoring multiple crops of the same photo (classify_binary, classify_hijab).
+    Verified once against the proven per-view loop before being trusted; permanently falls back
+    if anything doesn't match exactly."""
+    global _CLIP_BATCH_OK
+    if clip is None:
+        raise RuntimeError("CLIP model is not loaded.")
+    labels_l = list(labels)
+    with _CLIP_LOCK:
+        if _CLIP_BATCH_OK:
+            try:
+                res = clip(list(views), candidate_labels=labels_l)
+                return [{r["label"]: float(r["score"]) for r in per_view} for per_view in res]
+            except Exception:
+                logger.exception("CLIP batched call failed at runtime - falling back to per-view calls.")
+            return [{r["label"]: float(r["score"]) for r in clip(v, candidate_labels=labels_l)} for v in views]
+
+        looped = [{r["label"]: float(r["score"]) for r in clip(v, candidate_labels=labels_l)} for v in views]
+        if _CLIP_BATCH_OK is False:
+            return looped
+
+        # One-time canary: batched call must match the proven per-view loop exactly, or disable permanently.
+        try:
+            res = clip(list(views), candidate_labels=labels_l)
+            batched = [{r["label"]: float(r["score"]) for r in per_view} for per_view in res]
+        except Exception:
+            logger.exception("CLIP batched call failed canary check - disabling, using per-view calls.")
+            _CLIP_BATCH_OK = False
+            return looped
+        ok = len(batched) == len(looped) and all(
+            set(b) == set(l) and all(abs(b[k] - l[k]) < 1e-4 for k in l)
+            for b, l in zip(batched, looped)
+        )
+        _CLIP_BATCH_OK = ok
+        if ok:
+            logger.info("CLIP batched scoring verified (matches per-view calls exactly).")
+            return batched
+        logger.warning(
+            "CLIP batched scoring mismatch vs per-view calls - disabling.\n  looped=%s\n  batched=%s",
+            looped, batched,
+        )
+        return looped
+
 def check_scope(pil_img: Image.Image) -> Dict[str, float]:
     s = clip_scores(pil_img, list(SCOPE_LABELS.values()))
     scores = {k: s[v] for k, v in SCOPE_LABELS.items()}
@@ -1189,9 +1236,9 @@ def classify_binary(
     # ONE CLIP call per view (all prompts together) instead of one per prompt pair. The result is identical:
     # s[p] / (s[p] + s[n]) is a softmax ratio, which does not depend on which other labels share the softmax.
     # Saves ~2/3 of the image encodings (glasses + beard + bald checks used to encode each view 3 times).
+    # Further batched across views (clip_scores_batch) into one pipeline call instead of one per view.
     labels = list(pos_prompts) + list(neg_prompts)
-    for v in views:
-        s = clip_scores(v, labels)
+    for s in clip_scores_batch(views, labels):
         for p, n in zip(pos_prompts, neg_prompts):
             tot = s[p] + s[n]
             pos_all.append(s[p] / tot if tot else 0.0)
@@ -1350,8 +1397,7 @@ def classify_hijab(image: Image.Image) -> Tuple[bool, dict]:
     head = image.crop((int(width * 0.05), 0, int(width * 0.95), int(height * 0.85)))
     labels = [label for pair in HIJAB_PROMPT_PAIRS for label in pair]
     view_scores = []
-    for view in (image, head):
-        scores = clip_scores(view, labels)
+    for scores in clip_scores_batch([image, head], labels):
         view_scores.extend(
             scores[yes] / max(scores[yes] + scores[no], 1e-12)
             for yes, no in HIJAB_PROMPT_PAIRS
