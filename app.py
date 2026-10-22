@@ -1,6 +1,13 @@
 import os
 # Less allocator fragmentation = fewer CUDA OOMs with several concurrent GPU slots. Must be set before torch is imported.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# Step-1 analysis runs several CPU-side CLIP/RetinaFace calls per request via ANALYSIS_CONCURRENCY
+# concurrent threads. Without this, each call's own intra-op parallelism defaults to all CPU cores,
+# so N concurrent analyses oversubscribe by ~Nx (measured: analysis time 1-4s -> 4-17s under load
+# once admission exceeded GPU_SLOTS). Cap each call to 1 thread; ANALYSIS_CONCURRENCY provides the
+# cross-request parallelism instead. Must be set before torch is imported.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 import sys
 import uuid
 import base64
