@@ -2125,11 +2125,41 @@ def lora_prompt(text: str) -> str:
 def build_prompt(info, attempt=0, ref=False, style_mode=None, keep_user_expression=None, hair_retry=False):
     return lora_prompt(_build_prompt_core(info, attempt, ref, style_mode, keep_user_expression, hair_retry))
 
+def _build_reference_man_prompt(info, attempt=0, ref=False, hair_retry=False):
+    """Compact male prompt for the fast single-candidate profile."""
+    bald = bool(info.get("bald", False))
+    hair = V3_BALD if bald else V3_HAIR
+    if hair_retry and not bald:
+        hair += HAIR_RETRY
+    visor = V3_VISOR_MAN.format(ref=" and the close-up in Picture 3" if ref else "")
+    return (
+        "head_swap: use Picture 1 for the red and blue jacket, triangular emblem, black background, camera framing "
+        "and painted lighting. Replace its entire head with the real head of Picture 2. "
+        "Make the person immediately recognisable as Picture 2: preserve his forehead, face width, cheek fullness, "
+        "jaw and chin shape, nose, eyebrows, eye spacing, natural skin tone and real age. "
+        "Keep his expression from Picture 2: the same smile, mouth width, cheek creases and visible teeth if present. "
+        "Keep the same head silhouette and hairline as Picture 2. "
+        + hair
+        + V3_BEARD
+        + "Paint the face in Picture 1's crisp semi-realistic illustration style while retaining the natural "
+        "smile lines, facial hair detail if present, and facial proportions of Picture 2. "
+        "Match the red rim light and blue fill light. "
+        + visor
+        + (VISOR_RETRY if attempt > 0 else "")
+        + "Keep the visor's transparent lens light enough to see his real dark eyes and expression clearly. "
+        "The jacket, emblem, framing and black background remain as in Picture 1."
+    )
+
+
 def _build_prompt_core(info, attempt=0, ref=False, style_mode=None, keep_user_expression=None, hair_retry=False):
     if style_mode is None:
         style_mode = settings.STYLE_MODE
     if keep_user_expression is None:
         keep_user_expression = settings.KEEP_USER_EXPRESSION
+    if (settings.PROMPT_VARIANT == "reference" and info.get("avatar") == "Man"
+            and style_mode == "semi_real" and keep_user_expression):
+        return _build_reference_man_prompt(info, attempt, ref, hair_retry)
+    variant = "id_focus" if settings.PROMPT_VARIANT == "reference" else settings.PROMPT_VARIANT
     if settings.PROMPT_VARIANT == "v3":
         return _build_prompt_v3(info, attempt, ref, keep_user_expression, hair_retry)
     if settings.PROMPT_VARIANT == "v4":
@@ -2183,8 +2213,8 @@ def _build_prompt_core(info, attempt=0, ref=False, style_mode=None, keep_user_ex
     )
     # Prompt variant: "tuned" (default) is byte-for-byte the notebook order; "id_focus" puts the identity text first.
     head, IDENTITY_TXT = f"{VISOR_MANDATORY}{bfs}", IDENTITY
-    id2 = settings.PROMPT_VARIANT == "id_focus2"
-    if settings.PROMPT_VARIANT == "id_focus":
+    id2 = variant == "id_focus2"
+    if variant == "id_focus":
         head, IDENTITY_TXT = f"{bfs}{IDENTITY_FOCUS}{VISOR_MANDATORY}", ""
         style_text = _id_focus_style(style_text)
         closing = IDENTITY_FOCUS_CLOSING + closing
