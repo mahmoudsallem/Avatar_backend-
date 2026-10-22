@@ -28,9 +28,10 @@ Enable with S3_ENABLED=true in .env. AWS credentials come from the normal boto3 
 import asyncio
 import json
 import logging
+import time
 import uuid
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set
 from urllib.parse import unquote_plus
 
 import boto3
@@ -252,22 +253,48 @@ def _pending_keys(s3) -> List[str]:
     return pending
 
 
+# Polling mode keeps ONE semaphore + an in-flight set for the life of the process. The old version awaited
+# gather() on every batch, so photos that landed while a batch was running waited for the whole batch to
+# drain (+ S3_POLL_INTERVAL), and the GPU idled at the tail of every batch. Now jobs are launched in the
+# background and every poll only picks up photos that are not already being processed.
+_poll_sem: Optional[asyncio.Semaphore] = None
+_inflight: Set[str] = set()
+_poll_tasks: Set[asyncio.Task] = set()
+_retry_after: Dict[str, float] = {}
+RETRY_COOLDOWN_S = 10.0
+
+
 async def _poll_once() -> None:
+    global _poll_sem
+    if _poll_sem is None:
+        _poll_sem = asyncio.Semaphore(settings.S3_MAX_CONCURRENT)
     s3 = _client()
-    keys = await asyncio.to_thread(_pending_keys, s3)
+    now = time.monotonic()
+    keys = [k for k in await asyncio.to_thread(_pending_keys, s3)
+            if k not in _inflight and _retry_after.get(k, 0.0) <= now]
     if not keys:
         return
 
-    logger.info("S3 watcher: %d new user photo(s) to process", len(keys))
-    sem = asyncio.Semaphore(settings.S3_MAX_CONCURRENT)
+    logger.info("S3 watcher: %d new user photo(s) to process (%d already in flight)", len(keys), len(_inflight))
 
     async def _guarded(key: str) -> None:
-        async with sem:
-            result = await _process_one(s3, key)
+        try:
+            async with _poll_sem:
+                result = await _process_one(s3, key)
             if result == "rejected":
                 _failed_stems.add(Path(key).stem)
+            elif result == "retry":
+                _retry_after[key] = time.monotonic() + RETRY_COOLDOWN_S
+            else:
+                _retry_after.pop(key, None)
+        finally:
+            _inflight.discard(key)
 
-    await asyncio.gather(*(_guarded(key) for key in keys))
+    for key in keys:
+        _inflight.add(key)
+        task = asyncio.create_task(_guarded(key))
+        _poll_tasks.add(task)
+        task.add_done_callback(_poll_tasks.discard)
 
 
 async def _poll_watch_loop() -> None:
@@ -317,3 +344,5 @@ async def stop() -> None:
     except asyncio.CancelledError:
         pass
     _task = None
+    for t in list(_poll_tasks):
+        t.cancel()

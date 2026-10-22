@@ -39,8 +39,6 @@ CONFIGS = [
     ("detect",           "baseline",         {"PERSISTENT_DETECT": "true"}),
     ("attn_native",      "baseline",         {"ATTENTION_BACKEND": "native"}),
     ("attn_cudnn",       "baseline",         {"ATTENTION_BACKEND": "_native_cudnn"}),
-    ("attn_flash3",      "baseline",         {"FLUX_BACKEND": "diffusers", "ATTENTION_BACKEND": "_flash_3_hub"}),
-    ("attn_flash4",      "baseline",         {"FLUX_BACKEND": "diffusers", "ATTENTION_BACKEND": "flash4"}),
     ("cudnn_on",         "baseline",         {"CUDNN_ENABLED": "true"}),
     # --- these change the result on purpose: the table tells you how much (judge by the images + id_sim) ---
     ("steps_4",          "baseline",         {"STEPS": "4"}),
@@ -56,6 +54,23 @@ CONFIGS = [
     ("all_in",           "baseline_uniform", {"ID_LORA_SCHEDULE": UNIFORM, "FUSE_LORA": "true", "COMPILE_TRANSFORMER": "true",
                                               "CACHE_PROMPT_EMBEDS": "true", "CACHE_REF_LATENTS": "true",
                                               "PERSISTENT_DETECT": "true"}),
+    # --- plain-PyTorch (NO quantization) stack for sm_120 (RTX PRO 6000 / EC2 g7e). Compare every row to dif_base AND to
+    #     `baseline` (the nunchaku production profile) on gen s + id_sim. FlashAttention-3/4 are NOT listed: official FA3 is
+    #     Hopper-only and official FA4 needs sm90/sm100, so neither runs here (the community SM120 FA4 build measures
+    #     4-10% SLOWER than FA2 at these sequence lengths). Attention choices that DO exist on sm_120 are PyTorch SDPA's
+    #     flash / cuDNN / efficient kernels. Run:  python bench_speed.py suite --only baseline,dif_base,dif_cudnn,dif_best
+    ("dif_base",        None,               {"FLUX_BACKEND": "diffusers", "ID_LORA_SCHEDULE": UNIFORM}),
+    ("dif_fp16",        "dif_base",         {"FLUX_BACKEND": "diffusers", "ID_LORA_SCHEDULE": UNIFORM, "MODEL_DTYPE": "fp16"}),
+    ("dif_native_flash","dif_base",         {"FLUX_BACKEND": "diffusers", "ID_LORA_SCHEDULE": UNIFORM, "ATTENTION_BACKEND": "_native_flash"}),
+    ("dif_cudnn",       "dif_base",         {"FLUX_BACKEND": "diffusers", "ID_LORA_SCHEDULE": UNIFORM, "ATTENTION_BACKEND": "_native_cudnn",
+                                              "CUDNN_ENABLED": "true"}),
+    ("dif_fuse",        "dif_base",         {"FLUX_BACKEND": "diffusers", "ID_LORA_SCHEDULE": UNIFORM, "FUSE_LORA": "true"}),
+    ("dif_fuse_compile","dif_base",         {"FLUX_BACKEND": "diffusers", "ID_LORA_SCHEDULE": UNIFORM, "FUSE_LORA": "true",
+                                              "COMPILE_TRANSFORMER": "true", "COMPILE_MODE": "max-autotune-no-cudagraphs"}),
+    ("dif_best",        "dif_base",         {"FLUX_BACKEND": "diffusers", "ID_LORA_SCHEDULE": UNIFORM, "FUSE_LORA": "true",
+                                              "COMPILE_TRANSFORMER": "true", "COMPILE_MODE": "max-autotune-no-cudagraphs",
+                                              "ATTENTION_BACKEND": "_native_cudnn", "CUDNN_ENABLED": "true", "VAE_COMPILE": "true",
+                                              "CACHE_PROMPT_EMBEDS": "true", "CACHE_REF_LATENTS": "true", "PERSISTENT_DETECT": "true"}),
     # --- scaling test plan: add one speed-up at a time, then stack them. Judge by id_sim + the images ("DIFFERS" = do not use) ---
     ("cfg_1",           "baseline",         {"CFG": "1.0", "REFINE_CFG": "1.0"}),                 # does CFG double the work? (watch gen s)
     ("cfg1_steps4",     "baseline",         {"CFG": "1.0", "REFINE_CFG": "1.0", "STEPS": "4"}),

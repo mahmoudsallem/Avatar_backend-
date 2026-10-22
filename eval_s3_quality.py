@@ -299,7 +299,7 @@ def build_html_report(out_dir: Path, items: list, wall_clock: float, batch_name:
             </div>
             <div class="stat-card">
                 <div class="stat-value">{wall_clock:.1f} s</div>
-                <div class="stat-label">Total Generation Time</div>
+                <div class="stat-label">End-to-End Time (first upload to last avatar)</div>
             </div>
             <div class="stat-card">
                 <div class="stat-value">{avg_time:.2f} s</div>
@@ -334,13 +334,27 @@ function openModal(src) {{
     report_path.write_text(html_content, encoding="utf-8")
     return report_path
 
+def get_next_round_num() -> int:
+    existing = []
+    if EVAL_DIR.exists():
+        for d in EVAL_DIR.glob("uat_round_*"):
+            try:
+                num = int(d.name.split("_")[-1])
+                existing.append(num)
+            except ValueError:
+                pass
+    return max(existing, default=1) + 1
+
 def main():
     parser = argparse.ArgumentParser(description="Saytara Avatar S3 Quality & Performance Evaluator")
-    parser.add_argument("--round", type=int, default=3, help="Evaluation / UAT Round number (default: 3)")
+    parser.add_argument("--round", type=int, default=None, help="Evaluation / UAT Round number (default: auto-detected next round)")
     parser.add_argument("--prefix", type=str, default="", help="Custom S3 file prefix (default: uat<round>_)")
     parser.add_argument("--from-prefix", type=str, default="", help="Build report from existing S3 run without uploading")
     parser.add_argument("--no-open", action="store_true", help="Do not open browser automatically")
-    parser.add_argument("--timeout", type=int, default=300, help="Max wait time for S3 generation in seconds")
+    parser.add_argument("--timeout", type=int, default=600, help="Max wait (s) from the FIRST upload for all avatars to appear")
+    parser.add_argument("--repeat", type=int, default=1, help="Send the users/ photos this many times (e.g. 4 -> 56 images) to measure steady-state throughput")
+    parser.add_argument("--workers", type=int, default=8, help="Parallel upload/download workers")
+    parser.add_argument("--poll", type=float, default=1.0, help="Seconds between S3 listings while waiting")
     args = parser.parse_args()
 
     files = sorted(list(USERS_DIR.glob("*.*")), key=lambda p: p.name.lower())
@@ -400,7 +414,7 @@ def main():
         return
 
     # Mode B: Live S3 Evaluation (UAT)
-    round_num = args.round
+    round_num = args.round if args.round is not None else get_next_round_num()
     prefix = args.prefix if args.prefix else f"uat{round_num}_"
     if not prefix.endswith("_"):
         prefix += "_"
@@ -415,63 +429,88 @@ def main():
 
     print("=" * 60)
     print(f"SAYTARA AVATAR BACKEND - LIVE S3 EVALUATION (ROUND {round_num})")
-    print(f"Prefix: {prefix} | Total Images: {total_expected}")
+    print(f"Prefix: {prefix} | Total Images: {total_expected * max(1, args.repeat)} ({total_expected} photos x{max(1, args.repeat)})")
     print("=" * 60)
 
-    # 1. Upload batch to S3 Users/
-    t_start_upload = time.time()
-    print(f"\n[1/3] Uploading {total_expected} user photos to {S3_USERS}/{prefix}XX.jpg...")
-    for idx, f in enumerate(files, 1):
+    # ---- Timing model --------------------------------------------------------------------------
+    # The clock (t0) starts BEFORE the first upload, because the watcher starts generating as soon as the
+    # first photo lands. Starting it after the last upload (old behaviour) hid every avatar that finished
+    # during the upload and inflated throughput (Round 21: 11 of 14 were already done at "0 s").
+    #   end-to-end rate  = images / (first upload start -> last avatar seen)      <- the honest headline
+    #   steady-state rate= (images-1) / (first avatar seen -> last avatar seen)   <- GPU pipeline once warm
+    #   latency          = avatar first seen - that photo's upload finished       <- what one user waits
+    from concurrent.futures import ThreadPoolExecutor
+    from statistics import median
+
+    jobs = list(files) * max(1, args.repeat)
+    total_expected = len(jobs)
+
+    def _upload(job):
+        idx, f = job
         target_name = f"{prefix}{idx:02d}.jpg"
-        in_copy = inp_dir / f"{idx:02d}_{f.name}"
-        shutil.copyfile(f, in_copy)
         run_aws(["s3", "cp", str(f), f"{S3_USERS}/{target_name}", "--quiet"])
-        print(f"  -> Uploaded #{idx:02d}: {f.name} as {target_name}")
+        return target_name, time.time()
 
-    upload_duration = round(time.time() - t_start_upload, 1)
-    print(f"[1/3] Upload complete in {upload_duration}s.")
+    print(f"\n[1/3] Uploading {total_expected} photos ({args.workers} parallel) to {S3_USERS}/{prefix}XX.jpg; generation runs while uploading...")
+    for idx, f in enumerate(jobs, 1):
+        shutil.copyfile(f, inp_dir / f"{idx:02d}_{f.name}")
 
-    # 2. Monitor S3 output generation
-    print(f"\n[2/3] S3 Watcher is processing batch on Blackwell GPU slots...")
-    t_gen_start = time.time()
-    seen = {}
+    t0 = time.time()
+    uploaded = {}      # target_name -> time upload finished
+    seen = {}          # target_name -> time avatar first seen in S3
+    pool = ThreadPoolExecutor(max_workers=max(1, args.workers))
+    futures = [pool.submit(_upload, (i, f)) for i, f in enumerate(jobs, 1)]
 
+    print("[2/3] Waiting for avatars (clock started at first upload)...")
     while len(seen) < total_expected:
-        time.sleep(3)
-        ls_output = run_aws(["s3", "ls", f"{S3_OUTPUTS}/"])
-        lines = [line for line in ls_output.split("\n") if prefix in line]
-
-        for line in lines:
+        for fu in [x for x in futures if x.done()]:
+            futures.remove(fu)
+            name, t_up = fu.result()
+            uploaded[name] = t_up
+        ls_output = run_aws(["s3", "ls", f"{S3_OUTPUTS}/{prefix}"])
+        for line in ls_output.split("\n"):
             parts = line.strip().split()
-            if len(parts) >= 4:
-                date, time_str, size_bytes, name = parts[0], parts[1], parts[2], parts[3]
-                if name not in seen:
-                    elapsed = round(time.time() - t_gen_start, 1)
-                    seen[name] = elapsed
-                    size_kb = round(int(size_bytes) / 1024, 1)
-                    print(f"  [{elapsed}s] COMPLETED #{len(seen):02d}/{total_expected}: {name} ({size_kb} KB)")
-
-        elapsed_total = round(time.time() - t_gen_start, 1)
-        if elapsed_total > args.timeout:
+            if len(parts) >= 4 and parts[3].startswith(prefix) and parts[3] not in seen:
+                seen[parts[3]] = time.time()
+                print(f"  [{seen[parts[3]] - t0:6.1f}s] COMPLETED {len(seen):02d}/{total_expected}: {parts[3]} ({round(int(parts[2]) / 1024, 1)} KB)")
+        if time.time() - t0 > args.timeout:
             print(f"[2/3] Timeout reached ({args.timeout}s).")
             break
+        if len(seen) < total_expected:
+            time.sleep(max(0.2, args.poll))
+    pool.shutdown(wait=True)
+    for fu in futures:
+        name, t_up = fu.result()
+        uploaded[name] = t_up
 
-    gen_duration = round(time.time() - t_gen_start, 1)
-    print(f"[2/3] Generation finished in {gen_duration}s ({len(seen)}/{total_expected} completed).")
+    t_end = max(seen.values()) if seen else time.time()
+    gen_duration = round(t_end - t0, 1)
+    upload_duration = round(max(uploaded.values()) - t0, 1) if uploaded else 0.0
+    print(f"[2/3] Done: {len(seen)}/{total_expected} avatars, end-to-end {gen_duration}s (uploads finished at {upload_duration}s).")
 
     # 3. Download results and compile report
     print(f"\n[3/3] Downloading generated avatars and building quality report...")
+
+    def _download(job):
+        idx, f = job
+        target_name = f"{prefix}{idx:02d}.jpg"
+        out_local = out_img_dir / f"{idx:02d}_{f.stem}_avatar.jpg"
+        run_aws(["s3", "cp", f"{S3_OUTPUTS}/{target_name}", str(out_local), "--quiet"])
+        return out_local
+
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as dpool:
+        out_paths = list(dpool.map(_download, list(enumerate(jobs, 1))))
+
     items = []
-    for idx, f in enumerate(files, 1):
+    latencies = []
+    for (idx, f), out_local in zip(enumerate(jobs, 1), out_paths):
         target_name = f"{prefix}{idx:02d}.jpg"
         in_copy = inp_dir / f"{idx:02d}_{f.name}"
-        out_local = out_img_dir / f"{idx:02d}_{f.stem}_avatar.jpg"
-
-        run_aws(["s3", "cp", f"{S3_OUTPUTS}/{target_name}", str(out_local), "--quiet"])
         ok = out_local.is_file() and out_local.stat().st_size > 1000
         size_kb = round(out_local.stat().st_size / 1024, 1) if ok else 0
-        elapsed_item = seen.get(target_name, "-")
-
+        lat = round(seen[target_name] - uploaded[target_name], 1) if (target_name in seen and target_name in uploaded) else None
+        if lat is not None:
+            latencies.append(lat)
         items.append({
             "idx": idx,
             "filename": f.name,
@@ -480,22 +519,32 @@ def main():
             "output_rel": out_local.relative_to(out_dir).as_posix() if ok else "",
             "output_size_kb": size_kb,
             "ok": ok,
-            "elapsed": elapsed_item,
+            "elapsed": lat if lat is not None else "-",
         })
 
     report_file = build_html_report(out_dir, items, gen_duration, prefix, title)
     success_count = sum(1 for it in items if it["ok"])
     avg_s = round(gen_duration / max(1, len(items)), 2)
     t_rate = round(60.0 / max(0.1, avg_s), 1)
+    steady = None
+    if len(seen) >= 3:
+        span = max(seen.values()) - min(seen.values())
+        if span > 0:
+            steady = round((len(seen) - 1) / span * 60.0, 1)
+    lat_sorted = sorted(latencies)
+    p95 = lat_sorted[min(len(lat_sorted) - 1, int(len(lat_sorted) * 0.95))] if lat_sorted else None
 
     print("\n" + "=" * 60)
-    print("S3 EVALUATION SUMMARY")
+    print("S3 EVALUATION SUMMARY (clock = first upload -> last avatar)")
     print("=" * 60)
-    print(f"Acceptance Rate      : {success_count}/{total_expected} ({(success_count/total_expected)*100:.0f}%)")
-    print(f"Total Generation Time: {gen_duration}s")
-    print(f"Average Per Avatar   : {avg_s}s")
-    print(f"Throughput           : {t_rate} avatars/min (~{int(t_rate * 60)} / hour)")
-    print(f"HTML Report          : {report_file}")
+    print(f"Acceptance Rate        : {success_count}/{total_expected} ({(success_count/total_expected)*100:.0f}%)")
+    print(f"End-to-end time        : {gen_duration}s   (uploads finished at {upload_duration}s)")
+    print(f"End-to-end throughput  : {t_rate} avatars/min (~{int(t_rate * 60)} / hour)   <- honest headline")
+    if steady is not None:
+        print(f"Steady-state throughput: {steady} avatars/min   (first avatar -> last avatar)")
+    if lat_sorted:
+        print(f"Latency per avatar     : median {median(lat_sorted):.1f}s | p95 {p95:.1f}s | max {lat_sorted[-1]:.1f}s  (upload done -> avatar seen)")
+    print(f"HTML Report            : {report_file}")
     print("=" * 60)
 
     if not args.no_open:
