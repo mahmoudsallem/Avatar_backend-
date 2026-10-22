@@ -1505,12 +1505,12 @@ def describe_face_traits(crop_pil: Image.Image, crop_bgr: np.ndarray, rect: Tupl
     try:
         fx, fy, fw, fh = rect
         face = crop_pil.crop((max(0, fx), max(0, fy), min(crop_pil.width, fx + fw), min(crop_pil.height, fy + fh)))
-        t["face_shape"] = _best_label(face, _TRAIT_FACE_SHAPE, 0.28) if face.width > 10 and face.height > 10 else None
+        t["face_shape"] = _best_label(face, _TRAIT_FACE_SHAPE, 0.40) if face.width > 10 and face.height > 10 else None
         t["skin"] = _skin_tone_words(crop_bgr, rect)
         if gender == "Man" and beard:
-            t["beard"] = _best_label(face, _TRAIT_BEARD, 0.28)
+            t["beard"] = _best_label(face, _TRAIT_BEARD, 0.40)
         if gender == "Man" and not bald:
-            t["hair"] = _best_label(crop_pil, _TRAIT_HAIR_MAN, 0.35)
+            t["hair"] = _best_label(crop_pil, _TRAIT_HAIR_MAN, 0.40)
     except Exception as e:  # traits are a bonus, never a reason to fail a request
         logger.warning("face trait measurement failed: %s", e)
     return {k: v for k, v in t.items() if v}
@@ -2051,13 +2051,7 @@ def _build_prompt_v4(info, attempt=0, ref=False, keep_user_expression=True, hair
             hair = V3_BALD + (BALD_RETRY if attempt > 0 else "")
         else:
             hair = V4_HAIR.format(hair=(f" ({tr['hair']})" if tr.get("hair") else "")) + (HAIR_RETRY if hair_retry else "")
-        if info.get("beard"):
-            b_val = tr.get("beard") or "a neat trimmed beard or goatee"
-            if "goatee" in b_val or "moustache only" in b_val:
-                b_val += "; the cheeks are clean-shaven with no hair or stubble on the cheeks"
-            beard = V4_BEARD.format(beard=b_val)
-        else:
-            beard = "the face is completely clean-shaven with smooth bare skin and no facial hair, beard, moustache or stubble. "
+        beard = V4_BEARD.format(beard=tr["beard"]) if (info.get("beard") and tr.get("beard")) else V3_BEARD
         p = V3_HEAD + ident + V3_BUILD + hair + beard + visor + V3_STYLE + V3_CLOSING
     if is_woman or is_hijab:
         p = _strip_facial_hair(_v3_women_skin(p))
@@ -2662,7 +2656,7 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         while True:
             mult = settings.ID_LORA_SCHEDULE[k % len(settings.ID_LORA_SCHEDULE)]
             slot.set_lora(test_lora * mult)
-            if info.get("hijab") and settings.PROMPT_VARIANT in ("v3", "v4") and "hijab_colour" not in info:
+            if info.get("hijab") and settings.PROMPT_VARIANT == "v3" and "hijab_colour" not in info:
                 info["hijab_colour"] = None  # computed once; stays None if the sample is unreliable
                 try:
                     from app.postprocess_hijab import user_hijab_colour
