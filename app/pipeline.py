@@ -1290,8 +1290,10 @@ def detect_glasses(views: List[Image.Image], gender: str) -> Tuple[bool, dict]:
 def detect_beard(image: Image.Image) -> Tuple[bool, dict]:
     width, height = image.size
     lower_face = image.crop((0, int(height * 0.28), width, height))
+    # 2 views (full image + crop) instead of 3 - dropped the contrast-enhanced duplicate of the
+    # crop, a minor robustness boost, not the core signal. Cuts CLIP calls for this check by 1/3.
     scores = classify_binary(
-        [image, lower_face, ImageEnhance.Contrast(lower_face).enhance(1.10)],
+        [image, lower_face],
         [
             "a man with a visible beard",
             "a man with clear facial hair",
@@ -1348,8 +1350,9 @@ def detect_bald(image: Image.Image, crop_bgr: np.ndarray = None, rect=None) -> T
     """Bald only if the scalp-colour test AND CLIP agree (a false positive removes a man's real hair)."""
     width, height = image.size
     top_head = image.crop((0, 0, width, int(height * 0.45)))
+    # 2 views instead of 3 - same rationale as detect_beard above.
     scores = classify_binary(
-        [image, top_head, ImageEnhance.Contrast(top_head).enhance(1.10)],
+        [image, top_head],
         [
             "a photo of a bald man with a bare shaved scalp",
             "a bald man with no hair on top of his head",
