@@ -837,6 +837,70 @@ def _lora_selftest() -> None:
         _LORA["mode"] = "nunchaku"
         logger.info("Nunchaku BFS LoRA self-test passed: mean pixel difference %.2f", difference)
         return
+
+def _batch_feasibility_test() -> None:
+    """Diagnostic only - does not touch the live S3-serving path. Checks whether this nunchaku
+    pipeline can accept batch_size=2 (list prompt/image/generator) and, if so, whether the output
+    for each sample matches what a separate batch_size=1 call produces (same inputs, same seed) -
+    i.e. batching must not change per-sample results, only how they're computed. Also compares
+    wall-clock time: batched call vs the two separate calls summed."""
+    if settings.FLUX_BACKEND != "nunchaku":
+        logger.info("Batch feasibility test: skipped (only wired for FLUX_BACKEND=nunchaku).")
+        return
+    logger.info("Batch feasibility test: generating 2 tiny images (separate vs batched)...")
+    av_man, _ = load_avatar("Man")
+    av_woman, _ = load_avatar("Woman")
+    base1 = av_man.resize((512, 512), Image.LANCZOS)
+    face1 = pad_square(base1.crop((140, 20, 400, 300)), 512)
+    base2 = av_woman.resize((512, 512), Image.LANCZOS)
+    face2 = pad_square(base2.crop((140, 20, 400, 300)), 512)
+    prompt1 = lora_prompt("head_swap: replace the head in Picture 1 with the head from Picture 2.")
+    prompt2 = lora_prompt("head_swap: replace the head in Picture 1 with the head from Picture 2, woman.")
+
+    def one(prompt, base, face, seed):
+        with torch.no_grad():
+            im = pipe(prompt=prompt, image=[base, face], width=512, height=512,
+                      num_inference_steps=2, guidance_scale=settings.CFG,
+                      generator=torch.Generator("cuda").manual_seed(seed)).images[0]
+        return np.asarray(im.convert("RGB")).astype(np.int16)
+
+    try:
+        t0 = time.time()
+        ref1 = one(prompt1, base1, face1, 7)
+        ref2 = one(prompt2, base2, face2, 8)
+        t_separate = time.time() - t0
+
+        t0 = time.time()
+        with torch.no_grad():
+            out = pipe(
+                prompt=[prompt1, prompt2],
+                image=[[base1, face1], [base2, face2]],
+                width=512, height=512, num_inference_steps=2,
+                guidance_scale=settings.CFG,
+                generator=[torch.Generator("cuda").manual_seed(7), torch.Generator("cuda").manual_seed(8)],
+            ).images
+        t_batched = time.time() - t0
+        if len(out) != 2:
+            logger.warning("Batch feasibility test: expected 2 images back, got %d - batching not usable as-is.", len(out))
+            return
+        batch1 = np.asarray(out[0].convert("RGB")).astype(np.int16)
+        batch2 = np.asarray(out[1].convert("RGB")).astype(np.int16)
+        diff1 = float(np.abs(batch1 - ref1).mean())
+        diff2 = float(np.abs(batch2 - ref2).mean())
+        logger.info(
+            "Batch feasibility test: diff1=%.3f diff2=%.3f (want ~0, same seed/inputs) | "
+            "separate=%.2fs batched=%.2fs (ratio %.2fx)",
+            diff1, diff2, t_separate, t_batched, t_separate / max(t_batched, 1e-6),
+        )
+        if diff1 > 1.0 or diff2 > 1.0:
+            logger.warning(
+                "Batch feasibility test: outputs DIFFER from the separate-call reference - "
+                "batching changes per-sample results here, do not use it for production generation."
+            )
+        else:
+            logger.info("Batch feasibility test: outputs MATCH the separate-call reference - batching looks safe.")
+    except Exception:
+        logger.exception("Batch feasibility test failed (exception) - batch_size>1 is not usable as-is for this pipeline.")
     av, _ = load_avatar("Man")
     base = av.resize((512, 512), Image.LANCZOS)
     face = pad_square(base.crop((140, 20, 400, 300)), 512)
@@ -987,6 +1051,8 @@ def load_models() -> None:
     lora_layers = _count_lora_layers() if settings.FLUX_BACKEND == "diffusers" else -1
     if settings.LORA_SELFTEST:
         _lora_selftest()
+    if settings.TEST_BATCH_GENERATION:
+        _batch_feasibility_test()
     if settings.FLUX_BACKEND == "diffusers" and model_dtype() == torch.float16:
         logger.info("MODEL_DTYPE=fp16: FLUX runs in half precision. If avatars come out black/noisy, set MODEL_DTYPE=bf16.")
     _log_versions()
