@@ -146,13 +146,7 @@ def lora_kwargs():
 
 # Step 1 (CPU: RetinaFace/DeepFace subprocess + CLIP) runs outside the GPU slots, this many at a time
 analysis_sem = asyncio.Semaphore(settings.ANALYSIS_CONCURRENCY)
-# analyse_user() makes ~10-15 CLIP calls per image (gender/glasses/beard/bald/hijab across several
-# crops each). This was a plain Lock, fully serializing every CLIP call process-wide regardless of
-# ANALYSIS_CONCURRENCY - measured as the dominant cost (analysis+analysis_wait ~14-15s combined,
-# unmoved by CPU worker/concurrency retuning). HF pipeline forward passes in eval mode have no
-# shared mutable state across calls, so bounded concurrent access should be safe; using a semaphore
-# instead of a hard lock to allow real parallelism while still capping concurrent GPU memory use.
-_CLIP_LOCK = threading.Semaphore(settings.CLIP_CONCURRENCY)
+_CLIP_LOCK = threading.Lock()
 
 async def process_image_file(image_path: Path, overrides: Optional[dict] = None) -> Tuple[bytes, dict]:
     """Run Step 1 (analysis) + Step 2 (generation) for a local image file.
@@ -837,70 +831,6 @@ def _lora_selftest() -> None:
         _LORA["mode"] = "nunchaku"
         logger.info("Nunchaku BFS LoRA self-test passed: mean pixel difference %.2f", difference)
         return
-
-def _batch_feasibility_test() -> None:
-    """Diagnostic only - does not touch the live S3-serving path. Checks whether this nunchaku
-    pipeline can accept batch_size=2 (list prompt/image/generator) and, if so, whether the output
-    for each sample matches what a separate batch_size=1 call produces (same inputs, same seed) -
-    i.e. batching must not change per-sample results, only how they're computed. Also compares
-    wall-clock time: batched call vs the two separate calls summed."""
-    if settings.FLUX_BACKEND != "nunchaku":
-        logger.info("Batch feasibility test: skipped (only wired for FLUX_BACKEND=nunchaku).")
-        return
-    logger.info("Batch feasibility test: generating 2 tiny images (separate vs batched)...")
-    av_man, _ = load_avatar("Man")
-    av_woman, _ = load_avatar("Woman")
-    base1 = av_man.resize((512, 512), Image.LANCZOS)
-    face1 = pad_square(base1.crop((140, 20, 400, 300)), 512)
-    base2 = av_woman.resize((512, 512), Image.LANCZOS)
-    face2 = pad_square(base2.crop((140, 20, 400, 300)), 512)
-    prompt1 = lora_prompt("head_swap: replace the head in Picture 1 with the head from Picture 2.")
-    prompt2 = lora_prompt("head_swap: replace the head in Picture 1 with the head from Picture 2, woman.")
-
-    def one(prompt, base, face, seed):
-        with torch.no_grad():
-            im = pipe(prompt=prompt, image=[base, face], width=512, height=512,
-                      num_inference_steps=2, guidance_scale=settings.CFG,
-                      generator=torch.Generator("cuda").manual_seed(seed)).images[0]
-        return np.asarray(im.convert("RGB")).astype(np.int16)
-
-    try:
-        t0 = time.time()
-        ref1 = one(prompt1, base1, face1, 7)
-        ref2 = one(prompt2, base2, face2, 8)
-        t_separate = time.time() - t0
-
-        t0 = time.time()
-        with torch.no_grad():
-            out = pipe(
-                prompt=[prompt1, prompt2],
-                image=[[base1, face1], [base2, face2]],
-                width=512, height=512, num_inference_steps=2,
-                guidance_scale=settings.CFG,
-                generator=[torch.Generator("cuda").manual_seed(7), torch.Generator("cuda").manual_seed(8)],
-            ).images
-        t_batched = time.time() - t0
-        if len(out) != 2:
-            logger.warning("Batch feasibility test: expected 2 images back, got %d - batching not usable as-is.", len(out))
-            return
-        batch1 = np.asarray(out[0].convert("RGB")).astype(np.int16)
-        batch2 = np.asarray(out[1].convert("RGB")).astype(np.int16)
-        diff1 = float(np.abs(batch1 - ref1).mean())
-        diff2 = float(np.abs(batch2 - ref2).mean())
-        logger.info(
-            "Batch feasibility test: diff1=%.3f diff2=%.3f (want ~0, same seed/inputs) | "
-            "separate=%.2fs batched=%.2fs (ratio %.2fx)",
-            diff1, diff2, t_separate, t_batched, t_separate / max(t_batched, 1e-6),
-        )
-        if diff1 > 1.0 or diff2 > 1.0:
-            logger.warning(
-                "Batch feasibility test: outputs DIFFER from the separate-call reference - "
-                "batching changes per-sample results here, do not use it for production generation."
-            )
-        else:
-            logger.info("Batch feasibility test: outputs MATCH the separate-call reference - batching looks safe.")
-    except Exception:
-        logger.exception("Batch feasibility test failed (exception) - batch_size>1 is not usable as-is for this pipeline.")
     av, _ = load_avatar("Man")
     base = av.resize((512, 512), Image.LANCZOS)
     face = pad_square(base.crop((140, 20, 400, 300)), 512)
@@ -994,32 +924,12 @@ def load_models() -> None:
     from transformers.utils import logging as hf_logging
     hf_logging.set_verbosity_error()
 
-    # CLIP runs ~6 forward passes per Step-1 analysis call (gender/glasses/beard/bald/hijab/hair).
-    # Running it on the same GPU as FLUX generation means both stages contend for the same CUDA
-    # scheduler; forcing CLIP to CPU frees the GPU for FLUX exclusively. Testing this as a lever for
-    # the Step-1 analysis bottleneck (analysis+analysis_wait averaging ~14-15s combined under load).
-    clip_device = -1 if (low_vram or settings.CLIP_ON_CPU) else 0
-    logger.info("Loading CLIP model: %s (device=%s, attn=%s)", settings.CLIP_MODEL, clip_device, settings.CLIP_ATTN_IMPLEMENTATION)
-    try:
-        clip = hf_pipeline(
-            "zero-shot-image-classification",
-            model=settings.CLIP_MODEL,
-            device=clip_device,
-            model_kwargs={"attn_implementation": settings.CLIP_ATTN_IMPLEMENTATION},
-        )
-    except Exception:
-        # Mathematically equivalent attention kernel, not the classification math - if this specific
-        # implementation string isn't supported for this model/torch/transformers combo, fail loud at
-        # load time (not a silent scoring difference) and fall back to the library's own default.
-        logger.exception(
-            "CLIP failed to load with attn_implementation=%s - falling back to the default implementation.",
-            settings.CLIP_ATTN_IMPLEMENTATION,
-        )
-        clip = hf_pipeline(
-            "zero-shot-image-classification",
-            model=settings.CLIP_MODEL,
-            device=clip_device,
-        )
+    logger.info("Loading CLIP model: %s", settings.CLIP_MODEL)
+    clip = hf_pipeline(
+        "zero-shot-image-classification",
+        model=settings.CLIP_MODEL,
+        device=-1 if low_vram else 0,
+    )
     logger.info("CLIP loaded successfully.")
 
     from diffusers import FlowMatchEulerDiscreteScheduler
@@ -1051,8 +961,6 @@ def load_models() -> None:
     lora_layers = _count_lora_layers() if settings.FLUX_BACKEND == "diffusers" else -1
     if settings.LORA_SELFTEST:
         _lora_selftest()
-    if settings.TEST_BATCH_GENERATION:
-        _batch_feasibility_test()
     if settings.FLUX_BACKEND == "diffusers" and model_dtype() == torch.float16:
         logger.info("MODEL_DTYPE=fp16: FLUX runs in half precision. If avatars come out black/noisy, set MODEL_DTYPE=bf16.")
     _log_versions()
@@ -1155,53 +1063,6 @@ def clip_scores(pil_img: Image.Image, labels: List[str]) -> Dict[str, float]:
     with _CLIP_LOCK:
         res = clip(pil_img, candidate_labels=list(labels))
     return {r["label"]: float(r["score"]) for r in res}
-
-_CLIP_BATCH_OK: Optional[bool] = None  # None = not yet verified; True/False after a canary check
-
-def clip_scores_batch(views: List[Image.Image], labels: List[str]) -> List[Dict[str, float]]:
-    """Same model and math as clip_scores (the pipeline's own batching, nothing reimplemented),
-    called once for all views instead of once per view - saves N-1 separate forward-pass round
-    trips when scoring multiple crops of the same photo (classify_binary, classify_hijab).
-    Verified once against the proven per-view loop before being trusted; permanently falls back
-    if anything doesn't match exactly."""
-    global _CLIP_BATCH_OK
-    if clip is None:
-        raise RuntimeError("CLIP model is not loaded.")
-    labels_l = list(labels)
-    with _CLIP_LOCK:
-        if _CLIP_BATCH_OK:
-            try:
-                res = clip(list(views), candidate_labels=labels_l)
-                return [{r["label"]: float(r["score"]) for r in per_view} for per_view in res]
-            except Exception:
-                logger.exception("CLIP batched call failed at runtime - falling back to per-view calls.")
-            return [{r["label"]: float(r["score"]) for r in clip(v, candidate_labels=labels_l)} for v in views]
-
-        looped = [{r["label"]: float(r["score"]) for r in clip(v, candidate_labels=labels_l)} for v in views]
-        if _CLIP_BATCH_OK is False:
-            return looped
-
-        # One-time canary: batched call must match the proven per-view loop exactly, or disable permanently.
-        try:
-            res = clip(list(views), candidate_labels=labels_l)
-            batched = [{r["label"]: float(r["score"]) for r in per_view} for per_view in res]
-        except Exception:
-            logger.exception("CLIP batched call failed canary check - disabling, using per-view calls.")
-            _CLIP_BATCH_OK = False
-            return looped
-        ok = len(batched) == len(looped) and all(
-            set(b) == set(l) and all(abs(b[k] - l[k]) < 1e-4 for k in l)
-            for b, l in zip(batched, looped)
-        )
-        _CLIP_BATCH_OK = ok
-        if ok:
-            logger.info("CLIP batched scoring verified (matches per-view calls exactly).")
-            return batched
-        logger.warning(
-            "CLIP batched scoring mismatch vs per-view calls - disabling.\n  looped=%s\n  batched=%s",
-            looped, batched,
-        )
-        return looped
 
 def check_scope(pil_img: Image.Image) -> Dict[str, float]:
     s = clip_scores(pil_img, list(SCOPE_LABELS.values()))
@@ -1317,9 +1178,9 @@ def classify_binary(
     # ONE CLIP call per view (all prompts together) instead of one per prompt pair. The result is identical:
     # s[p] / (s[p] + s[n]) is a softmax ratio, which does not depend on which other labels share the softmax.
     # Saves ~2/3 of the image encodings (glasses + beard + bald checks used to encode each view 3 times).
-    # Further batched across views (clip_scores_batch) into one pipeline call instead of one per view.
     labels = list(pos_prompts) + list(neg_prompts)
-    for s in clip_scores_batch(views, labels):
+    for v in views:
+        s = clip_scores(v, labels)
         for p, n in zip(pos_prompts, neg_prompts):
             tot = s[p] + s[n]
             pos_all.append(s[p] / tot if tot else 0.0)
@@ -1478,7 +1339,8 @@ def classify_hijab(image: Image.Image) -> Tuple[bool, dict]:
     head = image.crop((int(width * 0.05), 0, int(width * 0.95), int(height * 0.85)))
     labels = [label for pair in HIJAB_PROMPT_PAIRS for label in pair]
     view_scores = []
-    for scores in clip_scores_batch([image, head], labels):
+    for view in (image, head):
+        scores = clip_scores(view, labels)
         view_scores.extend(
             scores[yes] / max(scores[yes] + scores[no], 1e-12)
             for yes, no in HIJAB_PROMPT_PAIRS
@@ -1533,16 +1395,6 @@ def analyse_user(user_path: Path, crop_dir: Path = None) -> dict:
     if "bald" in ov and gender == "Man":
         bald = bool(ov["bald"])
 
-    traits: dict = {}
-    if settings.PROMPT_VARIANT == "v4":
-        _fx1 = max(0, (int(area["x"]) + int(area["w"]) // 2) - int(int(area["w"]) * settings.CROP_SCALE) // 2)
-        _fy1 = max(0, (int(area["y"]) + int(area["h"]) // 2) - int(int(area["h"]) * settings.CROP_SCALE) // 2)
-        traits = describe_face_traits(
-            crop_pil, crop_bgr, (int(area["x"]) - _fx1, int(area["y"]) - _fy1, int(area["w"]), int(area["h"])),
-            gender, beard, bald, hijab,
-        )
-        logger.info("Face traits for %s: %s", key, traits)
-
     tags = [gender] + (["Glasses"] if glasses else []) + (["Hijab"] if hijab else []) + (["Bald"] if bald else [])
     target_crop_dir = crop_dir or settings.CROP_DIR
     target_crop_dir.mkdir(parents=True, exist_ok=True)
@@ -1565,7 +1417,6 @@ def analyse_user(user_path: Path, crop_dir: Path = None) -> dict:
         "beard": beard,
         "bald": bald,
         "hair_vol_user": hair_vol_user,
-        "traits": traits,
         "avatar": "Woman_Hijab" if hijab else gender,
     }
     logger.info(
@@ -1580,78 +1431,6 @@ def analyse_user(user_path: Path, crop_dir: Path = None) -> dict:
         beard,
     )
     return info
-
-# ============================================================================
-# Per-photo face traits for the "v4" prompt (settings.PROMPT_VARIANT=v4)
-# ============================================================================
-# FLUX.2-klein follows concrete, specific words far better than "copy the face of Picture 2". Step 1 already has the
-# CLIP model and the face box, so measure a few things about THIS user and write them into the prompt. Every trait is
-# optional: a low-confidence or failed measurement is simply left out (the prompt then falls back to the generic text).
-
-_TRAIT_FACE_SHAPE = {
-    "a round, full face with full cheeks and a wide, soft jaw": "a photo of a person with a round, full face and full cheeks",
-    "an oval face with balanced proportions": "a photo of a person with an oval face",
-    "a long, lean face with a narrow jaw": "a photo of a person with a long, narrow, lean face",
-    "a square face with a strong, wide jaw": "a photo of a person with a square face and a strong wide jaw",
-}
-_TRAIT_BEARD = {
-    "a full, dense beard joined to the moustache, covering the cheeks, chin and jaw": "a man with a full, thick beard connected to a moustache",
-    "a short, trimmed stubble beard with a moustache": "a man with short trimmed stubble and a moustache",
-    "a goatee with a moustache": "a man with a goatee and a moustache",
-    "a moustache only": "a man with a moustache and no beard",
-}
-_TRAIT_HAIR_MAN = {
-    "short curly hair": "a photo of a man with short curly hair",
-    "short wavy hair": "a photo of a man with short wavy hair",
-    "short straight hair": "a photo of a man with short straight hair",
-    "medium-length hair": "a photo of a man with medium-length hair",
-    "long hair": "a photo of a man with long hair",
-}
-
-def _best_label(img: Image.Image, table: Dict[str, str], min_conf: float) -> Optional[str]:
-    s = clip_scores(img, list(table.values()))
-    score, phrase = max((s.get(lbl, 0.0), ph) for ph, lbl in table.items())
-    return phrase if score >= min_conf else None
-
-def _skin_tone_words(crop_bgr: np.ndarray, rect: Tuple[int, int, int, int]) -> Optional[str]:
-    """Median Lab of the forehead strip + upper cheeks (no beard, no glasses) -> a plain skin-tone phrase."""
-    fx, fy, fw, fh = rect
-    H, W = crop_bgr.shape[:2]
-    boxes = [
-        (fx + 0.28 * fw, fy + 0.03 * fh, fx + 0.72 * fw, fy + 0.18 * fh),   # forehead
-        (fx + 0.10 * fw, fy + 0.46 * fh, fx + 0.30 * fw, fy + 0.62 * fh),   # left upper cheek
-        (fx + 0.70 * fw, fy + 0.46 * fh, fx + 0.90 * fw, fy + 0.62 * fh),   # right upper cheek
-    ]
-    px = []
-    for x0, y0, x1, y1 in boxes:
-        reg = crop_bgr[max(0, int(y0)):min(H, int(y1)), max(0, int(x0)):min(W, int(x1))]
-        if reg.size:
-            px.append(_lab_pixels(reg))
-    if not px:
-        return None
-    lab = np.median(np.concatenate(px, 0), 0)
-    L = float(lab[0]) * 100.0 / 255.0
-    if L >= 74: return "fair"
-    if L >= 62: return "light-medium"
-    if L >= 50: return "medium warm-brown"
-    if L >= 38: return "deep brown"
-    return "very deep brown"
-
-def describe_face_traits(crop_pil: Image.Image, crop_bgr: np.ndarray, rect: Tuple[int, int, int, int],
-                         gender: str, beard: bool, bald: bool, hijab: bool) -> dict:
-    t: dict = {}
-    try:
-        fx, fy, fw, fh = rect
-        face = crop_pil.crop((max(0, fx), max(0, fy), min(crop_pil.width, fx + fw), min(crop_pil.height, fy + fh)))
-        t["face_shape"] = _best_label(face, _TRAIT_FACE_SHAPE, 0.40) if face.width > 10 and face.height > 10 else None
-        t["skin"] = _skin_tone_words(crop_bgr, rect)
-        if gender == "Man" and beard:
-            t["beard"] = _best_label(face, _TRAIT_BEARD, 0.40)
-        if gender == "Man" and not bald:
-            t["hair"] = _best_label(crop_pil, _TRAIT_HAIR_MAN, 0.40)
-    except Exception as e:  # traits are a bonus, never a reason to fail a request
-        logger.warning("face trait measurement failed: %s", e)
-    return {k: v for k, v in t.items() if v}
 
 # ============================================================================
 # Prompt assembly (verbatim, tuned text - do not reword)
@@ -2121,81 +1900,6 @@ def _build_prompt_v3(info, attempt=0, ref=False, keep_user_expression=True, hair
     return p
 
 
-# ----------------------------------------------------------------------------
-# "v4" prompt variant (settings.PROMPT_VARIANT=v4): v3's short positive-only structure + THIS user's measured traits.
-#   * identity block comes right after the head_swap sentence (early tokens weigh most) and names the things the
-#     model drifted on in the 21-Oct runs: face width / jaw narrowed, beard shortened and tidied, hair made fuller,
-#     brows made heavier, skin tone lightened.
-#   * face shape, skin tone, beard style and hair type are measured per photo in Step 1 (info["traits"]) and written
-#     as concrete words; a missing trait just drops out of the sentence.
-#   * no negative sentences ("never ...") - the distilled model has no negative guidance, they only add the concept.
-# ----------------------------------------------------------------------------
-V4_IDENTITY = (
-    "the face is the exact person from Picture 2, an honest unflattered likeness, recognisable at first glance. "
-    "{traits}"
-    "copy Picture 2 landmark by landmark: face width-to-height ratio, forehead, cheekbones, cheek fullness, jaw width "
-    "and jawline angle, chin, ears, nose length, bridge and nostrils, lip shape and thickness, eyebrow shape and "
-    "thickness, eye shape, eye size and eye spacing, the real dark eye colour, skin tone, real age and skin texture "
-    "(smile lines, pores, under-eye detail). the face is exactly as wide and as full as in Picture 2 with the same "
-    "jaw width. the smile and mouth stay as in Picture 2 with the same visible teeth, "
-    "the head angle follows Picture 1, and the eyes look straight at the viewer. "
-)
-
-V4_HAIR = (
-    "hair: the exact hair of Picture 2{hair} with the same hairline, temples, parting, length and volume, "
-    "plus only a thin red rim light. "
-)
-
-V4_BEARD = (
-    "facial hair, copied exactly from Picture 2: {beard}, with the same shape, length, density, coverage and edge "
-    "line, in the same grey or black colour. "
-)
-
-def _v4_traits_sentence(info) -> str:
-    tr = info.get("traits") or {}
-    bits = []
-    if tr.get("face_shape"):
-        bits.append(tr["face_shape"])
-    if tr.get("skin"):
-        bits.append(f"{tr['skin']} skin tone")
-    if not bits:
-        return ""
-    return "Picture 2 shows " + ", ".join(bits) + "; keep exactly that. "
-
-def _build_prompt_v4(info, attempt=0, ref=False, keep_user_expression=True, hair_retry=False):
-    is_woman = info.get("gender") == "Woman"
-    is_hijab = bool(info.get("hijab", False))
-    is_bald = bool(info.get("bald", False)) and not is_hijab and not is_woman
-    tr = info.get("traits") or {}
-    ident = V4_IDENTITY.format(traits=_v4_traits_sentence(info))
-    if not keep_user_expression:
-        ident = ident.replace("the smile and mouth stay as in Picture 2 with the same visible teeth, ", "the smile and mouth follow Picture 1, ")
-    visor = (V3_VISOR_MAN if info.get("avatar") == "Man" else V3_VISOR_DEFAULT).format(
-        ref=" and the close-up in Picture 3" if ref else ""
-    )
-    if attempt > 0:
-        visor += VISOR_RETRY
-    if is_hijab:
-        col = info.get("hijab_colour")
-        hij = V3_HIJAB.format(
-            colour=(col + " " if col else ""),
-            colour_rule=(f"the hijab is {col}, not black" if col else "the hijab takes the colour of Picture 2's hijab, not the black of the template"),
-        )
-        p = V3_HEAD + ident + V3_FEMALE + V3_BUILD + hij + visor + V3_STYLE + V3_CLOSING
-    elif is_woman:
-        p = V3_HEAD + ident + V3_FEMALE + V3_BUILD + V3_WOMAN_HAIR + visor + V3_STYLE + V3_CLOSING
-    else:
-        if is_bald:
-            hair = V3_BALD + (BALD_RETRY if attempt > 0 else "")
-        else:
-            hair = V4_HAIR.format(hair=(f" ({tr['hair']})" if tr.get("hair") else "")) + (HAIR_RETRY if hair_retry else "")
-        beard = V4_BEARD.format(beard=tr["beard"]) if (info.get("beard") and tr.get("beard")) else V3_BEARD
-        p = V3_HEAD + ident + V3_BUILD + hair + beard + visor + V3_STYLE + V3_CLOSING
-    if is_woman or is_hijab:
-        p = _strip_facial_hair(_v3_women_skin(p))
-    return p
-
-
 def lora_prompt(text: str) -> str:
     """Prepend the LoRA trigger word (settings.LORA_TRIGGER, e.g. "jhuangswap") when one is configured."""
     t = (settings.LORA_TRIGGER or "").strip()
@@ -2211,8 +1915,6 @@ def _build_prompt_core(info, attempt=0, ref=False, style_mode=None, keep_user_ex
         keep_user_expression = settings.KEEP_USER_EXPRESSION
     if settings.PROMPT_VARIANT == "v3":
         return _build_prompt_v3(info, attempt, ref, keep_user_expression, hair_retry)
-    if settings.PROMPT_VARIANT == "v4":
-        return _build_prompt_v4(info, attempt, ref, keep_user_expression, hair_retry)
 
     # Only the MALE prompt has a bald branch; women / hijab prompts are untouched.
     is_bald = bool(info.get("bald", False)) and not info.get("hijab", False) and info.get("gender") != "Woman"

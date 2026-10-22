@@ -67,10 +67,6 @@ class Settings(BaseSettings):
     # ---------------- Models ----------------
     CLIP_DIR: Path = Path("/Models/clip-vit-base-patch32")
     CLIP_MODEL: str = "openai/clip-vit-base-patch32"
-    CLIP_ON_CPU: bool = False  # force CLIP off the GPU so Step-1 analysis doesn't contend with FLUX generation for the CUDA scheduler
-    CLIP_CONCURRENCY: int = 1  # how many CLIP forward passes may run at once (was a hard Lock = 1); HF eval-mode forward passes have no shared mutable state, so >1 should be safe
-    CLIP_ATTN_IMPLEMENTATION: str = "eager"  # "eager" (default) | "sdpa" (PyTorch's built-in efficient/flash attention, no classification-math change, loads via model_kwargs)
-    TEST_BATCH_GENERATION: bool = False  # one-time diagnostic at startup only, does not touch the live generation path - see _batch_feasibility_test
     FLUX_MODEL: str = "black-forest-labs/FLUX.2-klein-9B"
     FLUX_BACKEND: str = "diffusers"  # "diffusers" or "nunchaku"
     NUNCHAKU_MODEL: str = "tonera/FLUX.2-klein-9B-Nunchaku"
@@ -184,7 +180,7 @@ class Settings(BaseSettings):
     HIJAB_DRAPE_FIX: float = 0.9
     REF_SIZE: int = 1024
     STYLE_MODE: str = "comic"  # "semi_real" | "comic" | "off"
-    PROMPT_VARIANT: str = "tuned"  # "tuned" = the notebook prompt (default) | "id_focus" = identity-first prompt | "v3" = short positive-only prompt (~380 words vs ~1300), A/B with send_10_images.py | "v4" = v3 + per-photo measured face traits (face shape, skin tone, beard style, hair type) with a stronger identity block
+    PROMPT_VARIANT: str = "tuned"  # "tuned" = the notebook prompt (default) | "id_focus" = identity-first prompt | "v3" = short positive-only prompt (~380 words vs ~1300), A/B with send_10_images.py
     KEEP_USER_EXPRESSION: bool = True
 
     # ---------------- Visor & Similarity ----------------
