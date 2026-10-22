@@ -67,6 +67,7 @@ class Settings(BaseSettings):
     # ---------------- Models ----------------
     CLIP_DIR: Path = Path("/Models/clip-vit-base-patch32")
     CLIP_MODEL: str = "openai/clip-vit-base-patch32"
+    CLIP_ON_CPU: bool = False  # force CLIP off the GPU so Step-1 analysis doesn't contend with FLUX generation for the CUDA scheduler
     FLUX_MODEL: str = "black-forest-labs/FLUX.2-klein-9B"
     FLUX_BACKEND: str = "diffusers"  # "diffusers" or "nunchaku"
     NUNCHAKU_MODEL: str = "tonera/FLUX.2-klein-9B-Nunchaku"

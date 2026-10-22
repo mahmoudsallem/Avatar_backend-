@@ -924,11 +924,16 @@ def load_models() -> None:
     from transformers.utils import logging as hf_logging
     hf_logging.set_verbosity_error()
 
-    logger.info("Loading CLIP model: %s", settings.CLIP_MODEL)
+    # CLIP runs ~6 forward passes per Step-1 analysis call (gender/glasses/beard/bald/hijab/hair).
+    # Running it on the same GPU as FLUX generation means both stages contend for the same CUDA
+    # scheduler; forcing CLIP to CPU frees the GPU for FLUX exclusively. Testing this as a lever for
+    # the Step-1 analysis bottleneck (analysis+analysis_wait averaging ~14-15s combined under load).
+    clip_device = -1 if (low_vram or settings.CLIP_ON_CPU) else 0
+    logger.info("Loading CLIP model: %s (device=%s)", settings.CLIP_MODEL, clip_device)
     clip = hf_pipeline(
         "zero-shot-image-classification",
         model=settings.CLIP_MODEL,
-        device=-1 if low_vram else 0,
+        device=clip_device,
     )
     logger.info("CLIP loaded successfully.")
 
