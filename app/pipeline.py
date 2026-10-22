@@ -2191,7 +2191,8 @@ def _build_prompt_core(info, attempt=0, ref=False, style_mode=None, keep_user_ex
     elif id2:
         # women keep the exact WOMEN_SKIN_OLD sentence so _women_tune() swaps it as before; men get the texture sentence
         _skin = WOMEN_SKIN_OLD if info.get("gender") == "Woman" else IDENTITY_FOCUS2_SKIN_MAN
-        head, IDENTITY_TXT = f"{bfs}{IDENTITY_FOCUS2.format(skin=_skin, sil=("face and hair" if info.get("gender") == "Woman" else "face, hair and beard"))}{VISOR_MANDATORY}", ""
+        _sil = "face and hair" if info.get("gender") == "Woman" else "face, hair and beard"
+        head, IDENTITY_TXT = f"{bfs}{IDENTITY_FOCUS2.format(skin=_skin, sil=_sil)}{VISOR_MANDATORY}", ""
         style_text = _id_focus_style(style_text)
         closing = IDENTITY_FOCUS_CLOSING + closing
     if info.get("gender") == "Woman":
