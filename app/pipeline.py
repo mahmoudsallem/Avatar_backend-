@@ -444,29 +444,10 @@ def apply_speed_options(slot: "GpuSlot") -> None:
         else:
             backend_raw = settings.ATTENTION_BACKEND.strip()
             backends_to_try = [backend_raw]
-            try:
-                cc_major, cc_minor = torch.cuda.get_device_capability(0)
-            except Exception:
-                cc_major, cc_minor = 0, 0
-            gate_msg = None
-            # The "flash4"/"flash3" ALIASES are hardware-gated so a wrong setting cannot silently slow the service.
-            # Official FlashAttention-4 needs Hopper (sm90) or datacenter Blackwell (sm100: TMEM/tcgen05); FlashAttention-3
-            # is Hopper-only (sm90). Workstation/server Blackwell (RTX PRO 6000 = sm_120, EC2 g7e) has neither.
-            # Pass an exact diffusers name (e.g. "flash_4_hub") to bypass the gate and test a community SM120 build.
             if backend_raw.lower() in ("flash4", "flash_4", "flash-4", "_flash_4"):
-                backends_to_try = ["flash_4_hub", "_flash_4", "_flash_4_hub"]   # diffusers' own name is flash_4_hub
-                if cc_major not in (9, 10):
-                    gate_msg = (f"official FlashAttention-4 does not run on this GPU (sm_{cc_major}{cc_minor}); "
-                                "it needs sm90/sm100. Use ATTENTION_BACKEND=_native_cudnn or native (PyTorch SDPA) on sm_120")
+                backends_to_try = ["_flash_4", "_flash_4_hub", "flash4"]
             elif backend_raw.lower() in ("flash3", "flash_3", "flash-3", "_flash_3"):
                 backends_to_try = ["_flash_3_hub", "_flash_3"]
-                if cc_major != 9:
-                    gate_msg = (f"FlashAttention-3 is Hopper-only (sm90); this GPU is sm_{cc_major}{cc_minor}. "
-                                "Use ATTENTION_BACKEND=_native_cudnn or native (PyTorch SDPA)")
-            if gate_msg:
-                logger.warning("Slot %d: ATTENTION_BACKEND=%r skipped - %s. Keeping the default (PyTorch SDPA).",
-                               slot.idx, settings.ATTENTION_BACKEND, gate_msg)
-                backends_to_try = []
 
             applied = False
             last_err = None
@@ -479,7 +460,7 @@ def apply_speed_options(slot: "GpuSlot") -> None:
                 except Exception as exc:
                     last_err = exc
 
-            if not applied and backends_to_try:
+            if not applied:
                 logger.warning(
                     "Slot %d: could not set attention backend %r (%s). "
                     "Make sure 'flash_attn_4', 'flash_attn_3', or 'kernels' is installed. Keeping the default.",
