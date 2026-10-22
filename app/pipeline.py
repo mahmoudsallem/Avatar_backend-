@@ -2125,61 +2125,11 @@ def lora_prompt(text: str) -> str:
 def build_prompt(info, attempt=0, ref=False, style_mode=None, keep_user_expression=None, hair_retry=False):
     return lora_prompt(_build_prompt_core(info, attempt, ref, style_mode, keep_user_expression, hair_retry))
 
-def _build_reference_man_prompt(info, attempt=0, ref=False, hair_retry=False):
-    """Keep identity instructions prominent without increasing prompt length."""
-    bald = bool(info.get("bald", False))
-    hair = V3_BALD if bald else V3_HAIR
-    if hair_retry and not bald:
-        hair += HAIR_RETRY
-    visor = V3_VISOR_MAN.format(ref=" and the close-up in Picture 3" if ref else "")
-    return (
-        "head_swap: Picture 2 is the sole source for the person's head and facial identity. "
-        "Copy the whole head, not just the central facial features: its width and length, forehead height, "
-        "hairline, cheek fullness, jaw width and angle, chin, ears, nose bridge and tip, lips, eyebrows, "
-        "eye shape and spacing. Preserve the same natural skin tone and apparent age. "
-        "Match the head turn and gaze of Picture 2. Match its mouth opening precisely: closed lips stay closed, "
-        "a subtle smile stays subtle, and visible teeth appear only to the same extent as in Picture 2. "
-        "Keep the mouth width, smile lines and cheek lift. The face must be recognisable at first glance. "
-        + hair
-        + V3_BEARD
-        + "Picture 1 supplies only the semi-realistic painted finish, red and blue lighting, "
-        "jacket, triangular emblem, framing and solid black background. Keep those design elements intact. "
-        + visor
-        + (VISOR_RETRY if attempt > 0 else "")
-        + "Show the real eyes and expression of Picture 2 through the clear visor lens. "
-    )
-
-def _build_reference_woman_prompt(info, attempt=0, ref=False):
-    """Keep the user's face and hair while retaining the avatar design."""
-    visor = V3_VISOR_DEFAULT.format(ref=" and the close-up in Picture 3" if ref else "")
-    return (
-        "head_swap: Picture 2 is the sole source for this woman's head and facial identity. "
-        "Copy her face width and length, forehead, full cheek shape, jaw and chin, nose width and tip, "
-        "eyebrow shape, eye shape and spacing, lips, ears, natural skin tone and apparent age. "
-        "Match the head turn and gaze of Picture 2. Preserve its exact expression and mouth opening: "
-        "closed lips stay closed, a subtle smile stays subtle, and teeth appear only to the same extent as in "
-        "Picture 2. Keep her natural makeup level and facial proportions. "
-        "Her hair comes from Picture 2: the same hairline, part, length, texture, volume and colour, "
-        "arranged naturally around her own face. "
-        "Picture 1 supplies only the crisp semi-realistic painted style, red and blue lighting, jacket, "
-        "triangular emblem, framing and solid black background. "
-        + visor
-        + (VISOR_RETRY if attempt > 0 else "")
-        + "Her real eyes, brows and expression remain visible through the clear visor lens. "
-    )
-
 def _build_prompt_core(info, attempt=0, ref=False, style_mode=None, keep_user_expression=None, hair_retry=False):
     if style_mode is None:
         style_mode = settings.STYLE_MODE
     if keep_user_expression is None:
         keep_user_expression = settings.KEEP_USER_EXPRESSION
-    if (settings.PROMPT_VARIANT == "reference" and info.get("avatar") == "Man"
-            and style_mode == "semi_real" and keep_user_expression):
-        return _build_reference_man_prompt(info, attempt, ref, hair_retry)
-    if (settings.PROMPT_VARIANT == "reference" and info.get("avatar") == "Woman"
-            and not info.get("hijab") and style_mode == "semi_real" and keep_user_expression):
-        return _build_reference_woman_prompt(info, attempt, ref)
-    variant = "id_focus" if settings.PROMPT_VARIANT == "reference" else settings.PROMPT_VARIANT
     if settings.PROMPT_VARIANT == "v3":
         return _build_prompt_v3(info, attempt, ref, keep_user_expression, hair_retry)
     if settings.PROMPT_VARIANT == "v4":
@@ -2233,16 +2183,15 @@ def _build_prompt_core(info, attempt=0, ref=False, style_mode=None, keep_user_ex
     )
     # Prompt variant: "tuned" (default) is byte-for-byte the notebook order; "id_focus" puts the identity text first.
     head, IDENTITY_TXT = f"{VISOR_MANDATORY}{bfs}", IDENTITY
-    id2 = variant == "id_focus2"
-    if variant == "id_focus":
+    id2 = settings.PROMPT_VARIANT == "id_focus2"
+    if settings.PROMPT_VARIANT == "id_focus":
         head, IDENTITY_TXT = f"{bfs}{IDENTITY_FOCUS}{VISOR_MANDATORY}", ""
         style_text = _id_focus_style(style_text)
         closing = IDENTITY_FOCUS_CLOSING + closing
     elif id2:
         # women keep the exact WOMEN_SKIN_OLD sentence so _women_tune() swaps it as before; men get the texture sentence
         _skin = WOMEN_SKIN_OLD if info.get("gender") == "Woman" else IDENTITY_FOCUS2_SKIN_MAN
-        _sil = "face and hair" if info.get("gender") == "Woman" else "face, hair and beard"
-        head, IDENTITY_TXT = f"{bfs}{IDENTITY_FOCUS2.format(skin=_skin, sil=_sil)}{VISOR_MANDATORY}", ""
+        head, IDENTITY_TXT = f"{bfs}{IDENTITY_FOCUS2.format(skin=_skin, sil=("face and hair" if info.get("gender") == "Woman" else "face, hair and beard"))}{VISOR_MANDATORY}", ""
         style_text = _id_focus_style(style_text)
         closing = IDENTITY_FOCUS_CLOSING + closing
     if info.get("gender") == "Woman":
