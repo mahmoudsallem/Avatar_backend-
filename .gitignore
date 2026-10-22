@@ -41,3 +41,5 @@ archive/
 evaluation_results/*
 sagemaker-flux2-deployment-guide.pdf
 *.ps1
+
+eval_s3_quality.py
