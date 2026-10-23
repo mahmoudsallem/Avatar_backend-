@@ -30,6 +30,12 @@ Usage:
     # to be re-downloaded from Hugging Face / DeepFace:
     python install_models.py pull
 
+    # One-shot setup for a new box: pull from S3, download anything still missing straight from
+    # Hugging Face (e.g. the gated FLUX.2-klein-9B base model - needs HF_TOKEN or `hf auth login`
+    # from an account that accepted the license), then push it back to S3 so the next box only
+    # needs `pull`:
+    python install_models.py install
+
     # Only sync one of the three sets, or preview without transferring anything:
     python install_models.py pull --only huggingface_hub
     python install_models.py push --dry-run
@@ -88,6 +94,43 @@ def _configured_hf_repo_dirs() -> List[str]:
     """Each configured repo id's cache directory name, e.g. "black-forest-labs/FLUX.2-klein-9B"
     -> "models--black-forest-labs--FLUX.2-klein-9B" (HF's own naming convention)."""
     return [f"models--{repo.replace('/', '--')}" for repo in _configured_hf_repos()]
+
+
+def _hf_token() -> Optional[str]:
+    """HF_TOKEN / HUGGING_FACE_HUB_TOKEN from the environment, else None (huggingface_hub then falls
+    back to the token saved by `hf auth login`). Never read from .env - that file is committed to git."""
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
+
+
+def hf_download_missing(dry_run: bool) -> bool:
+    """Downloads every configured HF repo (see _configured_hf_repos) that is not fully in the local
+    HF cache yet, straight from Hugging Face. snapshot_download is idempotent: complete files are
+    skipped. The LoRA repo only fetches LORA_FILE. Returns False if a repo could not be fetched."""
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
+
+    ok = True
+    for repo in _configured_hf_repos():
+        patterns = [settings.LORA_FILE] if repo == settings.LORA and settings.LORA_FILE else None
+        if dry_run:
+            print(f"[huggingface_hub] would ensure {repo} is downloaded" + (f" ({patterns[0]} only)" if patterns else ""))
+            continue
+        print(f"[huggingface_hub] ensuring {repo} is in {HF_CACHE_DIR} (skips files already there)...")
+        try:
+            snapshot_download(repo_id=repo, cache_dir=str(HF_CACHE_DIR), allow_patterns=patterns, token=_hf_token())
+            print(f"[huggingface_hub] {repo}: OK")
+        except GatedRepoError:
+            ok = False
+            print(f"  [FAIL] {repo} is gated. Accept the license at https://huggingface.co/{repo} with your account, then "
+                  f"run `hf auth login` or `export HF_TOKEN=hf_...` (read token) and rerun.", file=sys.stderr)
+        except RepositoryNotFoundError:
+            ok = False
+            print(f"  [FAIL] {repo}: not found, or the token has no access to it.", file=sys.stderr)
+        except Exception as exc:
+            ok = False
+            print(f"  [FAIL] {repo}: {exc}", file=sys.stderr)
+    print()
+    return ok
 
 
 def _client():
@@ -289,7 +332,7 @@ def pull(s3, bucket: str, name: str, local_root: Path, s3_prefix: str, is_hf_cac
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("action", choices=["push", "pull"], help="push: local caches -> S3. pull: S3 -> local caches")
+    parser.add_argument("action", choices=["push", "pull", "install"], help="push: local caches -> S3. pull: S3 -> local caches. install: pull, then download whatever is still missing from Hugging Face, then push it to S3")
     parser.add_argument("--only", help="comma-separated subset of: " + ",".join(n for n, _, _ in MODEL_SETS))
     parser.add_argument("--dry-run", action="store_true", help="list what would transfer without moving data")
     parser.add_argument("--extra-repos", help="push only: comma-separated HF repo ids to back up IN ADDITION to the "
@@ -316,17 +359,29 @@ def main() -> None:
     print(f"Bucket: s3://{bucket}/{base_prefix}  |  action: {args.action}{dry_suffix}\n")
 
     extra_repos = [r.strip() for r in args.extra_repos.split(",")] if args.extra_repos else None
-    if extra_repos and args.action != "push":
+    if extra_repos and args.action not in ("push", "install"):
         parser.error("--extra-repos only applies to push")
 
-    for name, local_root, is_hf_cache in sets:
-        s3_prefix = f"{base_prefix}{name}/"
-        if args.action == "push":
-            push(s3, bucket, name, local_root, s3_prefix, is_hf_cache, args.dry_run,
-                 extra_repos=extra_repos if is_hf_cache else None)
-        else:
-            pull(s3, bucket, name, local_root, s3_prefix, is_hf_cache, args.dry_run)
-        print()
+    def run(action: str) -> None:
+        for name, local_root, is_hf_cache in sets:
+            s3_prefix = f"{base_prefix}{name}/"
+            if action == "push":
+                push(s3, bucket, name, local_root, s3_prefix, is_hf_cache, args.dry_run,
+                     extra_repos=extra_repos if is_hf_cache else None)
+            else:
+                pull(s3, bucket, name, local_root, s3_prefix, is_hf_cache, args.dry_run)
+            print()
+
+    if args.action == "install":
+        run("pull")
+        hf_ok = True
+        if wanted is None or "huggingface_hub" in wanted:
+            hf_ok = hf_download_missing(args.dry_run)
+        run("push")
+        if not hf_ok:
+            sys.exit(1)
+    else:
+        run(args.action)
 
 
 if __name__ == "__main__":
