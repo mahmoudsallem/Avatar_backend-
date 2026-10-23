@@ -908,13 +908,6 @@ def load_models() -> None:
     assert torch.cuda.is_available(), "PyTorch cannot see the GPU - FLUX needs CUDA."
     torch.backends.cudnn.enabled = bool(settings.CUDNN_ENABLED)
 
-    # 2026-10-23: the torch.backends.cuda.enable_flash_sdp/enable_math_sdp/enable_mem_efficient_sdp
-    # block tried here was reverted - it reproduced the exact "Invalid handle. Cannot load symbol
-    # cublasLtGetVersion" crash already diagnosed in 066d961 (loading NVIDIA shared libs outside this
-    # server's narrow LD_LIBRARY_PATH), and it was a no-op for FLUX_BACKEND=nunchaku anyway (Nunchaku
-    # uses its own quantized CUDA kernels, never PyTorch's SDPA dispatcher). Do not re-add without
-    # fixing LD_LIBRARY_PATH first.
-
     free_gb, total_gb = get_gpu_memory_info()
     free_gb_val = free_gb if free_gb is not None else 0.0
     low_vram = free_gb_val < 45.0
@@ -1402,6 +1395,16 @@ def analyse_user(user_path: Path, crop_dir: Path = None) -> dict:
     if "bald" in ov and gender == "Man":
         bald = bool(ov["bald"])
 
+    traits: dict = {}
+    if settings.PROMPT_VARIANT == "v4":
+        _fx1 = max(0, (int(area["x"]) + int(area["w"]) // 2) - int(int(area["w"]) * settings.CROP_SCALE) // 2)
+        _fy1 = max(0, (int(area["y"]) + int(area["h"]) // 2) - int(int(area["h"]) * settings.CROP_SCALE) // 2)
+        traits = describe_face_traits(
+            crop_pil, crop_bgr, (int(area["x"]) - _fx1, int(area["y"]) - _fy1, int(area["w"]), int(area["h"])),
+            gender, beard, bald, hijab,
+        )
+        logger.info("Face traits for %s: %s", key, traits)
+
     tags = [gender] + (["Glasses"] if glasses else []) + (["Hijab"] if hijab else []) + (["Bald"] if bald else [])
     target_crop_dir = crop_dir or settings.CROP_DIR
     target_crop_dir.mkdir(parents=True, exist_ok=True)
@@ -1424,6 +1427,7 @@ def analyse_user(user_path: Path, crop_dir: Path = None) -> dict:
         "beard": beard,
         "bald": bald,
         "hair_vol_user": hair_vol_user,
+        "traits": traits,
         "avatar": "Woman_Hijab" if hijab else gender,
     }
     logger.info(
@@ -1438,6 +1442,78 @@ def analyse_user(user_path: Path, crop_dir: Path = None) -> dict:
         beard,
     )
     return info
+
+# ============================================================================
+# Per-photo face traits for the "v4" prompt (settings.PROMPT_VARIANT=v4)
+# ============================================================================
+# FLUX.2-klein follows concrete, specific words far better than "copy the face of Picture 2". Step 1 already has the
+# CLIP model and the face box, so measure a few things about THIS user and write them into the prompt. Every trait is
+# optional: a low-confidence or failed measurement is simply left out (the prompt then falls back to the generic text).
+
+_TRAIT_FACE_SHAPE = {
+    "a round, full face with full cheeks and a wide, soft jaw": "a photo of a person with a round, full face and full cheeks",
+    "an oval face with balanced proportions": "a photo of a person with an oval face",
+    "a long, lean face with a narrow jaw": "a photo of a person with a long, narrow, lean face",
+    "a square face with a strong, wide jaw": "a photo of a person with a square face and a strong wide jaw",
+}
+_TRAIT_BEARD = {
+    "a full, dense beard joined to the moustache, covering the cheeks, chin and jaw": "a man with a full, thick beard connected to a moustache",
+    "a short, trimmed stubble beard with a moustache": "a man with short trimmed stubble and a moustache",
+    "a goatee with a moustache": "a man with a goatee and a moustache",
+    "a moustache only": "a man with a moustache and no beard",
+}
+_TRAIT_HAIR_MAN = {
+    "short curly hair": "a photo of a man with short curly hair",
+    "short wavy hair": "a photo of a man with short wavy hair",
+    "short straight hair": "a photo of a man with short straight hair",
+    "medium-length hair": "a photo of a man with medium-length hair",
+    "long hair": "a photo of a man with long hair",
+}
+
+def _best_label(img: Image.Image, table: Dict[str, str], min_conf: float) -> Optional[str]:
+    s = clip_scores(img, list(table.values()))
+    score, phrase = max((s.get(lbl, 0.0), ph) for ph, lbl in table.items())
+    return phrase if score >= min_conf else None
+
+def _skin_tone_words(crop_bgr: np.ndarray, rect: Tuple[int, int, int, int]) -> Optional[str]:
+    """Median Lab of the forehead strip + upper cheeks (no beard, no glasses) -> a plain skin-tone phrase."""
+    fx, fy, fw, fh = rect
+    H, W = crop_bgr.shape[:2]
+    boxes = [
+        (fx + 0.28 * fw, fy + 0.03 * fh, fx + 0.72 * fw, fy + 0.18 * fh),   # forehead
+        (fx + 0.10 * fw, fy + 0.46 * fh, fx + 0.30 * fw, fy + 0.62 * fh),   # left upper cheek
+        (fx + 0.70 * fw, fy + 0.46 * fh, fx + 0.90 * fw, fy + 0.62 * fh),   # right upper cheek
+    ]
+    px = []
+    for x0, y0, x1, y1 in boxes:
+        reg = crop_bgr[max(0, int(y0)):min(H, int(y1)), max(0, int(x0)):min(W, int(x1))]
+        if reg.size:
+            px.append(_lab_pixels(reg))
+    if not px:
+        return None
+    lab = np.median(np.concatenate(px, 0), 0)
+    L = float(lab[0]) * 100.0 / 255.0
+    if L >= 74: return "fair"
+    if L >= 62: return "light-medium"
+    if L >= 50: return "medium warm-brown"
+    if L >= 38: return "deep brown"
+    return "very deep brown"
+
+def describe_face_traits(crop_pil: Image.Image, crop_bgr: np.ndarray, rect: Tuple[int, int, int, int],
+                         gender: str, beard: bool, bald: bool, hijab: bool) -> dict:
+    t: dict = {}
+    try:
+        fx, fy, fw, fh = rect
+        face = crop_pil.crop((max(0, fx), max(0, fy), min(crop_pil.width, fx + fw), min(crop_pil.height, fy + fh)))
+        t["face_shape"] = _best_label(face, _TRAIT_FACE_SHAPE, 0.40) if face.width > 10 and face.height > 10 else None
+        t["skin"] = _skin_tone_words(crop_bgr, rect)
+        if gender == "Man" and beard:
+            t["beard"] = _best_label(face, _TRAIT_BEARD, 0.40)
+        if gender == "Man" and not bald:
+            t["hair"] = _best_label(crop_pil, _TRAIT_HAIR_MAN, 0.40)
+    except Exception as e:  # traits are a bonus, never a reason to fail a request
+        logger.warning("face trait measurement failed: %s", e)
+    return {k: v for k, v in t.items() if v}
 
 # ============================================================================
 # Prompt assembly (verbatim, tuned text - do not reword)
@@ -1770,6 +1846,65 @@ def visor_block(info, attempt=0, ref=False):
     )
 
 # ----------------------------------------------------------------------------
+# "id_focus2" prompt variant (settings.PROMPT_VARIANT=id_focus2): the production id_focus prompt, tightened for face
+# matching. Prompt-text only: no extra model calls, no per-photo measurements, and the text is STATIC per avatar type
+# so the CACHE_PROMPT_EMBEDS cache keeps hitting. It is also SHORTER than id_focus (fewer text tokens to encode and to
+# attend over), so it cannot cost speed.
+# What changed vs id_focus (drift seen in the 21/22-Oct runs: narrower face and jaw, beard trimmed, hair taller/fuller,
+# head turned upright, heavier brows):
+#   * one identity block that states the proportions as POSITIVE anchors ("exactly as wide and as full as Picture 2,
+#     same jaw width, same cheek width, same head silhouette incl. hair and beard") instead of ~15 "never ..." clauses
+#     (the distilled model has no negative guidance; every "never slim" only puts "slim" in the prompt).
+#   * removed the contradiction FACE_CLEAN "skin smooth, evenly painted" vs "keep the real skin texture" (men).
+#   * BUILD no longer asks for "a soft double chin / thicker neck" (caricature).
+#   * men: beard and hair paragraphs name length / fullness / outline / height explicitly (what drifted).
+# The women/hijab tune still works: it keys on BUILD's "BUILD: match" prefix and on the WOMEN_SKIN_OLD sentence, both
+# kept verbatim for women. Visor text, bald text, hijab text and the LoRA trigger sentence are untouched.
+# Rollback: PROMPT_VARIANT=id_focus.
+# ----------------------------------------------------------------------------
+IDENTITY_FOCUS2 = (
+    "FACE IDENTITY (highest priority, above style and above the visor): the face is the exact person in Picture 2, an "
+    "honest, unflattered likeness recognisable at first glance. Picture 2 is the ONLY source of facial structure; "
+    "Picture 1 supplies only painting style, lighting, jacket, emblem and background. copy from Picture 2, landmark by "
+    "landmark: head width-to-height ratio, forehead, cheekbones, cheek fullness, jaw width and jawline angle, chin, "
+    "ears, nose length, bridge and nostrils, lip shape and thickness, the same mouth and smile with the same visible "
+    "teeth, eyebrow shape, thickness and spacing, eye shape, eye size and eye spacing, and the exact eye color of "
+    "Picture 2 (dark brown stays dark brown, also behind the visor lens). the face is exactly as wide and as full as "
+    "in Picture 2, with the same cheek width and the same jaw width, so the whole head silhouette ({sil}) has the "
+    "width and proportions of Picture 2 and every landmark sits at the same relative position. "
+    "{skin}"
+)
+IDENTITY_FOCUS2_SKIN_MAN = (
+    "keep the real age and skin texture of Picture 2: forehead lines, smile lines, crow's feet, under-eye bags, pores "
+    "and stubble, in the same skin tone. "
+)
+
+BUILD2 = (
+    "BUILD: match the fullness of the person in Picture 2: a round, full face keeps full cheeks, a wide soft jaw and a "
+    "full neck; a lean face keeps lean cheeks, a defined jaw and a slim neck; an average face stays average. the build "
+    "comes from Picture 2 only. "
+)
+
+FACE_CLEAN2 = (
+    "FACE QUALITY: a clean, continuous jawline and chin contour from ear to chin on both sides, symmetrical and "
+    "undistorted, joining the neck naturally. "
+)
+
+HAIR_USER2 = (
+    "HAIR: ignore the hairstyle of Picture 1 and keep the exact hair of Picture 2: the same color, length, texture "
+    "(curly, wavy or straight), volume, height above the forehead, hairline, parting and side length; short hair "
+    "stays short, and a bald, shaved or receding head stays bald or receding exactly as in Picture 2 with no hair "
+    "painted on. the only change to the hair is a thin red rim light. "
+)
+
+FACIAL_HAIR2 = (
+    "FACIAL HAIR: the exact moustache, beard or stubble of Picture 2, with the same shape, coverage, length, density, "
+    "edge line and grey or black color; a full beard stays full and long along the whole jaw and chin and joins the "
+    "moustache exactly as in Picture 2; a clean-shaven face stays clean-shaven with smooth skin. facial hair comes "
+    "from Picture 2 only. "
+)
+
+# ----------------------------------------------------------------------------
 # "v3" prompt variant (settings.PROMPT_VARIANT=v3): short, positive-only, no contradictions.
 # Why (from the 14-photo concurrency run, test_results/run_20261016_224210):
 #   * the old prompts are ~1,300+ words. FLUX.2-klein is distilled (CFG ~1) so there is no negative guidance:
@@ -1907,6 +2042,81 @@ def _build_prompt_v3(info, attempt=0, ref=False, keep_user_expression=True, hair
     return p
 
 
+# ----------------------------------------------------------------------------
+# "v4" prompt variant (settings.PROMPT_VARIANT=v4): v3's short positive-only structure + THIS user's measured traits.
+#   * identity block comes right after the head_swap sentence (early tokens weigh most) and names the things the
+#     model drifted on in the 21-Oct runs: face width / jaw narrowed, beard shortened and tidied, hair made fuller,
+#     brows made heavier, skin tone lightened.
+#   * face shape, skin tone, beard style and hair type are measured per photo in Step 1 (info["traits"]) and written
+#     as concrete words; a missing trait just drops out of the sentence.
+#   * no negative sentences ("never ...") - the distilled model has no negative guidance, they only add the concept.
+# ----------------------------------------------------------------------------
+V4_IDENTITY = (
+    "the face is the exact person from Picture 2, an honest unflattered likeness, recognisable at first glance. "
+    "{traits}"
+    "copy Picture 2 landmark by landmark: face width-to-height ratio, forehead, cheekbones, cheek fullness, jaw width "
+    "and jawline angle, chin, ears, nose length, bridge and nostrils, lip shape and thickness, eyebrow shape and "
+    "thickness, eye shape, eye size and eye spacing, the real dark eye colour, skin tone, real age and skin texture "
+    "(smile lines, pores, under-eye detail). the face is exactly as wide and as full as in Picture 2 with the same "
+    "jaw width. the smile and mouth stay as in Picture 2 with the same visible teeth, "
+    "the head angle follows Picture 1, and the eyes look straight at the viewer. "
+)
+
+V4_HAIR = (
+    "hair: the exact hair of Picture 2{hair} with the same hairline, temples, parting, length and volume, "
+    "plus only a thin red rim light. "
+)
+
+V4_BEARD = (
+    "facial hair, copied exactly from Picture 2: {beard}, with the same shape, length, density, coverage and edge "
+    "line, in the same grey or black colour. "
+)
+
+def _v4_traits_sentence(info) -> str:
+    tr = info.get("traits") or {}
+    bits = []
+    if tr.get("face_shape"):
+        bits.append(tr["face_shape"])
+    if tr.get("skin"):
+        bits.append(f"{tr['skin']} skin tone")
+    if not bits:
+        return ""
+    return "Picture 2 shows " + ", ".join(bits) + "; keep exactly that. "
+
+def _build_prompt_v4(info, attempt=0, ref=False, keep_user_expression=True, hair_retry=False):
+    is_woman = info.get("gender") == "Woman"
+    is_hijab = bool(info.get("hijab", False))
+    is_bald = bool(info.get("bald", False)) and not is_hijab and not is_woman
+    tr = info.get("traits") or {}
+    ident = V4_IDENTITY.format(traits=_v4_traits_sentence(info))
+    if not keep_user_expression:
+        ident = ident.replace("the smile and mouth stay as in Picture 2 with the same visible teeth, ", "the smile and mouth follow Picture 1, ")
+    visor = (V3_VISOR_MAN if info.get("avatar") == "Man" else V3_VISOR_DEFAULT).format(
+        ref=" and the close-up in Picture 3" if ref else ""
+    )
+    if attempt > 0:
+        visor += VISOR_RETRY
+    if is_hijab:
+        col = info.get("hijab_colour")
+        hij = V3_HIJAB.format(
+            colour=(col + " " if col else ""),
+            colour_rule=(f"the hijab is {col}, not black" if col else "the hijab takes the colour of Picture 2's hijab, not the black of the template"),
+        )
+        p = V3_HEAD + ident + V3_FEMALE + V3_BUILD + hij + visor + V3_STYLE + V3_CLOSING
+    elif is_woman:
+        p = V3_HEAD + ident + V3_FEMALE + V3_BUILD + V3_WOMAN_HAIR + visor + V3_STYLE + V3_CLOSING
+    else:
+        if is_bald:
+            hair = V3_BALD + (BALD_RETRY if attempt > 0 else "")
+        else:
+            hair = V4_HAIR.format(hair=(f" ({tr['hair']})" if tr.get("hair") else "")) + (HAIR_RETRY if hair_retry else "")
+        beard = V4_BEARD.format(beard=tr["beard"]) if (info.get("beard") and tr.get("beard")) else V3_BEARD
+        p = V3_HEAD + ident + V3_BUILD + hair + beard + visor + V3_STYLE + V3_CLOSING
+    if is_woman or is_hijab:
+        p = _strip_facial_hair(_v3_women_skin(p))
+    return p
+
+
 def lora_prompt(text: str) -> str:
     """Prepend the LoRA trigger word (settings.LORA_TRIGGER, e.g. "jhuangswap") when one is configured."""
     t = (settings.LORA_TRIGGER or "").strip()
@@ -1922,6 +2132,8 @@ def _build_prompt_core(info, attempt=0, ref=False, style_mode=None, keep_user_ex
         keep_user_expression = settings.KEEP_USER_EXPRESSION
     if settings.PROMPT_VARIANT == "v3":
         return _build_prompt_v3(info, attempt, ref, keep_user_expression, hair_retry)
+    if settings.PROMPT_VARIANT == "v4":
+        return _build_prompt_v4(info, attempt, ref, keep_user_expression, hair_retry)
 
     # Only the MALE prompt has a bald branch; women / hijab prompts are untouched.
     is_bald = bool(info.get("bald", False)) and not info.get("hijab", False) and info.get("gender") != "Woman"
@@ -1971,8 +2183,16 @@ def _build_prompt_core(info, attempt=0, ref=False, style_mode=None, keep_user_ex
     )
     # Prompt variant: "tuned" (default) is byte-for-byte the notebook order; "id_focus" puts the identity text first.
     head, IDENTITY_TXT = f"{VISOR_MANDATORY}{bfs}", IDENTITY
+    id2 = settings.PROMPT_VARIANT == "id_focus2"
     if settings.PROMPT_VARIANT == "id_focus":
         head, IDENTITY_TXT = f"{bfs}{IDENTITY_FOCUS}{VISOR_MANDATORY}", ""
+        style_text = _id_focus_style(style_text)
+        closing = IDENTITY_FOCUS_CLOSING + closing
+    elif id2:
+        # women keep the exact WOMEN_SKIN_OLD sentence so _women_tune() swaps it as before; men get the texture sentence
+        _skin = WOMEN_SKIN_OLD if info.get("gender") == "Woman" else IDENTITY_FOCUS2_SKIN_MAN
+        _sil = "face and hair" if info.get("gender") == "Woman" else "face, hair and beard"
+        head, IDENTITY_TXT = f"{bfs}{IDENTITY_FOCUS2.format(skin=_skin, sil=_sil)}{VISOR_MANDATORY}", ""
         style_text = _id_focus_style(style_text)
         closing = IDENTITY_FOCUS_CLOSING + closing
     if info.get("gender") == "Woman":
@@ -1983,17 +2203,19 @@ def _build_prompt_core(info, attempt=0, ref=False, style_mode=None, keep_user_ex
     tune = (lambda t: _women_tune(t, info, ref)) if settings.WOMEN_PROMPT_TUNE else (lambda t: t)
     if info.get("hijab", False):
         return tune(
-            f"{head}{IDENTITY_TXT}{BUILD}{V}{HIJAB_VISOR_NOTE}"
+            f"{head}{IDENTITY_TXT}{BUILD2 if id2 else BUILD}{V}{HIJAB_VISOR_NOTE}"
             f"{HIJAB_FACE}{HIJAB_USER}{FACE_CLEAN}{style_text} {closing} the visor is present and fits her face."
         )
     if info.get("gender") == "Woman":
         return tune(
-            f"{head}{IDENTITY_TXT}{FEMALE_FACE}{BUILD}"
+            f"{head}{IDENTITY_TXT}{FEMALE_FACE}{BUILD2 if id2 else BUILD}"
             "her hair is styled exactly like Picture 1: long black hair with red and orange highlights woven "
             "throughout, styled in a high voluminous bun or updo at the crown, sleek and professionally polished, "
             f"framing the face. {V}{FACE_CLEAN}{style_text} " + closing
         )
-    hair_user_block = (BALD_USER + (BALD_RETRY if attempt > 0 else "")) if is_bald else (HAIR_USER + (HAIR_RETRY if hair_retry else ""))
+    hair_user_block = (BALD_USER + (BALD_RETRY if attempt > 0 else "")) if is_bald else ((HAIR_USER2 if id2 else HAIR_USER) + (HAIR_RETRY if hair_retry else ""))
+    if id2:
+        return f"{head}{IDENTITY_TXT}{BUILD2}{hair_user_block}{FACIAL_HAIR2}{V}{FACE_CLEAN2}{style_text} " + closing
     return (
         f"{head}{IDENTITY_TXT}{BUILD}{hair_user_block}"
         "FACIAL HAIR: keep the facial hair of Picture 2 exactly as it is: if Picture 2 has a moustache, goatee, "
