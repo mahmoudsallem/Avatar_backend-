@@ -943,8 +943,8 @@ def load_models() -> None:
     if settings.FLUX_BACKEND not in {"diffusers", "nunchaku"}:
         raise ValueError("FLUX_BACKEND must be 'diffusers' or 'nunchaku'")
     if settings.FLUX_BACKEND == "nunchaku":
-        if settings.FUSE_LORA or settings.COMPILE_TRANSFORMER:
-            raise ValueError("Nunchaku requires FUSE_LORA=false and COMPILE_TRANSFORMER=false")
+        if settings.FUSE_LORA:
+            raise ValueError("Nunchaku requires FUSE_LORA=false")
         _LORA["mode"] = "nunchaku"
 
     assert torch.cuda.is_available(), "PyTorch cannot see the GPU - FLUX needs CUDA."
