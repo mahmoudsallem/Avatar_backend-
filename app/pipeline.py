@@ -420,10 +420,39 @@ import threading as _threading
 _VAE_COMPILE_LOCK = _threading.Lock()
 
 
+def _verify_nunchaku_lora_switches_after_compile(slot: "GpuSlot") -> None:
+    """compile_repeated_blocks() traces the transformer's forward pass; set_lora_strength() changes a
+    parameter the compiled graph is expected to read at call time rather than bake in as a constant.
+    Generate the same tiny image at two different strengths and require different pixels, same check
+    _lora_selftest() does for the uncompiled path - but that runs BEFORE apply_speed_options, so it
+    never actually exercises the compiled graph. Raises (caught by the caller, which falls back to
+    uncompiled) if compiling silently froze the strength instead of reading it live."""
+    av, _ = load_avatar("Man")
+    base = av.resize((256, 256), Image.LANCZOS)
+    face = pad_square(base.crop((70, 10, 200, 150)), 256)
+    def gen(strength):
+        slot.set_lora(strength)
+        with torch.no_grad(), torch.cuda.stream(slot.stream):
+            im = slot.pipe(prompt=lora_prompt("head_swap: replace the head in Picture 1 with the head from Picture 2."),
+                            image=[base, face], width=256, height=256, num_inference_steps=2,
+                            guidance_scale=settings.CFG,
+                            generator=torch.Generator("cuda").manual_seed(1)).images[0]
+        slot.stream.synchronize()
+        return np.asarray(im.convert("RGB")).astype(np.int16)
+    try:
+        difference = float(np.abs(gen(0.0) - gen(1.1)).mean())
+    finally:
+        slot.set_lora(settings.LORA_STRENGTH * settings.ID_LORA_MULT * settings.ID_LORA_SCHEDULE[0])
+    if difference <= 1.0:
+        raise RuntimeError(
+            f"Slot {slot.idx}: post-compile LoRA strength check failed (mean pixel difference {difference:.2f} "
+            "between strength 0.0 and 1.1) - compile_repeated_blocks appears to have frozen the LoRA strength."
+        )
+
 def apply_speed_options(slot: "GpuSlot") -> None:
     p = slot.pipe
-    if settings.FLUX_BACKEND == "nunchaku" and (settings.FUSE_LORA or settings.COMPILE_TRANSFORMER):
-        raise ValueError("FUSE_LORA and COMPILE_TRANSFORMER are unsupported with FLUX_BACKEND=nunchaku")
+    if settings.FLUX_BACKEND == "nunchaku" and settings.FUSE_LORA:
+        raise ValueError("FUSE_LORA is unsupported with FLUX_BACKEND=nunchaku")
     if settings.FUSE_LORA:
         mults = [float(m) for m in settings.ID_LORA_SCHEDULE]
         if len(set(round(m, 6) for m in mults)) != 1:
@@ -492,7 +521,20 @@ def apply_speed_options(slot: "GpuSlot") -> None:
             logger.info("Slot %d: VAE decode compiled", slot.idx)
         except Exception as exc:
             logger.warning("Slot %d: VAE_COMPILE skipped (%s)", slot.idx, exc)
-    if settings.COMPILE_TRANSFORMER:
+    if settings.COMPILE_TRANSFORMER and settings.FLUX_BACKEND == "nunchaku":
+        # Regional compile: nunchaku's own compile_repeated_blocks() compiles only the repeated
+        # Flux2TransformerBlock / Flux2SingleTransformerBlock submodules (torch.compile "regional
+        # compilation"), not the whole model - same weights/math, just fused kernels. Distinct from
+        # the generic p.transformer.compile() path below, which nunchaku's quantized module structure
+        # does not support.
+        try:
+            p.transformer.compile_repeated_blocks(mode=settings.COMPILE_MODE, dynamic=False)
+            _verify_nunchaku_lora_switches_after_compile(slot)
+            logger.info("Slot %d: nunchaku transformer regionally compiled (mode=%s) - first calls per shape are slow",
+                        slot.idx, settings.COMPILE_MODE)
+        except Exception as exc:
+            logger.warning("Slot %d: nunchaku compile_repeated_blocks failed (%s) - running uncompiled", slot.idx, exc)
+    elif settings.COMPILE_TRANSFORMER:
         if not slot.fused:
             logger.warning("COMPILE_TRANSFORMER without a fused LoRA recompiles for every LoRA strength - "
                            "enable FUSE_LORA with a uniform ID_LORA_SCHEDULE.")
