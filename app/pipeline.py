@@ -474,7 +474,11 @@ def apply_speed_options(slot: "GpuSlot") -> None:
             backend_raw = settings.ATTENTION_BACKEND.strip()
             backends_to_try = [backend_raw]
             if backend_raw.lower() in ("flash4", "flash_4", "flash-4", "_flash_4"):
-                backends_to_try = ["_flash_4", "_flash_4_hub", "flash4"]
+                # The real name (confirmed 2026-10-24 from diffusers.attention_dispatch.AttentionBackendName's
+                # own error message on a live run) is "flash_4_hub" - no leading underscore. None of the three
+                # guesses below ever matched; this silently fell back to the default every time. Keep them as
+                # extra attempts in case a future diffusers version renames it again, but try the real one first.
+                backends_to_try = ["flash_4_hub", "_flash_4", "_flash_4_hub", "flash4"]
             elif backend_raw.lower() in ("flash3", "flash_3", "flash-3", "_flash_3"):
                 backends_to_try = ["_flash_3_hub", "_flash_3"]
 
