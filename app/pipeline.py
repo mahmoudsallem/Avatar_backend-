@@ -2715,7 +2715,11 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
             logger.info("DEBUG_DUMP -> %s (adapters=%s, lora_layers=%d)", dbg, _adapters(), lora_layers)
 
         # CPU embedding runs in thread while GPU generates try #1
-        fut = _POOL.submit(embed_user, face) if settings.VALIDATE else None
+        use_arcface = settings.VALIDATE and (
+            settings.BEST_OF_N > 1
+            or int(hashlib.md5(str(info.get("key", "")).encode()).hexdigest(), 16) % 1000 < settings.ARCFACE_SAMPLE_RATE * 1000
+        )
+        fut = _POOL.submit(embed_user, face) if use_arcface else None
 
         best, k, gen_s, val_s, stopped = None, 0, 0.0, 0.0, "all tries"
         bad_tries = 0   # corrupted (noise) generations thrown away so far

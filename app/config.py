@@ -198,6 +198,11 @@ class Settings(BaseSettings):
     # visor fitted to her face. false = exact previous prompt.
     WOMEN_PROMPT_TUNE: bool = True
     VALIDATE: bool = True
+    # Fraction of generations that also get the CPU-heavy ArcFace identity score (user + avatar embeddings, id_sim/jaw_diff).
+    # With BEST_OF_N=1 that score cannot change which image ships (there is only one candidate), so scoring every photo only burns
+    # CPU that Step 1 analysis needs. The visor/hair/bald CLIP guards and their retries ALWAYS run. 1.0 = score every photo
+    # (old behaviour, and always the case when BEST_OF_N > 1). Use e.g. 0.2 in production to keep id_sim as a monitoring sample.
+    ARCFACE_SAMPLE_RATE: float = 1.0
     BEST_OF_N: int = 3
     VISOR_EXTRA_TRIES: int = 2
     TIME_BUDGET: float = 0.0  # 0 = no limit (notebook behaviour)
