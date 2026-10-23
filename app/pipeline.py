@@ -908,6 +908,17 @@ def load_models() -> None:
     assert torch.cuda.is_available(), "PyTorch cannot see the GPU - FLUX needs CUDA."
     torch.backends.cudnn.enabled = bool(settings.CUDNN_ENABLED)
 
+    # 2026-10-23 throughput experiment: strictly enforce Flash Attention in PyTorch's legacy SDPA
+    # backend selector. NOTE this only affects torch.nn.functional.scaled_dot_product_attention -
+    # with FLUX_BACKEND=nunchaku the transformer uses Nunchaku's own quantized CUDA kernels and never
+    # calls through this dispatcher, so this block is a no-op for the current production backend
+    # (see the ATTENTION_BACKEND skip for nunchaku below / pipeline.py's slot-loading section).
+    # It only takes effect if FLUX_BACKEND is switched to "diffusers". With math/mem-efficient
+    # fallbacks disabled, any op shape Flash can't serve raises instead of silently falling back.
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_math_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+
     free_gb, total_gb = get_gpu_memory_info()
     free_gb_val = free_gb if free_gb is not None else 0.0
     low_vram = free_gb_val < 45.0

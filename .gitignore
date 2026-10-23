@@ -41,3 +41,8 @@ archive/
 
 sagemaker-flux2-deployment-guide.pdf
 *.ps1
+
+evaluation_results/
+
+experiments/
+*.zip

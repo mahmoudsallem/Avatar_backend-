@@ -67,6 +67,15 @@ RUN if [ "$INSTALL_FLASH_ATTN" = "true" ]; then \
         echo "Notice: flash-attn-4 wheel not found on PyPI for this python/cuda version. Using Hub/SDPA dispatcher."; \
     fi
 
+# 2026-10-23 throughput experiment: also attempt mainline flash-attn + xformers as requested.
+# NOTE: with FLUX_BACKEND=nunchaku (current production setting) neither package is on the hot path -
+# Nunchaku uses its own quantized CUDA kernels, not torch's SDPA dispatcher (see pipeline.py's
+# ATTENTION_BACKEND skip for nunchaku). This only matters if FLUX_BACKEND is switched to "diffusers".
+# Building flash-attn from source (--no-build-isolation) is slow and has no confirmed Blackwell
+# (sm_120) wheel as of this writing - kept non-fatal so a failed build doesn't break the image.
+RUN pip install --no-cache-dir -U xformers || echo "Notice: xformers install failed/skipped."
+RUN pip install --no-cache-dir -U flash-attn --no-build-isolation || echo "Notice: flash-attn build failed/skipped (no confirmed Blackwell wheel; flash-attn-4 above is the supported path)."
+
 # Create directory structure for models and runtime storage
 # Symlink /Models to /models so legacy default paths resolve automatically
 RUN mkdir -p /models/huggingface \
