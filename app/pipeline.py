@@ -1057,11 +1057,31 @@ def load_image(path: Path) -> np.ndarray:
         raise Rejected("Image cannot be read (not an image or corrupted)")
     return img_bgr
 
+_CLIP_STREAM = None
+
+def _clip_stream():
+    """Lazily created high-priority CUDA stream for CLIP (CLIP_PRIORITY_STREAM). None when disabled / no CUDA."""
+    global _CLIP_STREAM
+    if _CLIP_STREAM is None and settings.CLIP_PRIORITY_STREAM and torch.cuda.is_available():
+        try:
+            _CLIP_STREAM = torch.cuda.Stream(priority=-1)   # -1 = highest priority on CUDA
+            logger.info("CLIP runs on a high-priority CUDA stream")
+        except Exception as exc:
+            logger.warning("CLIP_PRIORITY_STREAM unavailable (%s) - using the default stream", exc)
+            _CLIP_STREAM = False
+    return _CLIP_STREAM or None
+
 def clip_scores(pil_img: Image.Image, labels: List[str]) -> Dict[str, float]:
     if clip is None:
         raise RuntimeError("CLIP model is not loaded.")
     with _CLIP_LOCK:
-        res = clip(pil_img, candidate_labels=list(labels))
+        st = _clip_stream()
+        if st is None:
+            res = clip(pil_img, candidate_labels=list(labels))
+        else:
+            with torch.cuda.stream(st):
+                res = clip(pil_img, candidate_labels=list(labels))
+            st.synchronize()
     return {r["label"]: float(r["score"]) for r in res}
 
 def check_scope(pil_img: Image.Image) -> Dict[str, float]:

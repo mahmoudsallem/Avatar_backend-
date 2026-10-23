@@ -203,6 +203,10 @@ class Settings(BaseSettings):
     # CPU that Step 1 analysis needs. The visor/hair/bald CLIP guards and their retries ALWAYS run. 1.0 = score every photo
     # (old behaviour, and always the case when BEST_OF_N > 1). Use e.g. 0.2 in production to keep id_sim as a monitoring sample.
     ARCFACE_SAMPLE_RATE: float = 1.0
+    # Run the Step-1 / output-guard CLIP calls on a HIGH-PRIORITY CUDA stream. In the 23-Oct logs Step 1 took 1.3-1.9 s while the GPU
+    # was idle but 7-9 s while all the diffusion slots were busy: the small CLIP kernels queued behind the big diffusion kernels.
+    # Same weights, same maths -> same scores; only the scheduling priority changes. False = old behaviour.
+    CLIP_PRIORITY_STREAM: bool = False
     BEST_OF_N: int = 3
     VISOR_EXTRA_TRIES: int = 2
     TIME_BUDGET: float = 0.0  # 0 = no limit (notebook behaviour)
