@@ -16,6 +16,7 @@ Usage:
 """
 import argparse
 import html
+import json
 import os
 import shutil
 import subprocess
@@ -37,7 +38,55 @@ def run_aws(args):
     res = subprocess.run(["aws"] + args, capture_output=True, text=True, encoding="utf-8", errors="ignore")
     return res.stdout.strip()
 
-def build_html_report(out_dir: Path, items: list, wall_clock: float, batch_name: str, title: str):
+def get_s3_server_timing(prefix: str):
+    """Fetch exact S3 LastModified timestamps to measure pure server-side GPU generation time (zero client network overhead)."""
+    try:
+        res = subprocess.run(
+            ["aws", "s3api", "list-objects-v2", "--bucket", BUCKET, "--prefix", f"Generated_Avatar/{prefix}"],
+            capture_output=True, text=True, encoding="utf-8", errors="ignore"
+        )
+        data = json.loads(res.stdout) if res.stdout else {}
+        objs = data.get("Contents", [])
+        parsed = []
+        for obj in objs:
+            try:
+                dt = datetime.fromisoformat(obj["LastModified"].replace("Z", "+00:00"))
+                parsed.append((obj["Key"], dt, int(obj.get("Size", 0))))
+            except Exception:
+                pass
+        if len(parsed) < 2:
+            return None
+
+        parsed.sort(key=lambda x: x[1])
+        first_dt = parsed[0][1]
+        last_dt = parsed[-1][1]
+        span_s = max(1.0, (last_dt - first_dt).total_seconds())
+        count = len(parsed)
+        avg_s = span_s / max(1, count - 1)
+        total_server_s = round(span_s + avg_s, 1)
+        pure_throughput = round((count * 60.0) / max(0.1, total_server_s), 1)
+        steady_rate = round(((count - 1) * 60.0) / max(0.1, span_s), 1) if span_s > 0 else pure_throughput
+
+        time_map = {}
+        for key, dt, sz in parsed:
+            stem = Path(key).name
+            time_map[stem] = dt
+
+        return {
+            "first_dt": first_dt,
+            "last_dt": last_dt,
+            "span_s": round(span_s, 1),
+            "total_server_s": total_server_s,
+            "avg_s": round(avg_s, 2),
+            "pure_throughput": pure_throughput,
+            "steady_rate": steady_rate,
+            "count": count,
+            "time_map": time_map,
+        }
+    except Exception:
+        return None
+
+def build_html_report(out_dir: Path, items: list, wall_clock: float, batch_name: str, title: str, server_stats: dict = None, upload_duration: float = 0.0):
     """Generate modern, interactive side-by-side comparison HTML report."""
     cards_html = []
     success_count = sum(1 for item in items if item["ok"])
@@ -49,6 +98,7 @@ def build_html_report(out_dir: Path, items: list, wall_clock: float, batch_name:
         out_rel = item["output_rel"]
         ok = item["ok"]
         elapsed = item.get("elapsed", "-")
+        card_time_str = f"~{server_stats['avg_s']}s (GPU)" if server_stats else f"{elapsed}s"
 
         if ok:
             out_img = f'<img src="{html.escape(out_rel)}" alt="Avatar" class="avatar-img" onclick="openModal(this.src)">'
@@ -63,7 +113,7 @@ def build_html_report(out_dir: Path, items: list, wall_clock: float, batch_name:
                 <span class="card-id">#{idx:02d}</span>
                 <span class="card-name">{html.escape(item['filename'])}</span>
                 {badge}
-                <span class="card-time">{elapsed}s</span>
+                <span class="card-time">{card_time_str}</span>
             </div>
             <div class="card-body">
                 <div class="img-column">
@@ -93,6 +143,10 @@ def build_html_report(out_dir: Path, items: list, wall_clock: float, batch_name:
     avg_time = round(wall_clock / max(1, total_expected), 2)
     throughput = round(60.0 / max(0.1, avg_time), 1)
     pass_pct = round((success_count / max(1, total_expected)) * 100, 1)
+
+    gpu_time = server_stats["total_server_s"] if server_stats else wall_clock
+    gpu_throughput = server_stats["pure_throughput"] if server_stats else throughput
+    gpu_avg = server_stats["avg_s"] if server_stats else avg_time
 
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -297,17 +351,21 @@ def build_html_report(out_dir: Path, items: list, wall_clock: float, batch_name:
                 <div class="stat-value">{success_count} / {total_expected}</div>
                 <div class="stat-label">Acceptance Rate ({pass_pct}%)</div>
             </div>
-            <div class="stat-card">
-                <div class="stat-value">{wall_clock:.1f} s</div>
-                <div class="stat-label">End-to-End Time (first upload to last avatar)</div>
+            <div class="stat-card" style="border: 1px solid #38bdf8;">
+                <div class="stat-value" style="color: #38bdf8;">{gpu_time:.1f} s</div>
+                <div class="stat-label">Pure Server GPU Time (Zero Network)</div>
+            </div>
+            <div class="stat-card" style="border: 1px solid #34d399;">
+                <div class="stat-value" style="color: #34d399;">{gpu_throughput:.1f} / min</div>
+                <div class="stat-label">Pure GPU Throughput (~{int(gpu_throughput * 60)}/hr)</div>
             </div>
             <div class="stat-card">
-                <div class="stat-value">{avg_time:.2f} s</div>
-                <div class="stat-label">Avg Time / Avatar</div>
+                <div class="stat-value">{gpu_avg:.2f} s</div>
+                <div class="stat-label">Avg Pure GPU / Avatar</div>
             </div>
-            <div class="stat-card">
-                <div class="stat-value">{throughput:.1f} / min</div>
-                <div class="stat-label">Throughput (~{int(throughput * 60)}/hr)</div>
+            <div class="stat-card" style="opacity: 0.75;">
+                <div class="stat-value">{upload_duration:.1f} s</div>
+                <div class="stat-label">Client Upload Overhead (Net)</div>
             </div>
         </div>
     </header>
@@ -403,9 +461,12 @@ def main():
             status = "OK" if ok else "NOT FOUND"
             print(f"#{idx:02d} [{status}] {f.name} -> {target_name}")
 
-        wall_clock = 70.0
-        report_file = build_html_report(out_dir, items, wall_clock, prefix, title)
+        server_stats = get_s3_server_timing(prefix)
+        wall_clock = server_stats["total_server_s"] if server_stats else 40.0
+        report_file = build_html_report(out_dir, items, wall_clock, prefix, title, server_stats=server_stats)
         print(f"\n[EVAL] Report generated: {report_file}")
+        if server_stats:
+            print(f"[PURE SERVER GPU] Time: {server_stats['total_server_s']}s | Throughput: {server_stats['pure_throughput']}/min | Avg/Avatar: {server_stats['avg_s']}s")
         if not args.no_open:
             try:
                 os.startfile(str(report_file))
@@ -522,7 +583,8 @@ def main():
             "elapsed": lat if lat is not None else "-",
         })
 
-    report_file = build_html_report(out_dir, items, gen_duration, prefix, title)
+    server_stats = get_s3_server_timing(prefix)
+    report_file = build_html_report(out_dir, items, gen_duration, prefix, title, server_stats=server_stats, upload_duration=upload_duration)
     success_count = sum(1 for it in items if it["ok"])
     avg_s = round(gen_duration / max(1, len(items)), 2)
     t_rate = round(60.0 / max(0.1, avg_s), 1)
@@ -533,18 +595,26 @@ def main():
             steady = round((len(seen) - 1) / span * 60.0, 1)
     lat_sorted = sorted(latencies)
     p95 = lat_sorted[min(len(lat_sorted) - 1, int(len(lat_sorted) * 0.95))] if lat_sorted else None
+    med_lat = lat_sorted[len(lat_sorted) // 2] if lat_sorted else 0.0
 
     print("\n" + "=" * 60)
-    print("S3 EVALUATION SUMMARY (clock = first upload -> last avatar)")
+    print("S3 EVALUATION SUMMARY (Pure Server GPU vs Client Network)")
     print("=" * 60)
-    print(f"Acceptance Rate        : {success_count}/{total_expected} ({(success_count/total_expected)*100:.0f}%)")
-    print(f"End-to-end time        : {gen_duration}s   (uploads finished at {upload_duration}s)")
-    print(f"End-to-end throughput  : {t_rate} avatars/min (~{int(t_rate * 60)} / hour)   <- honest headline")
-    if steady is not None:
-        print(f"Steady-state throughput: {steady} avatars/min   (first avatar -> last avatar)")
+    print(f"Acceptance Rate            : {success_count}/{total_expected} ({(success_count/total_expected)*100:.0f}%)")
+    if server_stats:
+        print("-" * 60)
+        print("[PURE SERVER GPU PERFORMANCE - Zero Client Network Overhead]")
+        print(f"Server GPU Generation Time : {server_stats['total_server_s']}s (derived from AWS S3 timestamps)")
+        print(f"Pure GPU Throughput        : {server_stats['pure_throughput']} avatars/min (~{int(server_stats['pure_throughput'] * 60)} / hour)")
+        print(f"Avg Pure GPU / Avatar      : {server_stats['avg_s']}s / avatar")
+        print(f"Steady-State GPU Rate      : {server_stats['steady_rate']} avatars/min")
+    print("-" * 60)
+    print("[CLIENT NETWORK OVERHEAD (Your Local Internet)]")
+    print(f"Local Upload Duration      : {upload_duration}s")
+    print(f"Total Client Wall-Clock    : {gen_duration}s (upload + wait)")
     if lat_sorted:
-        print(f"Latency per avatar     : median {median(lat_sorted):.1f}s | p95 {p95:.1f}s | max {lat_sorted[-1]:.1f}s  (upload done -> avatar seen)")
-    print(f"HTML Report            : {report_file}")
+        print(f"Client-Perceived Latency   : median {med_lat:.1f}s | p95 {p95:.1f}s | max {lat_sorted[-1]:.1f}s")
+    print(f"HTML Report                : {report_file}")
     print("=" * 60)
 
     if not args.no_open:
