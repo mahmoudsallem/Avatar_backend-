@@ -908,16 +908,12 @@ def load_models() -> None:
     assert torch.cuda.is_available(), "PyTorch cannot see the GPU - FLUX needs CUDA."
     torch.backends.cudnn.enabled = bool(settings.CUDNN_ENABLED)
 
-    # 2026-10-23 throughput experiment: strictly enforce Flash Attention in PyTorch's legacy SDPA
-    # backend selector. NOTE this only affects torch.nn.functional.scaled_dot_product_attention -
-    # with FLUX_BACKEND=nunchaku the transformer uses Nunchaku's own quantized CUDA kernels and never
-    # calls through this dispatcher, so this block is a no-op for the current production backend
-    # (see the ATTENTION_BACKEND skip for nunchaku below / pipeline.py's slot-loading section).
-    # It only takes effect if FLUX_BACKEND is switched to "diffusers". With math/mem-efficient
-    # fallbacks disabled, any op shape Flash can't serve raises instead of silently falling back.
-    torch.backends.cuda.enable_flash_sdp(True)
-    torch.backends.cuda.enable_math_sdp(False)
-    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    # 2026-10-23: the torch.backends.cuda.enable_flash_sdp/enable_math_sdp/enable_mem_efficient_sdp
+    # block tried here was reverted - it reproduced the exact "Invalid handle. Cannot load symbol
+    # cublasLtGetVersion" crash already diagnosed in 066d961 (loading NVIDIA shared libs outside this
+    # server's narrow LD_LIBRARY_PATH), and it was a no-op for FLUX_BACKEND=nunchaku anyway (Nunchaku
+    # uses its own quantized CUDA kernels, never PyTorch's SDPA dispatcher). Do not re-add without
+    # fixing LD_LIBRARY_PATH first.
 
     free_gb, total_gb = get_gpu_memory_info()
     free_gb_val = free_gb if free_gb is not None else 0.0
