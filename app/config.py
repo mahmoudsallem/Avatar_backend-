@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     CLIP_DIR: Path = Path("/Models/clip-vit-base-patch32")
     CLIP_MODEL: str = "openai/clip-vit-base-patch32"
     FLUX_MODEL: str = "black-forest-labs/FLUX.2-klein-9B"
-    FLUX_BACKEND: str = "diffusers"  # "diffusers" or "nunchaku"
+    FLUX_BACKEND: str = "nunchaku"  # "diffusers" or "nunchaku"
     NUNCHAKU_MODEL: str = "tonera/FLUX.2-klein-9B-Nunchaku"
     LORA: str = "sisniha/BFS-Best-Face-Swap"
     LORA_FILE: str = "bfs_head_v1_flux-klein_9b_step3500_rank128.safetensors"
