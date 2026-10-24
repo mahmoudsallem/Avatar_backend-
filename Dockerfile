@@ -59,22 +59,13 @@ subprocess.check_call(['pip', 'install', '--no-deps', whl])" || \
         echo "Warning: Nunchaku wheel install skipped or failed. Falling back to diffusers backend."; \
     fi
 
-# Optional build arg: install FlashAttention-4 for Blackwell architectures
-ARG INSTALL_FLASH_ATTN=true
-RUN if [ "$INSTALL_FLASH_ATTN" = "true" ]; then \
-        pip install --no-cache-dir flash-attn-4 || \
-        pip install --no-cache-dir --pre flash-attn-4 || \
-        echo "Notice: flash-attn-4 wheel not found on PyPI for this python/cuda version. Using Hub/SDPA dispatcher."; \
-    fi
-
-# 2026-10-23 throughput experiment: also attempt mainline flash-attn + xformers as requested.
-# NOTE: with FLUX_BACKEND=nunchaku (current production setting) neither package is on the hot path -
-# Nunchaku uses its own quantized CUDA kernels, not torch's SDPA dispatcher (see pipeline.py's
-# ATTENTION_BACKEND skip for nunchaku). This only matters if FLUX_BACKEND is switched to "diffusers".
-# Building flash-attn from source (--no-build-isolation) is slow and has no confirmed Blackwell
-# (sm_120) wheel as of this writing - kept non-fatal so a failed build doesn't break the image.
-RUN pip install --no-cache-dir -U xformers || echo "Notice: xformers install failed/skipped."
-RUN pip install --no-cache-dir -U flash-attn --no-build-isolation || echo "Notice: flash-attn build failed/skipped (no confirmed Blackwell wheel; flash-attn-4 above is the supported path)."
+# 2026-10-24: flash-attn-4/flash-attn/xformers deliberately NOT installed. Confirmed this session
+# (live Dynamo trace) that FLUX_BACKEND=nunchaku (current production setting) never touches
+# PyTorch's attention dispatch at all - Nunchaku's transformer uses its own fused quantized kernels
+# (attention_fp16/gemm_w4a4). "flash-attn-4" isn't a real PyPI package (always 404s); building
+# mainline flash-attn from source takes 20-40+ min with zero runtime benefit here, and measurably
+# degraded live EC2 throughput (8.7->2.6 avatars/min) when it ran as a background job earlier today.
+# Only revisit this if FLUX_BACKEND is ever switched to "diffusers".
 
 # Create directory structure for models and runtime storage
 # Symlink /Models to /models so legacy default paths resolve automatically
