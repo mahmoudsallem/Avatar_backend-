@@ -1462,33 +1462,14 @@ def analyse_user(user_path: Path, crop_dir: Path = None) -> dict:
         bald = bool(ov["bald"])
 
     traits: dict = {}
-    hijab_colour = None
-    prompt_uses_traits = settings.PROMPT_VARIANT in ("v4", "v6")
-    prompt_uses_hijab_colour = hijab and settings.PROMPT_VARIANT in ("v3", "v4", "v6")
-    face_rect = None
-    if prompt_uses_traits or prompt_uses_hijab_colour:
+    if settings.PROMPT_VARIANT == "v4":
         _fx1 = max(0, (int(area["x"]) + int(area["w"]) // 2) - int(int(area["w"]) * settings.CROP_SCALE) // 2)
         _fy1 = max(0, (int(area["y"]) + int(area["h"]) // 2) - int(int(area["h"]) * settings.CROP_SCALE) // 2)
-        face_rect = (int(area["x"]) - _fx1, int(area["y"]) - _fy1, int(area["w"]), int(area["h"]))
-
-    if settings.PROMPT_VARIANT == "v4" and face_rect is not None:
         traits = describe_face_traits(
-            crop_pil, crop_bgr, face_rect, gender, beard, bald, hijab,
+            crop_pil, crop_bgr, (int(area["x"]) - _fx1, int(area["y"]) - _fy1, int(area["w"]), int(area["h"])),
+            gender, beard, bald, hijab,
         )
         logger.info("Face traits for %s: %s", key, traits)
-    elif settings.PROMPT_VARIANT == "v6" and face_rect is not None:
-        skin = _skin_tone_words(crop_bgr, face_rect)
-        if skin:
-            traits["skin"] = skin
-        logger.info("Compact prompt complexion for %s: %s", key, skin or "unavailable")
-
-    if prompt_uses_hijab_colour and face_rect is not None:
-        try:
-            from app.postprocess_hijab import user_hijab_colour
-            hijab_colour = user_hijab_colour(crop_pil, face_rect)
-            logger.info("Measured hijab fabric colour for %s: %s", key, hijab_colour or "unavailable")
-        except Exception as e:
-            logger.warning("Hijab colour measurement failed for %s: %s", key, e)
 
     tags = [gender] + (["Glasses"] if glasses else []) + (["Hijab"] if hijab else []) + (["Bald"] if bald else [])
     target_crop_dir = crop_dir or settings.CROP_DIR
@@ -1509,7 +1490,6 @@ def analyse_user(user_path: Path, crop_dir: Path = None) -> dict:
         "glasses": glasses,
         "glasses_source": glasses_s.get("source", "step1_clip") if isinstance(glasses_s, dict) else "step1_clip",
         "hijab": hijab,
-        "hijab_colour": hijab_colour,
         "beard": beard,
         "bald": bald,
         "hair_vol_user": hair_vol_user,
@@ -1562,7 +1542,7 @@ def _best_label(img: Image.Image, table: Dict[str, str], min_conf: float) -> Opt
     return phrase if score >= min_conf else None
 
 def _skin_tone_words(crop_bgr: np.ndarray, rect: Tuple[int, int, int, int]) -> Optional[str]:
-    """Robustly describe the user's base complexion from forehead and upper-cheek pixels."""
+    """Median Lab of the forehead strip + upper cheeks (no beard, no glasses) -> a plain skin-tone phrase."""
     fx, fy, fw, fh = rect
     H, W = crop_bgr.shape[:2]
     boxes = [
@@ -1574,25 +1554,16 @@ def _skin_tone_words(crop_bgr: np.ndarray, rect: Tuple[int, int, int, int]) -> O
     for x0, y0, x1, y1 in boxes:
         reg = crop_bgr[max(0, int(y0)):min(H, int(y1)), max(0, int(x0)):min(W, int(x1))]
         if reg.size:
-            pixels = _lab_pixels(reg)
-            lightness = pixels[:, 0]
-            pixels = pixels[(lightness >= 45) & (lightness <= 238)]
-            if len(pixels):
-                px.append(pixels)
+            px.append(_lab_pixels(reg))
     if not px:
         return None
     lab = np.median(np.concatenate(px, 0), 0)
     L = float(lab[0]) * 100.0 / 255.0
-    if L >= 76: shade = "very light"
-    elif L >= 68: shade = "light"
-    elif L >= 60: shade = "light-medium"
-    elif L >= 52: shade = "medium tan-brown"
-    elif L >= 44: shade = "medium-deep brown"
-    elif L >= 35: shade = "deep brown"
-    else: shade = "very deep brown"
-    undertone_b = float(lab[2]) - 128.0  # OpenCV's 8-bit Lab b channel is centered at 128.
-    undertone = "warm golden" if undertone_b >= 12 else ("neutral" if undertone_b > -8 else "cool")
-    return f"{shade} {undertone} complexion"
+    if L >= 74: return "fair"
+    if L >= 62: return "light-medium"
+    if L >= 50: return "medium warm-brown"
+    if L >= 38: return "deep brown"
+    return "very deep brown"
 
 def describe_face_traits(crop_pil: Image.Image, crop_bgr: np.ndarray, rect: Tuple[int, int, int, int],
                          gender: str, beard: bool, bald: bool, hijab: bool) -> dict:
@@ -2080,11 +2051,14 @@ V3_FEMALE = (
 )
 
 V3_HIJAB = (
-    "she wears her hijab from Picture 2; {colour_rule}. Keep that base hue and saturation across the head covering "
-    "and shoulder drape, with red and blue lighting only as highlights. Match the real fabric and folds, wrapped around "
-    "the forehead, cheeks and under the chin, covering hair, ears and neck. The scarf follows the shoulders and tucks "
-    "into Picture 1's jacket. Keep Picture 1's jacket and background. The clear visor fits inside the hijab opening, "
-    "with the edge visible above the eyebrows. "
+    "she wears her own {colour}hijab from Picture 2, copied in its real colours ({colour_rule}), the same sheen and "
+    "soft folds, wrapped snugly around the face with the "
+    "edge in the same place on the forehead, cheeks and under the chin, covering all hair, ears and neck. the "
+    "scarf then falls over the shoulders and chest in soft shaded folds of the same fabric and colour as the "
+    "head covering, lit by the red and blue lights of the jacket, and tucks into the jacket collar of Picture 1 "
+    "with no flat patches. only her head and hijab "
+    "come from Picture 2; her clothes and background do not. the visor sits inside the hijab opening, no wider "
+    "than the face, with its arms resting at the temples, and the hijab edge above the eyebrows stays visible. "
 )
 
 V3_CLOSING = (
@@ -2120,7 +2094,8 @@ def _build_prompt_v3(info, attempt=0, ref=False, keep_user_expression=True, hair
     if is_hijab:
         col = info.get("hijab_colour")
         hij = V3_HIJAB.format(
-            colour_rule=(f"the sampled base fabric colour is {col}, matching Picture 2 rather than the template" if col else "copy the exact base fabric colour from Picture 2 rather than the template's black"),
+            colour=(col + " " if col else ""),
+            colour_rule=(f"the hijab is {col}, not black" if col else "the hijab takes the colour of Picture 2's hijab, not the black of the template"),
         )
         p = V3_HEAD + ident + V3_FEMALE + V3_BUILD + hij + visor + V3_STYLE + V3_CLOSING
     elif is_woman:
@@ -2131,43 +2106,6 @@ def _build_prompt_v3(info, attempt=0, ref=False, keep_user_expression=True, hair
     if is_woman or is_hijab:
         p = _strip_facial_hair(_v3_women_skin(p))
     return p
-
-
-def _build_prompt_v5(info, attempt=0, ref=False, keep_user_expression=True, hair_retry=False):
-    """v3 identity/style prompt with explicit template head scale and finer facial rendering detail.
-
-    The v3 canary kept throughput but enlarged the generated head and hair relative to the template.
-    Keep the concise identity conditioning, while anchoring the replacement inside Picture 1's
-    existing head silhouette and asking for crisp facial features at the same denoising budget.
-    """
-    p = _build_prompt_v3(info, attempt, ref, keep_user_expression, hair_retry)
-    p = p.replace(
-        V3_HEAD,
-        V3_HEAD +
-        "keep the original head position, head size and head-to-shoulder proportions of Picture 1; "
-        "fit the replacement head inside the existing head silhouette, with the same overall width "
-        "and height. keep the hairline, crown height and outer hair silhouette true to Picture 2. ",
-        1,
-    )
-    p = p.replace(
-        "sharp detail, 4k.",
-        "crisp fine facial detail: clearly defined eyelids, eyebrows, nose contours, smile lines and "
-        "individual beard strands, with natural skin texture and clean edges; keep the same polished "
-        "digital painting finish and original head proportions.",
-        1,
-    )
-    return p
-
-
-def _build_prompt_v6(info, attempt=0, ref=False, keep_user_expression=True, hair_retry=False):
-    """Compact v3 identity prompt with measured complexion and hijab colour; no extra model pass."""
-    p = _build_prompt_v3(info, attempt, ref, keep_user_expression, hair_retry)
-    framing = "keep Picture 1's head center, tilt, head size, shoulders and emblem; replace only the head appearance. "
-    tr = info.get("traits") or {}
-    colour_lock = ""
-    if tr.get("skin"):
-        colour_lock = f"Match Picture 2's {tr['skin']} complexion on the forehead and cheeks under the scene lighting. "
-    return p.replace(V3_HEAD, V3_HEAD + framing + colour_lock, 1)
 
 
 # ----------------------------------------------------------------------------
@@ -2184,8 +2122,7 @@ V4_IDENTITY = (
     "{traits}"
     "copy Picture 2 landmark by landmark: face width-to-height ratio, forehead, cheekbones, cheek fullness, jaw width "
     "and jawline angle, chin, ears, nose length, bridge and nostrils, lip shape and thickness, eyebrow shape and "
-    "thickness, eye shape, eye size and eye spacing, the real dark eye colour, the exact base complexion and undertone "
-    "of the forehead and cheeks, real age and skin texture "
+    "thickness, eye shape, eye size and eye spacing, the real dark eye colour, skin tone, real age and skin texture "
     "(smile lines, pores, under-eye detail). the face is exactly as wide and as full as in Picture 2 with the same "
     "jaw width. the smile and mouth stay as in Picture 2 with the same visible teeth, "
     "the head angle follows Picture 1, and the eyes look straight at the viewer. "
@@ -2207,7 +2144,7 @@ def _v4_traits_sentence(info) -> str:
     if tr.get("face_shape"):
         bits.append(tr["face_shape"])
     if tr.get("skin"):
-        bits.append(f"{tr['skin']} on the forehead and cheeks")
+        bits.append(f"{tr['skin']} skin tone")
     if not bits:
         return ""
     return "Picture 2 shows " + ", ".join(bits) + "; keep exactly that. "
@@ -2228,7 +2165,8 @@ def _build_prompt_v4(info, attempt=0, ref=False, keep_user_expression=True, hair
     if is_hijab:
         col = info.get("hijab_colour")
         hij = V3_HIJAB.format(
-            colour_rule=(f"the sampled base fabric colour is {col}, matching Picture 2 rather than the template" if col else "copy the exact base fabric colour from Picture 2 rather than the template's black"),
+            colour=(col + " " if col else ""),
+            colour_rule=(f"the hijab is {col}, not black" if col else "the hijab takes the colour of Picture 2's hijab, not the black of the template"),
         )
         p = V3_HEAD + ident + V3_FEMALE + V3_BUILD + hij + visor + V3_STYLE + V3_CLOSING
     elif is_woman:
@@ -2260,10 +2198,6 @@ def _build_prompt_core(info, attempt=0, ref=False, style_mode=None, keep_user_ex
         keep_user_expression = settings.KEEP_USER_EXPRESSION
     if settings.PROMPT_VARIANT == "v3":
         return _build_prompt_v3(info, attempt, ref, keep_user_expression, hair_retry)
-    if settings.PROMPT_VARIANT == "v5":
-        return _build_prompt_v5(info, attempt, ref, keep_user_expression, hair_retry)
-    if settings.PROMPT_VARIANT == "v6":
-        return _build_prompt_v6(info, attempt, ref, keep_user_expression, hair_retry)
     if settings.PROMPT_VARIANT == "v4":
         return _build_prompt_v4(info, attempt, ref, keep_user_expression, hair_retry)
 
@@ -2861,6 +2795,17 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         while True:
             mult = settings.ID_LORA_SCHEDULE[k % len(settings.ID_LORA_SCHEDULE)]
             slot.set_lora(test_lora * mult)
+            if info.get("hijab") and settings.PROMPT_VARIANT == "v3" and "hijab_colour" not in info:
+                info["hijab_colour"] = None  # computed once; stays None if the sample is unreliable
+                try:
+                    from app.postprocess_hijab import user_hijab_colour
+                    ue = fut.result() if fut is not None else embed_user(face)
+                    ub0 = _face_box(ue, face.width, face.height) if ue else None
+                    if ub0:
+                        info["hijab_colour"] = user_hijab_colour(face, ub0)
+                    logger.info("hijab colour for prompt: %s", info["hijab_colour"])
+                except Exception as e:
+                    logger.warning("hijab colour sampling failed: %s", e)
             prompt = build_prompt(info, attempt=k, ref=visor_ref is not None, style_mode=style_mode, hair_retry=(prev_hair == "bald"))
 
             tg = time.time()
