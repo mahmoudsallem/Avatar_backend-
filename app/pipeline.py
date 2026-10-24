@@ -1462,7 +1462,7 @@ def analyse_user(user_path: Path, crop_dir: Path = None) -> dict:
         bald = bool(ov["bald"])
 
     traits: dict = {}
-    if settings.PROMPT_VARIANT == "v4":
+    if settings.PROMPT_VARIANT in ("v4", "v6"):
         _fx1 = max(0, (int(area["x"]) + int(area["w"]) // 2) - int(int(area["w"]) * settings.CROP_SCALE) // 2)
         _fy1 = max(0, (int(area["y"]) + int(area["h"]) // 2) - int(int(area["h"]) * settings.CROP_SCALE) // 2)
         traits = describe_face_traits(
@@ -2134,6 +2134,21 @@ def _build_prompt_v5(info, attempt=0, ref=False, keep_user_expression=True, hair
     return p
 
 
+def _build_prompt_v6(info, attempt=0, ref=False, keep_user_expression=True, hair_retry=False):
+    """Use measured per-photo identity traits and place framing guidance first.
+
+    Round 9119 shows generic detail wording in v5 did not sufficiently preserve likeness
+    and head scale. This variant adds no denoising steps or generation pass.
+    """
+    p = _build_prompt_v4(info, attempt, ref, keep_user_expression, hair_retry)
+    framing = (
+        "match Picture 1's original head center, tilt, visible head width and head height; "
+        "keep the shoulders, jacket and emblem fully visible at their original scale. "
+        "Replace only the head appearance, fitting the face naturally within that same composition. "
+    )
+    return p.replace(V3_HEAD, V3_HEAD + framing, 1)
+
+
 # ----------------------------------------------------------------------------
 # "v4" prompt variant (settings.PROMPT_VARIANT=v4): v3's short positive-only structure + THIS user's measured traits.
 #   * identity block comes right after the head_swap sentence (early tokens weigh most) and names the things the
@@ -2226,6 +2241,8 @@ def _build_prompt_core(info, attempt=0, ref=False, style_mode=None, keep_user_ex
         return _build_prompt_v3(info, attempt, ref, keep_user_expression, hair_retry)
     if settings.PROMPT_VARIANT == "v5":
         return _build_prompt_v5(info, attempt, ref, keep_user_expression, hair_retry)
+    if settings.PROMPT_VARIANT == "v6":
+        return _build_prompt_v6(info, attempt, ref, keep_user_expression, hair_retry)
     if settings.PROMPT_VARIANT == "v4":
         return _build_prompt_v4(info, attempt, ref, keep_user_expression, hair_retry)
 
