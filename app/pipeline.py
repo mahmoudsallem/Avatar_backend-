@@ -1471,11 +1471,16 @@ def analyse_user(user_path: Path, crop_dir: Path = None) -> dict:
         _fy1 = max(0, (int(area["y"]) + int(area["h"]) // 2) - int(int(area["h"]) * settings.CROP_SCALE) // 2)
         face_rect = (int(area["x"]) - _fx1, int(area["y"]) - _fy1, int(area["w"]), int(area["h"]))
 
-    if prompt_uses_traits and face_rect is not None:
+    if settings.PROMPT_VARIANT == "v4" and face_rect is not None:
         traits = describe_face_traits(
             crop_pil, crop_bgr, face_rect, gender, beard, bald, hijab,
         )
         logger.info("Face traits for %s: %s", key, traits)
+    elif settings.PROMPT_VARIANT == "v6" and face_rect is not None:
+        skin = _skin_tone_words(crop_bgr, face_rect)
+        if skin:
+            traits["skin"] = skin
+        logger.info("Compact prompt complexion for %s: %s", key, skin or "unavailable")
 
     if prompt_uses_hijab_colour and face_rect is not None:
         try:
@@ -2075,17 +2080,11 @@ V3_FEMALE = (
 )
 
 V3_HIJAB = (
-    "she wears her own hijab from Picture 2; {colour_rule}. "
-    "Match the same base hue, lightness and saturation across the head covering and draped scarf, preserving natural "
-    "fabric folds and texture. Red and blue scene lights appear only as highlights, not as a change to its base colour. "
-    "Keep the same sheen and "
-    "soft folds, wrapped snugly around the face with the "
-    "edge in the same place on the forehead, cheeks and under the chin, covering all hair, ears and neck. the "
-    "scarf then falls over the shoulders and chest in soft shaded folds of the same fabric and colour as the "
-    "head covering, lit by the red and blue lights of the jacket, and tucks into the jacket collar of Picture 1 "
-    "with no flat patches. only her head and hijab "
-    "come from Picture 2; her clothes and background do not. the visor sits inside the hijab opening, no wider "
-    "than the face, with its arms resting at the temples, and the hijab edge above the eyebrows stays visible. "
+    "she wears her hijab from Picture 2; {colour_rule}. Keep that base hue and saturation across the head covering "
+    "and shoulder drape, with red and blue lighting only as highlights. Match the real fabric and folds, wrapped around "
+    "the forehead, cheeks and under the chin, covering hair, ears and neck. The scarf follows the shoulders and tucks "
+    "into Picture 1's jacket. Keep Picture 1's jacket and background. The clear visor fits inside the hijab opening, "
+    "with the edge visible above the eyebrows. "
 )
 
 V3_CLOSING = (
@@ -2161,33 +2160,13 @@ def _build_prompt_v5(info, attempt=0, ref=False, keep_user_expression=True, hair
 
 
 def _build_prompt_v6(info, attempt=0, ref=False, keep_user_expression=True, hair_retry=False):
-    """Use measured per-photo identity traits and place framing guidance first.
-
-    Round 9119 shows generic detail wording in v5 did not sufficiently preserve likeness
-    and head scale. This variant adds no denoising steps or generation pass.
-    """
-    p = _build_prompt_v4(info, attempt, ref, keep_user_expression, hair_retry)
-    framing = (
-        "match Picture 1's original head center, tilt, visible head width and head height; "
-        "keep the shoulders, jacket and emblem fully visible at their original scale. "
-        "Replace only the head appearance, fitting the face naturally within that same composition. "
-    )
+    """Compact v3 identity prompt with measured complexion and hijab colour; no extra model pass."""
+    p = _build_prompt_v3(info, attempt, ref, keep_user_expression, hair_retry)
+    framing = "keep Picture 1's head center, tilt, head size, shoulders and emblem; replace only the head appearance. "
     tr = info.get("traits") or {}
     colour_lock = ""
     if tr.get("skin"):
-        colour_lock += (
-            f"Match the forehead and cheek complexion in Picture 2 exactly: {tr['skin']}; "
-            "preserve its base hue and depth under Picture 1's red and blue lighting. "
-        )
-    if info.get("hijab"):
-        colour = info.get("hijab_colour")
-        if colour:
-            colour_lock += (
-                f"The sampled hijab fabric in Picture 2 is {colour}; carry that same base hue, "
-                "lightness and saturation consistently over the head covering and drape. "
-            )
-        else:
-            colour_lock += "Copy the hijab's actual base colour from Picture 2 consistently over the head covering and drape. "
+        colour_lock = f"Match Picture 2's {tr['skin']} complexion on the forehead and cheeks under the scene lighting. "
     return p.replace(V3_HEAD, V3_HEAD + framing + colour_lock, 1)
 
 
