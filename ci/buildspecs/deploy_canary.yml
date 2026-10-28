@@ -1,0 +1,40 @@
+version: 0.2
+# Deploys the just-built image to a fresh, throwaway single-instance canary endpoint (completely
+# separate from saytara-avatar-g7e-test - this stage never touches it). Cleans up any leftover
+# canary stack from a previous failed run first, so a stuck ROLLBACK_COMPLETE/DELETE_FAILED stack
+# never blocks this one.
+phases:
+  pre_build:
+    commands:
+      - source $CODEBUILD_SRC_DIR_BuildOutput/image_tag.env
+      - echo "Canary-deploying tag $IMAGE_TAG"
+      - |
+        STATUS=$(aws cloudformation describe-stacks --stack-name saytara-avatar-g7e-canary --region $AWS_DEFAULT_REGION --query "Stacks[0].StackStatus" --output text 2>/dev/null || echo "NONE")
+        if [ "$STATUS" = "ROLLBACK_COMPLETE" ] || [ "$STATUS" = "DELETE_FAILED" ]; then
+          echo "Leftover canary stack in $STATUS - deleting before redeploy"
+          aws cloudformation delete-stack --stack-name saytara-avatar-g7e-canary --region $AWS_DEFAULT_REGION
+          aws cloudformation wait stack-delete-complete --stack-name saytara-avatar-g7e-canary --region $AWS_DEFAULT_REGION
+        fi
+  build:
+    commands:
+      - >
+        aws cloudformation deploy
+        --template-file deploy/sagemaker-endpoint-g7e-canary.yaml
+        --stack-name saytara-avatar-g7e-canary
+        --region $AWS_DEFAULT_REGION
+        --parameter-overrides
+        ExecutionRoleArn=$EXECUTION_ROLE_ARN
+        ImageUri=$ECR_REGISTRY/avatar:$IMAGE_TAG
+        --no-fail-on-empty-changeset
+  post_build:
+    commands:
+      - |
+        echo "Waiting for the canary endpoint to reach InService (up to 30 min - fresh container, full model load)..."
+        for i in $(seq 1 90); do
+          STATUS=$(aws sagemaker describe-endpoint --endpoint-name saytara-avatar-g7e-canary --region $AWS_DEFAULT_REGION --query "EndpointStatus" --output text)
+          echo "  [$i/90] status=$STATUS"
+          if [ "$STATUS" = "InService" ]; then break; fi
+          if [ "$STATUS" = "Failed" ]; then echo "Canary endpoint failed to come up"; exit 1; fi
+          sleep 20
+        done
+        if [ "$STATUS" != "InService" ]; then echo "Timed out waiting for canary InService"; exit 1; fi

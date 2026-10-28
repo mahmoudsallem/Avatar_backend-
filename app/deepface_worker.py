@@ -30,6 +30,29 @@ import cv2
 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
     from deepface import DeepFace
 
+
+@contextlib.contextmanager
+def _silence_stdout_fd():
+    """Suppresses stdout at the OS file-descriptor level, not just Python's sys.stdout.
+
+    contextlib.redirect_stdout alone only catches writes through Python's sys.stdout object - it
+    does not catch a Keras/TensorFlow predict() progress indicator writing straight to the real
+    fd 1, which happens on some model/backend combinations. That matters here specifically because
+    fd 1 is also this worker's __JSON__/__READY__ protocol pipe to the parent process: a stray
+    progress line that never ends in '\\n' (Keras progress bars update via '\\r') makes the
+    parent's line-based read block forever, not just print noise.
+    """
+    stdout_fd = sys.stdout.fileno()
+    saved_fd = os.dup(stdout_fd)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull_fd, stdout_fd)
+        yield
+    finally:
+        os.dup2(saved_fd, stdout_fd)
+        os.close(devnull_fd)
+        os.close(saved_fd)
+
 def run_detect(argv):
     """Returns the result dict (printing is done by the callers below)."""
     if len(argv) < 6:
@@ -88,13 +111,14 @@ def run_detect(argv):
                 ]
                 if crop.size:
                     try:
-                        analysis = DeepFace.analyze(
-                            img_path=crop,
-                            actions=["gender"],
-                            detector_backend="skip",
-                            enforce_detection=False,
-                            silent=True,
-                        )
+                        with _silence_stdout_fd():
+                            analysis = DeepFace.analyze(
+                                img_path=crop,
+                                actions=["gender"],
+                                detector_backend="skip",
+                                enforce_detection=False,
+                                silent=True,
+                            )
                         analysis = analysis[0] if isinstance(analysis, list) else analysis
                         result["faces"] = [{
                             "facial_area": {"x": x, "y": y, "w": w, "h": h},
@@ -141,7 +165,7 @@ def run_embed(argv):
             continue
         try:
             req = json.loads(line)
-            with contextlib.redirect_stdout(io.StringIO()):
+            with _silence_stdout_fd():
                 reps = DeepFace.represent(
                     img_path=req["img"],
                     model_name=model,

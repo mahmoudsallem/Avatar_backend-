@@ -1,0 +1,25 @@
+version: 0.2
+# Runs ci/smoke_test.py against the canary endpoint, then ALWAYS tears the canary stack down
+# (success or failure) so it never lingers racking up GPU cost. The teardown must not be skipped
+# just because the smoke test failed - that's why the test's exit code is captured instead of
+# letting it fail the `build` phase outright (which could short-circuit post_build's cleanup).
+phases:
+  install:
+    commands:
+      - pip install --no-cache-dir boto3 pillow
+  build:
+    commands:
+      - |
+        set +e
+        python ci/smoke_test.py --endpoint-name saytara-avatar-g7e-canary --region $AWS_DEFAULT_REGION --timeout 180
+        echo $? > smoke_exit_code.txt
+        set -e
+  post_build:
+    commands:
+      - echo "Tearing down the canary stack now (always, regardless of smoke test outcome)"
+      - aws cloudformation delete-stack --stack-name saytara-avatar-g7e-canary --region $AWS_DEFAULT_REGION
+      - aws cloudformation wait stack-delete-complete --stack-name saytara-avatar-g7e-canary --region $AWS_DEFAULT_REGION || true
+      - |
+        SMOKE_EXIT=$(cat smoke_exit_code.txt)
+        echo "Smoke test exit code: $SMOKE_EXIT"
+        exit $SMOKE_EXIT

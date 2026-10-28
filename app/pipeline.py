@@ -320,16 +320,16 @@ def prompt_inputs(slot: "GpuSlot", prompt: str) -> dict:
             _PROMPT_CACHE.move_to_end(prompt)
     if emb is None:
         _CACHE_STATS["prompt_miss"] += 1
-        with torch.no_grad():
+        with torch.no_grad(), torch.cuda.stream(slot.stream):
             e, _ids = slot.pipe.encode_prompt(prompt=prompt, device=slot.pipe._execution_device)
-        emb = e.detach().to("cpu")          # synchronous copy; kept on the CPU so it is safe across CUDA streams
+            emb = e.detach()          # Keep directly in VRAM on execution device without synchronous CPU copy
         with _PROMPT_LOCK:
             _PROMPT_CACHE[prompt] = emb
-            while len(_PROMPT_CACHE) > 256:
+            while len(_PROMPT_CACHE) > 64:
                 _PROMPT_CACHE.popitem(last=False)
     else:
         _CACHE_STATS["prompt_hit"] += 1
-    return {"prompt_embeds": emb.to(slot.pipe._execution_device)}
+    return {"prompt_embeds": emb}
 
 def _tensor_key(x: torch.Tensor) -> str:
     h = hashlib.blake2b(digest_size=16)
@@ -920,7 +920,7 @@ def _lora_selftest() -> None:
             pass
     raise RuntimeError(
         "LoRA self-test FAILED: the BFS LoRA does not change the output at any strength, so the face swap would "
-        "ignore the user's photo. Check diffusers / peft / transformers versions (see env_report.py)."
+        "ignore the user's photo. Check diffusers / peft / transformers versions (see tests/env_report.py)."
     )
 
 def _trim_slots_for_headroom() -> None:
@@ -1760,13 +1760,51 @@ HIJAB_VISOR_NOTE = (
 )
 
 HIJAB_USER = (
-    "she wears her own hijab from Picture 2, copied exactly: the same fabric colors (including any two-tone or "
+    "she wears her own {colour}hijab from Picture 2, copied exactly: {colour_rule} (including any two-tone or "
     "lighter under-scarf), the same sheen and soft folds, wrapped the same way tightly around the face with the "
     "edge sitting at the same place on the forehead, cheeks and under the chin, covering all hair, both ears and the "
     "neck, then falling in soft drapes onto the shoulders and chest and flowing into the jacket collar of Picture 1. "
     "no hair visible, no pins, brooches or patterns added, the fabric is not changed to another color. only her head "
     "and hijab are taken from Picture 2; ignore her clothes, cardigan, shirt, body and background. "
 )
+
+def _hijab_user_text(info: dict) -> str:
+    """Fills HIJAB_USER's colour placeholders from the measured hijab_colour (set in generate_avatar's retry loop,
+    same sampling used by v3/v4 - see user_hijab_colour()). Without a named colour the model defaults to the
+    template's own black hijab instead of the user's real one (see the 16-Oct hijab bug notes below)."""
+    col = info.get("hijab_colour")
+    is_col = bool(col and col != "black")
+    if not is_col:
+        colour_prefix = ""
+        colour_rule = "the same fabric colors as Picture 2, not the black of the template"
+    elif "base" in col:
+        base_col = col.replace("patterned with a ", "").replace(" base", "").strip()
+        colour_prefix = f"patterned {base_col} "
+        colour_rule = f"the hijab is {col}, not black"
+    elif "pattern" in col:
+        colour_prefix = col if col.endswith(" ") else col + " "
+        colour_rule = f"the hijab is {col}, not black"
+    else:
+        colour_prefix = col + " "
+        colour_rule = f"the hijab is {col}, not black"
+    return HIJAB_USER.format(
+        colour=colour_prefix,
+        colour_rule=colour_rule,
+    )
+
+def _hijab_colour_lead(info: dict) -> str:
+    """A short, early-prompt sentence stating the hijab colour or pattern. The "id_focus" prompt runs long (~1300 words);
+    confirmed by direct A/B (26-Oct) that a colour instruction placed where HIJAB_USER sits - deep in the prompt -
+    is not followed by the model (output keeps the template's black hijab) even when the colour is explicit and
+    correct, while the identical instruction moved to the very front of the prompt IS followed. Likely a text
+    encoder context/attention limit this far into such a long prompt. Keep HIJAB_USER's colour text too (harmless
+    reinforcement) but this early sentence is what actually controls the result for id_focus/id_focus2."""
+    col = info.get("hijab_colour")
+    if not col or col == "black":
+        return "IMPORTANT: her hijab takes its real colour from Picture 2, not the black of the template. "
+    if "pattern" in col:
+        return f"IMPORTANT: her hijab is {col}, not black - take the patterned hijab colours only from Picture 2. "
+    return f"IMPORTANT: her hijab is {col}, not black - take the hijab colour only from Picture 2. "
 
 HIJAB_FACE = (
     "keep her natural look from Picture 2: the full natural face with its full cheeks and soft jaw (do not slim or "
@@ -1982,7 +2020,7 @@ FACIAL_HAIR2 = (
 #   * VISOR_MANDATORY names "Picture 1 or 3" even when there is no Picture 3.
 #   * hijab: the template's black hijab and grey cowl bleed through (user's lilac/pink hijab came out black, flat
 #     grey patch on the chest). The hijab text must say the colour comes from Picture 2 and the drape is hijab fabric.
-# The old variants ("tuned", "id_focus") are untouched. Switch with PROMPT_VARIANT=v3 and A/B with send_10_images.py.
+# The old variants ("tuned", "id_focus") are untouched. Switch with PROMPT_VARIANT=v3 and A/B with tests/benchmarks/send_10_images.py.
 # ----------------------------------------------------------------------------
 V3_HEAD = (
     "head_swap: start with Picture 1 as the base image and keep its jacket, emblem, lighting and solid black "
@@ -2093,11 +2131,25 @@ def _build_prompt_v3(info, attempt=0, ref=False, keep_user_expression=True, hair
         visor += VISOR_RETRY
     if is_hijab:
         col = info.get("hijab_colour")
+        is_col = bool(col and col != "black")
+        if not is_col:
+            colour_prefix = ""
+            colour_rule = "the hijab takes the colour of Picture 2's hijab, not the black of the template"
+        elif "base" in col:
+            base_col = col.replace("patterned with a ", "").replace(" base", "").strip()
+            colour_prefix = f"patterned {base_col} "
+            colour_rule = f"the hijab is {col}, not black"
+        elif "pattern" in col:
+            colour_prefix = col if col.endswith(" ") else col + " "
+            colour_rule = f"the hijab is {col}, not black"
+        else:
+            colour_prefix = col + " "
+            colour_rule = f"the hijab is {col}, not black"
         hij = V3_HIJAB.format(
-            colour=(col + " " if col else ""),
-            colour_rule=(f"the hijab is {col}, not black" if col else "the hijab takes the colour of Picture 2's hijab, not the black of the template"),
+            colour=colour_prefix,
+            colour_rule=colour_rule,
         )
-        p = V3_HEAD + ident + V3_FEMALE + V3_BUILD + hij + visor + V3_STYLE + V3_CLOSING
+        p = _hijab_colour_lead(info) + V3_HEAD + ident + V3_FEMALE + V3_BUILD + hij + visor + V3_STYLE + V3_CLOSING
     elif is_woman:
         p = V3_HEAD + ident + V3_FEMALE + V3_BUILD + V3_WOMAN_HAIR + visor + V3_STYLE + V3_CLOSING
     else:
@@ -2164,11 +2216,25 @@ def _build_prompt_v4(info, attempt=0, ref=False, keep_user_expression=True, hair
         visor += VISOR_RETRY
     if is_hijab:
         col = info.get("hijab_colour")
+        is_col = bool(col and col != "black")
+        if not is_col:
+            colour_prefix = ""
+            colour_rule = "the hijab takes the colour of Picture 2's hijab, not the black of the template"
+        elif "base" in col:
+            base_col = col.replace("patterned with a ", "").replace(" base", "").strip()
+            colour_prefix = f"patterned {base_col} "
+            colour_rule = f"the hijab is {col}, not black"
+        elif "pattern" in col:
+            colour_prefix = col if col.endswith(" ") else col + " "
+            colour_rule = f"the hijab is {col}, not black"
+        else:
+            colour_prefix = col + " "
+            colour_rule = f"the hijab is {col}, not black"
         hij = V3_HIJAB.format(
-            colour=(col + " " if col else ""),
-            colour_rule=(f"the hijab is {col}, not black" if col else "the hijab takes the colour of Picture 2's hijab, not the black of the template"),
+            colour=colour_prefix,
+            colour_rule=colour_rule,
         )
-        p = V3_HEAD + ident + V3_FEMALE + V3_BUILD + hij + visor + V3_STYLE + V3_CLOSING
+        p = _hijab_colour_lead(info) + V3_HEAD + ident + V3_FEMALE + V3_BUILD + hij + visor + V3_STYLE + V3_CLOSING
     elif is_woman:
         p = V3_HEAD + ident + V3_FEMALE + V3_BUILD + V3_WOMAN_HAIR + visor + V3_STYLE + V3_CLOSING
     else:
@@ -2269,8 +2335,8 @@ def _build_prompt_core(info, attempt=0, ref=False, style_mode=None, keep_user_ex
     tune = (lambda t: _women_tune(t, info, ref)) if settings.WOMEN_PROMPT_TUNE else (lambda t: t)
     if info.get("hijab", False):
         return tune(
-            f"{head}{IDENTITY_TXT}{BUILD2 if id2 else BUILD}{V}{HIJAB_VISOR_NOTE}"
-            f"{HIJAB_FACE}{HIJAB_USER}{FACE_CLEAN}{style_text} {closing} the visor is present and fits her face."
+            f"{_hijab_colour_lead(info)}{head}{IDENTITY_TXT}{BUILD2 if id2 else BUILD}{V}{HIJAB_VISOR_NOTE}"
+            f"{HIJAB_FACE}{_hijab_user_text(info)}{FACE_CLEAN}{style_text} {closing} the visor is present and fits her face."
         )
     if info.get("gender") == "Woman":
         return tune(
@@ -2700,40 +2766,33 @@ def score_output(user_emb: Optional[dict], out: Image.Image, info: dict) -> dict
         **vis,
     }
 
-def encode_jpeg_capped(img: Image.Image, max_bytes: int = None) -> bytes:
-    """Encode `img` as JPEG, stepping quality down and then resolution down
-    until the encoded size is at or under `max_bytes`. Falls back to the
-    smallest encoding found (with a logged warning) if the budget still can't
-    be met at the lowest quality/resolution tried."""
+def encode_jpeg_capped(img: Image.Image, max_bytes: int = None, qualities: Tuple[int, ...] = (85, 75, 65, 50, 40)) -> bytes:
+    """Fast capped JPEG encoder: replaces 128-step iterative loop with a short quality ladder
+    and disables 2-pass Huffman optimization (optimize=False) to eliminate CPU contention under load."""
     max_bytes = max_bytes or settings.OUTPUT_MAX_BYTES
-    rgb = img.convert("RGB")
-    quality_steps = (95, 90, 85, 80, 75, 70, 65, 60, 55, 50, 45, 40, 35, 30, 25, 20)
-    scale = 1.0
+    rgb = img if img.mode == "RGB" else img.convert("RGB")
     smallest: Optional[bytes] = None
-    for _ in range(8):
-        work = (
-            rgb
-            if scale >= 0.999
-            else rgb.resize(
-                (max(1, int(rgb.width * scale)), max(1, int(rgb.height * scale))),
-                Image.LANCZOS,
-            )
-        )
-        for quality in quality_steps:
-            buf = io.BytesIO()
-            work.save(buf, format="JPEG", quality=quality, optimize=True)
-            data = buf.getvalue()
-            if smallest is None or len(data) < len(smallest):
-                smallest = data
-            if len(data) <= max_bytes:
-                return data
-        scale *= 0.85
-    logger.warning(
-        "Could not encode output under %d bytes after quality/resolution search; "
-        "returning smallest JPEG found (%d bytes).",
-        max_bytes,
-        len(smallest),
-    )
+
+    for q in qualities:
+        buf = io.BytesIO()
+        rgb.save(buf, format="JPEG", quality=q, optimize=False)
+        data = buf.getvalue()
+        if smallest is None or len(data) < len(smallest):
+            smallest = data
+        if len(data) <= max_bytes:
+            return data
+
+    # Fast fallback: downscale by 15% and save at q=50 if quality ladder still exceeds max_bytes
+    w, h = rgb.size
+    small = rgb.resize((max(1, int(w * 0.85)), max(1, int(h * 0.85))), Image.BILINEAR)
+    buf = io.BytesIO()
+    small.save(buf, format="JPEG", quality=50, optimize=False)
+    data = buf.getvalue()
+    if len(data) <= max_bytes:
+        return data
+
+    logger.warning("Encoded JPEG size (%d bytes) slightly exceeds max_bytes (%d bytes); returning smallest candidate.",
+                   len(smallest), max_bytes)
     return smallest
 
 def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = None,
@@ -2795,7 +2854,7 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         while True:
             mult = settings.ID_LORA_SCHEDULE[k % len(settings.ID_LORA_SCHEDULE)]
             slot.set_lora(test_lora * mult)
-            if info.get("hijab") and settings.PROMPT_VARIANT == "v3" and "hijab_colour" not in info:
+            if info.get("hijab") and settings.PROMPT_VARIANT in ("v3", "v4", "id_focus", "id_focus2") and "hijab_colour" not in info:
                 info["hijab_colour"] = None  # computed once; stays None if the sample is unreliable
                 try:
                     from app.postprocess_hijab import user_hijab_colour

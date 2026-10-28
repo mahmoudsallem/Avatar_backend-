@@ -1,0 +1,40 @@
+version: 0.2
+# Promotes the canary-validated image to the real saytara-avatar-g7e-test endpoint via the
+# blue/green DeploymentConfig already on that stack's Endpoint resource (deploy/sagemaker-endpoint-
+# g7e-test.yaml) - the new fleet comes up fully before the old one drains, same as every manual
+# deploy this session. EndpointConfigName/ModelName MUST be new each time (both resources are
+# immutable - CloudFormation can't replace a same-named one in place), so both are suffixed with
+# the image tag, which is unique per commit.
+phases:
+  pre_build:
+    commands:
+      - source $CODEBUILD_SRC_DIR_BuildOutput/image_tag.env
+      - echo "Promoting canary-passed tag $IMAGE_TAG to saytara-avatar-g7e-test"
+  build:
+    commands:
+      - >
+        aws cloudformation deploy
+        --template-file deploy/sagemaker-endpoint-g7e-test.yaml
+        --stack-name saytara-avatar-g7e-test
+        --region $AWS_DEFAULT_REGION
+        --parameter-overrides
+        ExecutionRoleArn=$EXECUTION_ROLE_ARN
+        ModelName=saytara-avatar-model-$IMAGE_TAG
+        EndpointConfigName=saytara-avatar-g7e-test-config-$IMAGE_TAG
+        EndpointName=saytara-avatar-g7e-test
+        ImageUri=$ECR_REGISTRY/avatar:$IMAGE_TAG
+        InstanceType=ml.g7e.2xlarge
+        --no-fail-on-empty-changeset
+  post_build:
+    commands:
+      - |
+        echo "Waiting for the blue/green rollout to finish (new fleet up, cutover, old fleet drained - up to 40 min)..."
+        for i in $(seq 1 120); do
+          STATUS=$(aws sagemaker describe-endpoint --endpoint-name saytara-avatar-g7e-test --region $AWS_DEFAULT_REGION --query "EndpointStatus" --output text)
+          echo "  [$i/120] status=$STATUS"
+          if [ "$STATUS" = "InService" ]; then break; fi
+          if [ "$STATUS" = "Failed" ]; then echo "Promotion rollout failed"; exit 1; fi
+          sleep 20
+        done
+        if [ "$STATUS" != "InService" ]; then echo "Timed out waiting for g7e-test InService after promotion"; exit 1; fi
+        echo "Promoted successfully: saytara-avatar-g7e-test now running tag $IMAGE_TAG"

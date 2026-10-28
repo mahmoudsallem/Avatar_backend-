@@ -14,6 +14,7 @@ from fastapi import FastAPI, File, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.config import settings
 from app import pipeline
@@ -27,6 +28,22 @@ logging.basicConfig(
 logger = logging.getLogger("saytara")
 
 _models_loaded = False
+
+def _sync_model_caches_from_s3():
+    """Pull all three S3-cached model sets (HF hub, DeepFace weights, CLIP) into their local
+    directories via install_models.py's own pull() logic, before pipeline.load_models() runs.
+    A fresh container has none of these on disk - without this, load_models() would fall back to
+    downloading FLUX.2 (gated) and DeepFace's weights straight from the internet on every boot."""
+    import install_models
+
+    s3 = install_models._client()
+    for name, local_root, is_hf_cache in install_models.MODEL_SETS:
+        s3_prefix = f"{settings.S3_MODEL_CACHE_PREFIX}{name}/"
+        try:
+            install_models.pull(s3, settings.S3_MODEL_BUCKET, name, local_root, s3_prefix, is_hf_cache, dry_run=False)
+        except Exception as exc:
+            logger.warning("Model cache pull failed for %s (will fall back to downloading on demand): %s", name, exc)
+
 
 def _download_s3_prefix_if_needed():
     """Download all objects under s3://bucket/prefix (or tar.gz archive) into dest_dir if MODEL_S3_URI is set."""
@@ -101,6 +118,7 @@ async def lifespan(app: FastAPI):
         logger.critical("Fatal: GPU check failed: %s", exc)
         raise
 
+    _sync_model_caches_from_s3()
     _download_s3_prefix_if_needed()
 
     try:
@@ -152,6 +170,10 @@ app.add_middleware(
         "X-Score-Seconds",
     ],
 )
+
+# GET /metrics on :8080 - the default BYOC scrape target SageMaker's
+# EnableDetailedObservability reads for container-level metrics.
+Instrumentator().instrument(app).expose(app, include_in_schema=False)
 
 @app.exception_handler(pipeline.Rejected)
 async def rejected_exception_handler(request: Request, exc: pipeline.Rejected):

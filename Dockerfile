@@ -24,7 +24,9 @@ ENV HOST=0.0.0.0 \
     PORT=8080
 
 # Install required system packages for OpenCV, DeepFace, Git, and build tools
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# apt-get upgrade picks up Debian security patches already released for the base image
+# (e.g. libssl3) that aren't baked into the python:3.11-slim-bookworm tag yet.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
     git \
@@ -84,6 +86,12 @@ COPY app/ ./app/
 COPY Avatar/ ./Avatar/
 COPY app.py ./
 COPY install_models.py ./
+
+# Run as a non-root user. The GPU device nodes NVIDIA's container runtime exposes are accessible
+# to any container user, so this doesn't need special GPU group membership.
+RUN groupadd -r appuser && useradd -r -g appuser -d /app appuser \
+    && chown -R appuser:appuser /app /models /Models
+USER appuser
 
 # Expose SageMaker service port
 EXPOSE 8080

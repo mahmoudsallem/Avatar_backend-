@@ -91,7 +91,7 @@ and settings for each. At least 50 requests provides a more useful steady-load c
 than the default ten:
 
 ```bash
-python send_10_images.py --url http://localhost:8000 --count 50
+python tests/benchmarks/send_10_images.py --url http://localhost:8000 --count 50
 ```
 
 The `throughput` line reports completed JPEG avatars per minute. The target is at least 10

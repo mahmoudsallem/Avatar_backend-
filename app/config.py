@@ -15,7 +15,7 @@ class Settings(BaseSettings):
 
     # ---------------- Server & Security ----------------
     # TEST ONLY: lets /v1/avatar accept ?steps=&tries=&time_budget=&cfg=&style= per request so settings can be A/B tested
-    # on the same photos (send_10_images.py --matrix). Keep false in production.
+    # on the same photos (tests/benchmarks/send_10_images.py --matrix). Keep false in production.
     ALLOW_TEST_OVERRIDES: bool = False
     HOST: str = "0.0.0.0"
     PORT: int = int(os.environ.get("PORT", 8080))
@@ -131,7 +131,7 @@ class Settings(BaseSettings):
     ANALYSIS_CONCURRENCY: int = 4    # Step 1 (CPU subprocesses) running at once, outside the GPU slots
 
     # ---------------- Speed options (all OFF by default = identical behaviour to before) ----------------
-    # Exact / near-exact: they must not change the picture (check with bench_speed.py before enabling).
+    # Exact / near-exact: they must not change the picture (check with tests/benchmarks/bench_speed.py before enabling).
     CACHE_PROMPT_EMBEDS: bool = False  # cache the text-encoder output per distinct prompt (bit-identical)
     CACHE_REF_LATENTS: bool = False    # cache VAE latents of repeated reference images, e.g. the templates (bit-identical)
     FUSE_LORA: bool = False            # merge the LoRA into the weights; needs a uniform ID_LORA_SCHEDULE (rounding-level change)
@@ -180,7 +180,7 @@ class Settings(BaseSettings):
     HIJAB_DRAPE_FIX: float = 0.9
     REF_SIZE: int = 1024
     STYLE_MODE: str = "comic"  # "semi_real" | "comic" | "off"
-    PROMPT_VARIANT: str = "tuned"  # "tuned" = the notebook prompt (default) | "id_focus" = identity-first prompt | "v3" = short positive-only prompt (~380 words vs ~1300), A/B with send_10_images.py | "v4" = v3 + per-photo measured face traits (face shape, skin tone, beard style, hair type) with a stronger identity block
+    PROMPT_VARIANT: str = "tuned"  # "tuned" = the notebook prompt (default) | "id_focus" = identity-first prompt | "v3" = short positive-only prompt (~380 words vs ~1300), A/B with tests/benchmarks/send_10_images.py | "v4" = v3 + per-photo measured face traits (face shape, skin tone, beard style, hair type) with a stronger identity block
     KEEP_USER_EXPRESSION: bool = True
 
     # ---------------- Visor & Similarity ----------------

@@ -45,6 +45,9 @@ sagemaker-flux2-deployment-guide.pdf
 
 evaluation_results/
 
+# Raw SageMaker throughput benchmark output (tests/benchmarks/sagemaker_load_test.py)
+sagemaker_load_test_results/
+
 experiments/
 *.zip
 
@@ -54,4 +57,8 @@ V2/
 
 CLAUDE.md
 
+sagemaker_scaleout_results/
+
 deploy/
+
+uat_results/
