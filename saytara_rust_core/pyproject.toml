@@ -14,4 +14,3 @@ dependencies = [
 [tool.maturin]
 features = ["pyo3/extension-module"]
 module-name = "saytara_rust_core"
-python-source = "python"

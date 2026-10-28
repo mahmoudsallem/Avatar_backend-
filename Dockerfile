@@ -86,6 +86,15 @@ COPY app/ ./app/
 COPY Avatar/ ./Avatar/
 COPY app.py ./
 COPY install_models.py ./
+COPY saytara_rust_core/ ./saytara_rust_core/
+
+# Compile native Rust extension module with Maturin
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && \
+    export PATH="$HOME/.cargo/bin:$PATH" && \
+    pip install --no-cache-dir maturin && \
+    cd saytara_rust_core && \
+    maturin develop --release && \
+    cd .. && rm -rf "$HOME/.cargo" "$HOME/.rustup" ./saytara_rust_core/target
 
 # Run as a non-root user. The GPU device nodes NVIDIA's container runtime exposes are accessible
 # to any container user, so this doesn't need special GPU group membership.
