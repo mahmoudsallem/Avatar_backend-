@@ -93,7 +93,8 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --pr
     export PATH="$HOME/.cargo/bin:$PATH" && \
     pip install --no-cache-dir maturin && \
     cd saytara_rust_core && \
-    maturin develop --release && \
+    maturin build --release --strip && \
+    pip install --no-cache-dir target/wheels/*.whl && \
     cd .. && rm -rf "$HOME/.cargo" "$HOME/.rustup" ./saytara_rust_core/target
 
 # Run as a non-root user. The GPU device nodes NVIDIA's container runtime exposes are accessible
