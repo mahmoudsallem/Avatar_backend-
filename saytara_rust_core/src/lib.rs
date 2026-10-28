@@ -42,7 +42,7 @@ fn fast_tone_match_mask<'py>(
         )
     });
 
-    Ok(mask.into_pyarray_bound(py))
+    Ok(mask.into_pyarray(py))
 }
 
 /// Fast skin classifier across an entire BGR image canvas.
@@ -76,7 +76,7 @@ fn fast_skin_mask<'py>(
         out
     });
 
-    Ok(mask.into_pyarray_bound(py))
+    Ok(mask.into_pyarray(py))
 }
 
 /// Blends and shifts colors in CIE L*a*b* space without GIL contention.
@@ -105,7 +105,7 @@ fn fast_apply_lab_shift<'py>(
         )
     });
 
-    Ok(recolored.into_pyarray_bound(py))
+    Ok(recolored.into_pyarray(py))
 }
 
 /// The Saytara Rust Core native extension module.

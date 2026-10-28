@@ -202,7 +202,7 @@ pub fn apply_lab_shift(
     shift_b: f32,
     strength: f32,
 ) -> Array3<u8> {
-    let height = img.shape()[0];
+    let _height = img.shape()[0];
     let width = img.shape()[1];
 
     img.axis_iter_mut(Axis(0))
