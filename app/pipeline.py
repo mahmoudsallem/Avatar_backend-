@@ -329,14 +329,15 @@ def prompt_inputs(slot: "GpuSlot", prompt: str) -> dict:
         _CACHE_STATS["prompt_miss"] += 1
         with torch.no_grad(), torch.cuda.stream(slot.stream):
             e, _ids = slot.pipe.encode_prompt(prompt=prompt, device=slot.pipe._execution_device)
-            emb = e.detach()          # Keep directly in VRAM on execution device without synchronous CPU copy
+            slot.stream.synchronize()
+            emb = e.detach().cpu()          # Safely store in CPU RAM, preventing cross-stream races & allocator reuse
         with _PROMPT_LOCK:
             _PROMPT_CACHE[prompt] = emb
             while len(_PROMPT_CACHE) > 64:
                 _PROMPT_CACHE.popitem(last=False)
     else:
         _CACHE_STATS["prompt_hit"] += 1
-    return {"prompt_embeds": emb}
+    return {"prompt_embeds": emb.to(slot.pipe._execution_device)}
 
 def _tensor_key(x: torch.Tensor) -> str:
     """Extremely fast fingerprinting without moving the bulk payload across PCIe.
@@ -2917,14 +2918,35 @@ def generate_avatar_gpu(user_image_path: Path, info: dict, t0: Optional[float] =
                 torch.cuda.empty_cache()
             g = time.time() - tg
 
-            if looks_corrupted(out) and bad_tries < 2:
+            if looks_corrupted(out):
                 bad_tries += 1
                 gen_s += g
-                logger.warning("Try %d on slot %d came out as noise (corrupted generation) - discarded, regenerating "
-                               "with a new seed (%d/2)", k + 1, slot.idx, bad_tries)
                 if dbg is not None:
                     out.save(dbg / f"corrupt{bad_tries}_try{k + 1}.png")
-                continue
+                # Clear any fragmented CUDA allocator cache and stream state before retrying
+                slot.stream.synchronize()
+                torch.cuda.empty_cache()
+                if bad_tries < 3:
+                    logger.warning(
+                        "Try %d on slot %d came out as noise (corrupted generation) - discarded, regenerating "
+                        "with a new seed (%d/3)",
+                        k + 1,
+                        slot.idx,
+                        bad_tries,
+                    )
+                    continue
+                else:
+                    logger.error(
+                        "Try %d on slot %d came out as noise and exceeded max retries (%d/3) - discarded",
+                        k + 1,
+                        slot.idx,
+                        bad_tries,
+                    )
+                    if best is not None:
+                        logger.warning("Falling back to valid candidate from try %d", best["k"])
+                        break
+                    else:
+                        raise Rejected("Generation corrupted (noise output)")
 
             tv = time.time()
             user_emb = fut.result() if fut is not None else None
@@ -3011,6 +3033,10 @@ def generate_avatar_gpu(user_image_path: Path, info: dict, t0: Optional[float] =
                     per_try,
                 )
                 break
+
+        if best is None:
+            logger.error("No valid avatar candidate could be generated on slot %d (all attempts produced noise)", slot.idx)
+            raise Rejected("Generation corrupted (noise output)")
 
         out, v = best["out"], best["v"]
         meta = {

@@ -208,8 +208,13 @@ def user_hijab_lab(user: Image.Image, box: Box) -> HijabLab:
     try:
         bgr = _bgr(user)
         H, W = bgr.shape[:2]
+        if max(H, W) > 512:
+            scale = 512.0 / max(H, W)
+            bgr = cv2.resize(bgr, (int(W * scale), int(H * scale)), interpolation=cv2.INTER_AREA)
+            box = (box[0] * scale, box[1] * scale, box[2] * scale, box[3] * scale)
+            H, W = bgr.shape[:2]
         x, y, w, h = box
-        if w < 20 or h < 20 or x >= W or y >= H:
+        if w < 10 or h < 10 or x >= W or y >= H:
             return HijabLab(None, None)
 
         # Targeted sampling boxes:
