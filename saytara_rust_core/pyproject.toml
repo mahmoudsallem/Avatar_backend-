@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "saytara-rust-core"
+version = "0.1.0"
+description = "High-performance Rust acceleration module for Saytara Avatar CPU-bound image processing"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "saytara_rust_core"
+python-source = "python"

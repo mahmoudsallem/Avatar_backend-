@@ -1,0 +1,24 @@
+[package]
+name = "saytara_rust_core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Saytara Core Team <engineering@saytara.com>"]
+description = "High-performance Rust acceleration module for Saytara Avatar post-processing"
+license = "Proprietary"
+
+[lib]
+name = "saytara_rust_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+numpy = "0.22"
+ndarray = { version = "0.15", features = ["rayon"] }
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

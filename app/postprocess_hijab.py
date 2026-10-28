@@ -395,7 +395,21 @@ def user_hijab_colour(user: Image.Image, box: Box) -> Optional[str]:
 # --------------------------------------------------------------------------------------------- the three fixes
 def _fix_skin(bgr, lab, box: Box, skin_ref: Optional[np.ndarray], smooth: float, match: float) -> Tuple[np.ndarray, Dict]:
     info: Dict = {}
-    m = _ellipse(bgr.shape, box, 0.86, 0.96) * _skin_like(bgr).astype(np.float32)
+    try:
+        # Zero-copy Rust acceleration (releases Python GIL during pixel-level tone matching)
+        from saytara_rust_core import fast_tone_match_mask
+        target_lab = skin_ref if skin_ref is not None else np.array([65.0, 15.0, 18.0], dtype=np.float32)
+        m = fast_tone_match_mask(
+            bgr,
+            int(box[0]), int(box[1]), int(box[2]), int(box[3]),
+            float(target_lab[0]), float(target_lab[1]), float(target_lab[2]),
+            threshold=40.0,
+            sx=0.86,
+            sy=0.96,
+        )
+        info["rust_accelerated"] = True
+    except (ImportError, Exception):
+        m = _ellipse(bgr.shape, box, 0.86, 0.96) * _skin_like(bgr).astype(np.float32)
     m = cv2.erode(m, np.ones((3, 3), np.uint8))
     m = _soft(m, max(5, box[2] * 0.03))
     sel = m > 0.5
