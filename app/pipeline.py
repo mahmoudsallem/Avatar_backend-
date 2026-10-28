@@ -168,16 +168,23 @@ async def process_image_file(image_path: Path, overrides: Optional[dict] = None)
     t_slot_wait = time.time() - t_s0             # waiting for a free GPU slot
     t0 = time.time() - t_analysis
     try:
-        jpeg_bytes, rec = await asyncio.to_thread(generate_avatar, image_path, info, t0, slot, overrides)
-        rec["analysis_wait_s"] = round(t_analysis_wait, 1)
-        rec["analysis_s"] = round(t_analysis, 1)
-        rec["slot_wait_s"] = round(t_slot_wait, 1)
-        logger.info("TIMING %s: analysis_wait=%.1fs analysis=%.1fs slot_wait=%.1fs gen=%.1fs score=%.1fs tries=%s total_server=%.1fs",
-                    image_path.name, t_analysis_wait, t_analysis, t_slot_wait, rec.get("gen_s", 0), rec.get("val_s", 0),
-                    rec.get("tries"), time.time() - t_req)
-        return jpeg_bytes, rec
+        raw_out, v, user_emb, face, rec, meta = await asyncio.to_thread(
+            generate_avatar_gpu, image_path, info, t0, slot, overrides
+        )
     finally:
-        release_slot(slot)
+        release_slot(slot)                       # Release GPU slot early! Free for next request
+
+    # CPU Post-processing and JPEG encoding run completely outside the GPU slot
+    jpeg_bytes, rec = await asyncio.to_thread(
+        postprocess_avatar, raw_out, v, user_emb, face, info, rec, meta, t0
+    )
+    rec["analysis_wait_s"] = round(t_analysis_wait, 1)
+    rec["analysis_s"] = round(t_analysis, 1)
+    rec["slot_wait_s"] = round(t_slot_wait, 1)
+    logger.info("TIMING %s: analysis_wait=%.1fs analysis=%.1fs slot_wait=%.1fs gen=%.1fs score=%.1fs tries=%s total_server=%.1fs",
+                image_path.name, t_analysis_wait, t_analysis, t_slot_wait, rec.get("gen_s", 0), rec.get("val_s", 0),
+                rec.get("tries"), time.time() - t_req)
+    return jpeg_bytes, rec
 
 # Persistent ArcFace embedding worker state
 _VW = {"p": None}
@@ -2803,8 +2810,8 @@ def encode_jpeg_capped(img: Image.Image, max_bytes: int = None, qualities: Tuple
                    len(smallest), max_bytes)
     return smallest
 
-def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = None,
-                    slot: Optional[GpuSlot] = None, overrides: Optional[dict] = None) -> Tuple[bytes, dict]:
+def generate_avatar_gpu(user_image_path: Path, info: dict, t0: Optional[float] = None,
+                        slot: Optional[GpuSlot] = None, overrides: Optional[dict] = None) -> Tuple[Image.Image, dict, Any, Image.Image, dict, dict]:
     # t0 defaults to "now" (generation-only budget) but callers should pass the
     # timestamp from before Step 1 analysis so TIME_BUDGET covers the whole
     # image end-to-end, matching the notebook.
@@ -2855,6 +2862,7 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
         fut = _POOL.submit(embed_user, face) if use_arcface else None
 
         best, k, gen_s, val_s, stopped = None, 0, 0.0, 0.0, "all tries"
+        user_emb = None
         bad_tries = 0   # corrupted (noise) generations thrown away so far
         t_loop = time.time()
 
@@ -3005,54 +3013,83 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
                 break
 
         out, v = best["out"], best["v"]
-        if info.get("hijab") and settings.HIJAB_POSTFIX:
-            out = _apply_hijab_postfix(out, face, user_emb, rec, key_for_debug=locals().get("dbg"), out_emb=v.get("out_emb"))
-        elif info.get("avatar") in settings.SKIN_POSTFIX_AVATARS:
-            out = _apply_hijab_postfix(out, face, user_emb, rec, key_for_debug=locals().get("dbg"), skin_only=True, out_emb=v.get("out_emb"))
-        jpeg_bytes = encode_jpeg_capped(out, settings.OUTPUT_MAX_BYTES)
-        rec.update(
-            status="done",
-            gender=info["gender"],
-            hijab=info.get("hijab", False),
-            avatar=info["avatar"],
-            glasses=info.get("glasses", False),
-            beard=info.get("beard", False),
-            bald=info.get("bald", False),
-            hair=v["hair"],
-            bald_score=v["bald_score"],
-            hair_vol_mismatch=v.get("hair_vol_mismatch"),
-            hair_vol_diff=v.get("hair_vol_diff"),
-            seconds=round(time.time() - t0, 1),
-            gen_s=round(gen_s, 1),
-            val_s=round(val_s, 1),
-            tries=k,
-            steps=steps,
-            cfg=cfg,
-            style=style_mode or settings.STYLE_MODE,
-            best_try=best["k"],
-            stopped=stopped,
-            lora_mult=best["mult"],
-            id_sim=v["id_sim"],
-            jaw_diff=v["jaw_diff"],
-            score=v["score"],
-            visor=v["visor"],
-            visor_score=v["visor_score"],
-            output_bytes=len(jpeg_bytes),
-        )
-        logger.info(
-            "Best candidate selected: try %d of %d, id_sim=%s, visor=%s, score=%s in %.1fs, "
-            "output=%d bytes (JPEG, cap=%d)",
-            best["k"],
-            k,
-            v["id_sim"],
-            v["visor"],
-            v["score"],
-            rec["seconds"],
-            len(jpeg_bytes),
-            settings.OUTPUT_MAX_BYTES,
-        )
-        return jpeg_bytes, rec
+        meta = {
+            "k": k,
+            "gen_s": gen_s,
+            "val_s": val_s,
+            "stopped": stopped,
+            "best_k": best["k"],
+            "lora_mult": best["mult"],
+            "steps": steps,
+            "cfg": cfg,
+            "style_mode": style_mode,
+            "dbg": dbg,
+        }
+        return out, v, user_emb, face, rec, meta
     finally:
         if progress is not None:
             progress.close()
         slot.reset_lora()
+
+
+def postprocess_avatar(out: Image.Image, v: dict, user_emb: Any, face: Image.Image,
+                       info: dict, rec: dict, meta: dict, t0: float) -> Tuple[bytes, dict]:
+    """CPU-only post-processing (hijab/skin tone match & fast capped JPEG encoding).
+    Executed completely outside the GPU slot lock to ensure GPU slots are freed immediately."""
+    dbg = meta.get("dbg")
+    if info.get("hijab") and settings.HIJAB_POSTFIX:
+        out = _apply_hijab_postfix(out, face, user_emb, rec, key_for_debug=dbg, out_emb=v.get("out_emb"))
+    elif info.get("avatar") in settings.SKIN_POSTFIX_AVATARS:
+        out = _apply_hijab_postfix(out, face, user_emb, rec, key_for_debug=dbg, skin_only=True, out_emb=v.get("out_emb"))
+    jpeg_bytes = encode_jpeg_capped(out, settings.OUTPUT_MAX_BYTES)
+    rec.update(
+        status="done",
+        gender=info["gender"],
+        hijab=info.get("hijab", False),
+        avatar=info["avatar"],
+        glasses=info.get("glasses", False),
+        beard=info.get("beard", False),
+        bald=info.get("bald", False),
+        hair=v["hair"],
+        bald_score=v["bald_score"],
+        hair_vol_mismatch=v.get("hair_vol_mismatch"),
+        hair_vol_diff=v.get("hair_vol_diff"),
+        seconds=round(time.time() - t0, 1),
+        gen_s=round(meta["gen_s"], 1),
+        val_s=round(meta["val_s"], 1),
+        tries=meta["k"],
+        steps=meta["steps"],
+        cfg=meta["cfg"],
+        style=meta["style_mode"] or settings.STYLE_MODE,
+        best_try=meta["best_k"],
+        stopped=meta["stopped"],
+        lora_mult=meta["lora_mult"],
+        id_sim=v["id_sim"],
+        jaw_diff=v["jaw_diff"],
+        score=v["score"],
+        visor=v["visor"],
+        visor_score=v["visor_score"],
+        output_bytes=len(jpeg_bytes),
+    )
+    logger.info(
+        "Best candidate selected: try %d of %d, id_sim=%s, visor=%s, score=%s in %.1fs, "
+        "output=%d bytes (JPEG, cap=%d)",
+        meta["best_k"],
+        meta["k"],
+        v["id_sim"],
+        v["visor"],
+        v["score"],
+        rec["seconds"],
+        len(jpeg_bytes),
+        settings.OUTPUT_MAX_BYTES,
+    )
+    return jpeg_bytes, rec
+
+
+def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = None,
+                    slot: Optional[GpuSlot] = None, overrides: Optional[dict] = None) -> Tuple[bytes, dict]:
+    """Compatibility wrapper: runs GPU diffusion then CPU post-processing."""
+    if t0 is None:
+        t0 = time.time()
+    raw_out, v, user_emb, face, rec, meta = generate_avatar_gpu(user_image_path, info, t0, slot, overrides)
+    return postprocess_avatar(raw_out, v, user_emb, face, info, rec, meta, t0)
