@@ -332,9 +332,16 @@ def prompt_inputs(slot: "GpuSlot", prompt: str) -> dict:
     return {"prompt_embeds": emb}
 
 def _tensor_key(x: torch.Tensor) -> str:
+    """Extremely fast fingerprinting without moving the bulk payload across PCIe.
+    Downsamples the tensor on device before moving a tiny slice to host for Blake2b hashing."""
     h = hashlib.blake2b(digest_size=16)
-    h.update(repr((tuple(x.shape), str(x.dtype))).encode())
-    h.update(x.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes())
+    h.update(f"{x.device}_{x.shape}_{x.dtype}".encode("utf-8"))
+    if x.numel() <= 32768:
+        sample = x.detach().contiguous().cpu()
+    else:
+        step = max(1, x.numel() // 8192)
+        sample = x.flatten()[::step].detach().contiguous().cpu()
+    h.update(sample.view(torch.uint8).numpy().tobytes())
     return h.hexdigest()
 
 def _install_ref_cache(p) -> None:
@@ -2678,11 +2685,11 @@ def _face_box(emb_res, target_w: int, target_h: int):
 
 
 def _apply_hijab_postfix(out: Image.Image, face: Image.Image, user_emb, rec: dict, key_for_debug=None,
-                         skin_only: bool = False) -> Image.Image:
+                         skin_only: bool = False, out_emb: Optional[dict] = None) -> Image.Image:
     """Skin smoothing / tone match + neck-drape recolour for hijab avatars. Fail-soft: returns `out` on any problem."""
     try:
         from app.postprocess_hijab import fix_hijab_avatar
-        o = embed(out, True, "fix") or embed(out, False, "fix")
+        o = out_emb or embed(out, True, "fix") or embed(out, False, "fix")
         if not o:
             rec["postfix"] = {"applied": False, "reason": "no_face_in_output"}
             return out
@@ -2737,7 +2744,7 @@ def score_output(user_emb: Optional[dict], out: Image.Image, info: dict) -> dict
     vis = check_visor(out)
     vis.update(check_bald_output(out, info))
     vis.update(check_hair_volume_output(out, info))
-    sim = u_r = o_r = None
+    sim = u_r = o_r = o = None
     if settings.VALIDATE and user_emb is not None:
         o = embed(out, True, "out")
         if o is None:
@@ -2763,6 +2770,7 @@ def score_output(user_emb: Optional[dict], out: Image.Image, info: dict) -> dict
         "id_sim": None if sim is None else round(sim, 3),
         "jaw_diff": None if jaw is None else round(jaw, 3),
         "score": round(score, 3),
+        "out_emb": o,
         **vis,
     }
 
@@ -2998,9 +3006,9 @@ def generate_avatar(user_image_path: Path, info: dict, t0: Optional[float] = Non
 
         out, v = best["out"], best["v"]
         if info.get("hijab") and settings.HIJAB_POSTFIX:
-            out = _apply_hijab_postfix(out, face, user_emb, rec, key_for_debug=locals().get("dbg"))
+            out = _apply_hijab_postfix(out, face, user_emb, rec, key_for_debug=locals().get("dbg"), out_emb=v.get("out_emb"))
         elif info.get("avatar") in settings.SKIN_POSTFIX_AVATARS:
-            out = _apply_hijab_postfix(out, face, user_emb, rec, key_for_debug=locals().get("dbg"), skin_only=True)
+            out = _apply_hijab_postfix(out, face, user_emb, rec, key_for_debug=locals().get("dbg"), skin_only=True, out_emb=v.get("out_emb"))
         jpeg_bytes = encode_jpeg_capped(out, settings.OUTPUT_MAX_BYTES)
         rec.update(
             status="done",
